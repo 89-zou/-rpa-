@@ -145,6 +145,7 @@ class ElementPickerDialog(QDialog):
         self.img_dir = self.project_dir / "img"
         self._worker: Optional[PickerWorker] = None
         self._hits: list = []
+        self._shots: list = []          # 这次捕获生成的截图（收尾时清掉没用的）
         self.result_data: Optional[dict] = None
         self._init_ui(url)
 
@@ -204,7 +205,7 @@ class ElementPickerDialog(QDialog):
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("完成")
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self._on_reject)
+        buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
     # ------------------------------
@@ -262,6 +263,7 @@ class ElementPickerDialog(QDialog):
         lines.append(f"截图：{image}" if image else "截图：没抓到（可用【选择截图…】手工裁剪）")
         self.result_label.setText("\n".join(lines))
         if image:
+            self._shots.append(self.project_dir / image)
             self._show_preview(self.project_dir / image)
         self.result_data = {
             "xpath": xpath if count >= 0 else "",
@@ -292,15 +294,37 @@ class ElementPickerDialog(QDialog):
                 "还没有捕获到元素。\n先点【开始捕获】，在浏览器里点一下目标元素。",
             )
             return
-        self._shutdown()
         self.accept()
 
-    def _on_reject(self):
-        self._shutdown()
-        self.reject()
+    def accept(self):
+        """完成：留下的只有最后选中的那张截图。"""
+        image = (self.result_data or {}).get("image") or ""
+        self._shutdown(keep=(self.project_dir / image) if image else None)
+        super().accept()
 
-    def _shutdown(self):
+    def reject(self):
+        """取消（含点右上角 ×、按 Esc）：关掉浏览器并清掉这次的截图。"""
+        self._shutdown(keep=None)
+        super().reject()
+
+    def _shutdown(self, keep: Optional[Path]):
         if self._worker is not None:
             self._worker.stop()
             self._worker.wait(4000)
             self._worker = None
+        self._drop_unused_shots(keep)
+
+    def _drop_unused_shots(self, keep: Optional[Path]):
+        """删掉这次捕获生成、但最终没用上的截图。
+
+        抓一个点一个很容易试好几次；只有最后选中的那张会被写进步骤，
+        其余的留着只会在 img/ 里堆废图。
+        """
+        for p in self._shots:
+            if keep is not None and p == keep:
+                continue
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        self._shots.clear()

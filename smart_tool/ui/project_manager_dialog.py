@@ -1,23 +1,25 @@
 # -*- coding: utf-8 -*-
-"""项目管理对话框：项目列表 + 变量清单。
+"""项目管理对话框：项目列表 + 变量清单 + 图片库。
 
-左边选项目，右边看这个项目的变量从哪来：
+左边选项目，右边两个页签：
 
-- 变量有两个来源——「读取数据」节点产出的列表变量（读文件/文件夹），
-  以及手工加的自定义变量（账号密码之类）；
-- 循环里的 {{loop.item}} / {{loop.index}} 是运行时自动有的，不在这里列，
-  也不用手工配置（写错会在运行前检查里提示）；
-- 自定义变量可以增删改，改动立即保存，没有「保存」按钮；
-  读取节点产出的变量要改名/换路径，请去画布上双击那个「读取数据」节点。
+- 【变量清单】变量从哪来——「读取数据」节点产出的列表变量，以及手工加的自定义
+  变量。循环里的 {{loop.item}} / {{loop.index}} 是运行时自动有的，不在这里列。
+  自定义变量可以增删改（改动立即保存）；读取节点产出的要改名/换路径，
+  请去画布上双击那个「读取数据」节点。
+- 【图片库】项目 img/ 目录里的元素截图：能预览、能看「被哪几步引用」、
+  能导入/替换/删除。删除前先看引用列，免得删掉正在用的模板。
 """
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QDialog, QHBoxLayout, QHeaderView, QLabel, QListWidget,
-    QListWidgetItem, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QDialog, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
+    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QTableWidget,
+    QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from smart_tool.core import data_sources, project_store, step_executor
@@ -30,10 +32,13 @@ KIND_DATA, KIND_PROJECT = "data", "project"
 
 COL_NAME, COL_VALUE, COL_SRC = range(3)
 PLACEHOLDER = "（运行时按项填充）"
+# 图片库表格列
+COL_IMG, COL_IMG_SIZE, COL_IMG_BYTES, COL_IMG_USE = range(4)
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"}
 
 
 class ProjectManagerDialog(QDialog):
-    """项目管理：项目列表 + 变量清单。"""
+    """项目管理：项目列表 + 变量清单 + 图片库。"""
 
     def __init__(self, current_name: str = "", parent=None):
         super().__init__(parent)
@@ -73,12 +78,17 @@ class ProjectManagerDialog(QDialog):
         left.addLayout(row_btns)
         root.addLayout(left, 2)
 
-        # ---- 右：变量清单 ----
+        # ---- 右：变量清单 / 图片库 ----
         right = QVBoxLayout()
-        self.header_label = QLabel("在左边选中一个项目，这里就是它的变量清单")
+        self.header_label = QLabel("在左边选中一个项目，这里就是它的配置")
         self.header_label.setStyleSheet("color: #444; font-weight: bold;")
         right.addWidget(self.header_label)
-        right.addWidget(self._build_var_page(), 1)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_var_page(), "变量清单")
+        self.tabs.addTab(self._build_image_page(), "图片库")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        right.addWidget(self.tabs, 1)
 
         bottom = QHBoxLayout()
         bottom.addStretch()
@@ -143,6 +153,289 @@ class ProjectManagerDialog(QDialog):
         return page
 
     # ------------------------------
+    # 图片库（项目 img/ 目录）
+    # ------------------------------
+    def _build_image_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 6, 0, 0)
+
+        tip = QLabel(
+            "项目 img/ 目录里的元素截图：用【捕获元素…】抓的、以及你自己裁剪的都在这。\n"
+            "「用在哪」列出引用它的步骤——定位方式＝截图的，或 XPath 步骤的兜底截图。\n"
+            "删之前先看这一列：删掉正在用的图，那些步骤运行时会报「截图文件不存在」"
+            "（也可以先【替换…】换成新图，步骤不用改）。"
+        )
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color: #777;")
+        lay.addWidget(tip)
+
+        body = QHBoxLayout()
+
+        self.img_table = QTableWidget(0, 4)
+        self.img_table.setHorizontalHeaderLabels(["图片", "尺寸", "大小", "用在哪"])
+        header = self.img_table.horizontalHeader()
+        header.setSectionResizeMode(COL_IMG, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(COL_IMG_SIZE, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(COL_IMG_BYTES, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(COL_IMG_USE, QHeaderView.ResizeMode.Stretch)
+        self.img_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.img_table.itemSelectionChanged.connect(self._show_image_preview)
+        body.addWidget(self.img_table, 3)
+
+        self.img_preview = QLabel("选中一张图，这里看大图")
+        self.img_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.img_preview.setWordWrap(True)
+        self.img_preview.setMinimumWidth(200)
+        self.img_preview.setStyleSheet(
+            "border: 1px dashed #bbb; border-radius: 4px; color: #999;"
+        )
+        body.addWidget(self.img_preview, 2)
+        lay.addLayout(body, 1)
+
+        btns = QHBoxLayout()
+        self.btn_img_import = QPushButton("导入图片…")
+        self.btn_img_import.setToolTip("把外面的图片拷进项目 img/（可多选）")
+        self.btn_img_import.clicked.connect(self._import_images)
+        btns.addWidget(self.btn_img_import)
+        self.btn_img_replace = QPushButton("替换…")
+        self.btn_img_replace.setToolTip(
+            "用另一张图覆盖选中的这张（文件名不变，引用它的步骤不用改）"
+        )
+        self.btn_img_replace.clicked.connect(self._replace_image)
+        btns.addWidget(self.btn_img_replace)
+        self.btn_img_delete = QPushButton("删除选中")
+        self.btn_img_delete.clicked.connect(self._delete_images)
+        btns.addWidget(self.btn_img_delete)
+        btns.addStretch()
+        self.img_status = QLabel("")
+        self.img_status.setStyleSheet("color: #2e7d32;")
+        btns.addWidget(self.img_status)
+        lay.addLayout(btns)
+        return page
+
+    def _load_images(self):
+        """刷新图片库：列出 img/ 里的图片 + 各自被哪些步骤引用。"""
+        if self._store is None:
+            return
+        steps = self._store.load_steps()
+        usage = self._image_usage(steps)
+        files: List[Path] = []
+        if self._store.img_dir.exists():
+            files = sorted(
+                (p for p in self._store.img_dir.iterdir()
+                 if p.is_file() and p.suffix.lower() in IMG_EXTS),
+                key=lambda p: p.name.lower(),
+            )
+
+        self._loading = True
+        self.img_table.setRowCount(0)
+        unused = 0
+        for p in files:
+            rel = f"img/{p.name}"
+            users = usage.get(rel.lower(), [])
+            if not users:
+                unused += 1
+            pix = QPixmap(str(p))
+            size = (f"{pix.width()} × {pix.height()}"
+                    if not pix.isNull() else "读不出")
+            self._append_image_row(p.name, size, self._human_size(p), users)
+        self._loading = False
+        self._show_image_preview()
+        self.img_status.setText(
+            f"共 {len(files)} 张图" + (f"，其中 {unused} 张没被任何步骤用到" if unused else "")
+        )
+
+    def _append_image_row(self, name: str, size: str, human: str,
+                          users: List[str]):
+        row = self.img_table.rowCount()
+        self.img_table.insertRow(row)
+        name_item = QTableWidgetItem(name)
+        name_item.setData(Qt.ItemDataRole.UserRole, name)
+        self.img_table.setItem(row, COL_IMG, name_item)
+        for col, text in ((COL_IMG_SIZE, size), (COL_IMG_BYTES, human)):
+            item = QTableWidgetItem(text)
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.img_table.setItem(row, col, item)
+        use_item = QTableWidgetItem("、".join(users) if users else "（没被用到）")
+        use_item.setFlags(use_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        use_item.setToolTip("\n".join(users) if users else "没有任何步骤引用这张图")
+        self.img_table.setItem(row, COL_IMG_USE, use_item)
+
+    @staticmethod
+    def _image_usage(steps: List[Step]) -> Dict[str, List[str]]:
+        """图片 → 引用它的步骤（定位方式＝截图的，或 XPath 的兜底截图）。
+
+        键统一成小写、斜杠统一的 img/xxx 形式，避免 Windows 上大小写不一致。
+        """
+        usage: Dict[str, List[str]] = {}
+
+        def add(path: str, label: str):
+            key = path.replace("\\", "/").strip().lower()
+            if not key:
+                return
+            usage.setdefault(key, []).append(label)
+
+        for s in steps:
+            loc = s.locator
+            if loc is None:
+                continue
+            who = f"{s.id}. {s.title or s.action}"
+            if loc.type == "image" and loc.value:
+                add(loc.value, who)
+            if loc.image:
+                add(loc.image, who)
+        return usage
+
+    @staticmethod
+    def _human_size(path: Path) -> str:
+        try:
+            n = float(path.stat().st_size)
+        except OSError:
+            return ""
+        for unit in ("B", "KB", "MB"):
+            if n < 1024 or unit == "MB":
+                return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+            n /= 1024
+        return f"{n:.1f} MB"
+
+    def _selected_image(self) -> Optional[str]:
+        """选中的图片文件名（没选中返回 None）。"""
+        rows = {i.row() for i in self.img_table.selectedIndexes()}
+        if len(rows) != 1:
+            return None
+        item = self.img_table.item(rows.pop(), COL_IMG)
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def _show_image_preview(self):
+        name = self._selected_image()
+        if not name or self._store is None:
+            self.img_preview.setPixmap(QPixmap())
+            self.img_preview.setText("选中一张图，这里看大图")
+            return
+        pix = QPixmap(str(self._store.img_dir / name))
+        if pix.isNull():
+            self.img_preview.setPixmap(QPixmap())
+            self.img_preview.setText("（这张图读不出来）")
+            return
+        box = self.img_preview.size()
+        self.img_preview.setPixmap(pix.scaled(
+            max(120, box.width() - 12), max(120, box.height() - 12),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        ))
+
+    def _import_images(self):
+        """把外面的图片拷进 img/（重名自动加后缀）。"""
+        if self._store is None:
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择要导入的图片", str(Path.home()),
+            "图片 (*.png *.jpg *.jpeg *.bmp *.webp *.gif)",
+        )
+        if not paths:
+            return
+        self._store.img_dir.mkdir(parents=True, exist_ok=True)
+        added, skipped = [], []
+        for src in paths:
+            src_path = Path(src)
+            if src_path.suffix.lower() not in IMG_EXTS:
+                skipped.append(src_path.name)
+                continue
+            dst = self._store.img_dir / src_path.name
+            i = 1
+            while dst.exists():
+                dst = self._store.img_dir / f"{src_path.stem}_{i}{src_path.suffix}"
+                i += 1
+            try:
+                shutil.copy2(src_path, dst)
+                added.append(dst.name)
+            except OSError as e:
+                skipped.append(f"{src_path.name}（{e}）")
+        self._load_images()
+        msg = f"已导入 {len(added)} 张：{'、'.join(added)}" if added else "没有导入任何图片"
+        if skipped:
+            msg += f"；跳过 {len(skipped)} 个：{'、'.join(skipped)}"
+        self.img_status.setText(msg)
+
+    def _replace_image(self):
+        """用另一张图覆盖选中的那张（文件名不变，引用它的步骤不用改）。"""
+        if self._store is None:
+            return
+        name = self._selected_image()
+        if not name:
+            QMessageBox.information(self, "提示", "请先在表里选中一行要替换的图片。")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, f"用哪张图替换 {name}", str(Path.home()),
+            "图片 (*.png *.jpg *.jpeg *.bmp *.webp *.gif)",
+        )
+        if not path:
+            return
+        src = Path(path)
+        if src.suffix.lower() not in IMG_EXTS:
+            QMessageBox.warning(self, "格式不支持", "请选择 png/jpg/bmp/webp/gif 图片。")
+            return
+        reply = QMessageBox.question(
+            self, "确认替换",
+            f"会用这张图覆盖 {name}：\n{src}\n\n"
+            "文件名不变，所以引用它的步骤不用改；原来的图会被覆盖掉。\n确定吗？",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            shutil.copy2(src, self._store.img_dir / name)
+        except OSError as e:
+            QMessageBox.critical(self, "替换失败", f"覆盖图片失败：\n{e}")
+            return
+        self._load_images()
+        self.img_status.setText(f"已用新图覆盖 {name}")
+
+    def _delete_images(self):
+        """删除选中的图片；被步骤引用的会先提醒。"""
+        if self._store is None:
+            return
+        rows = sorted({i.row() for i in self.img_table.selectedIndexes()})
+        if not rows:
+            QMessageBox.information(self, "提示", "请先在表里选中要删除的图片。")
+            return
+        names = []
+        used_lines = []
+        for r in rows:
+            item = self.img_table.item(r, COL_IMG)
+            if item is None:
+                continue
+            name = item.data(Qt.ItemDataRole.UserRole) or item.text()
+            names.append(name)
+            use_item = self.img_table.item(r, COL_IMG_USE)
+            users = (use_item.toolTip() if use_item else "") or ""
+            if users and "没被用到" not in users:
+                used_lines.append(f"· {name} ← {users.replace(chr(10), '、')}")
+        msg = f"确定删除这 {len(names)} 张图吗？\n" + "、".join(names)
+        if used_lines:
+            msg += ("\n\n注意：下面这些图正在被步骤使用，删了以后"
+                    "那些步骤运行时会报「截图文件不存在」：\n" + "\n".join(used_lines))
+        reply = QMessageBox.warning(
+            self, "确认删除图片", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        failed = []
+        for name in names:
+            try:
+                (self._store.img_dir / name).unlink()
+            except OSError as e:
+                failed.append(f"{name}（{e}）")
+        self._load_images()
+        self.img_status.setText(
+            f"已删除 {len(names) - len(failed)} 张图"
+            + (f"；失败 {len(failed)} 个：{'、'.join(failed)}" if failed else "")
+        )
+
+    # ------------------------------
     # 项目列表
     # ------------------------------
     def _reload(self, select_name: str = ""):
@@ -172,23 +465,37 @@ class ProjectManagerDialog(QDialog):
         single = len(stores) == 1
         self.btn_open.setEnabled(single)
         self.btn_delete.setEnabled(len(stores) > 0)
-        self.var_table.setEnabled(single)
-        self.btn_var_add.setEnabled(single)
-        self.btn_var_del.setEnabled(single)
+        self.tabs.setEnabled(single)
+        for w in (self.var_table, self.btn_var_add, self.btn_var_del,
+                  self.img_table, self.btn_img_import, self.btn_img_replace,
+                  self.btn_img_delete):
+            w.setEnabled(single)
         one = stores[0] if single else None
         self._store = one
         if one is None:
             self.header_label.setText(
-                "在左边选中**一个**项目，这里就是它的变量清单"
+                "在左边选中**一个**项目，这里就是它的配置"
             )
-            self.data_label.setText("")
             self._loading = True
             self.var_table.setRowCount(0)
+            self.img_table.setRowCount(0)
             self._loading = False
+            self.data_label.setText("")
             self.status_label.clear()
+            self.img_status.clear()
+            self._show_image_preview()
             return
         self.header_label.setText(f"项目：{one.name}")
-        self._load_var_list()
+        self._on_tab_changed(self.tabs.currentIndex())
+
+    def _on_tab_changed(self, index: int):
+        """切页签 / 换项目时刷新当前页，保证看到的都是同一份最新数据。"""
+        if self._store is None:
+            return
+        if index == 0:
+            self._load_var_list()
+        else:
+            self._load_images()
 
     # ------------------------------
     # 变量清单
