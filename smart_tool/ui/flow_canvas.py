@@ -11,6 +11,8 @@
       **单元之间不连线**（循环的重复由紫色虚线框表达）
     - **条件**：条件卡 → 各分支卡（蓝色扇出），分支之间不连线
     - **分支体**：分支卡 → 分支体第一单元，之后照常顺序连线（分支体是顺序执行的）
+- 箭头连到「一个块」时，直接落在它最外层的虚线框上（不伸进框里去够卡片）；
+  分支不套框，所以分支的端点就是分支卡本身
 - 虚线框只有循环（紫）和条件（蓝）两种：**分支不套框**（靠分支卡片与扇出箭头区分）
 - **拖虚线框＝整块移动**（块里嵌套的块与所有卡片一起走）；拖单个卡片仍是单独移动
 - 块可以嵌套（分支里放循环等），框按层级一层层套
@@ -822,29 +824,27 @@ class FlowCanvas(QWidget):
         return next((sp for sp in self._spans if sp.start == index), None)
 
     def _endpoint(self, ref):
-        """连线单元 → 端点对象（步骤卡片或块框）。
+        """连线单元 → 端点对象（步骤卡片或块虚线框）。
 
-        - loop box → 块框（顶层外部连接用，loop 真的是整体黑盒）
-        - condition / branch box → **start 卡本身**（不连到框上，
-          箭头指向有业务含义的"条件判断"/"分支"卡片而不是视觉边界）
+        - loop box → 循环紫框；condition box → 条件蓝框：
+          连接到「一个块」时直接接到它最外层的虚线框上，
+          箭头不必伸进框里去够里面的卡片；
+        - branch box → 分支卡本身（分支不套框，没有框可接）。
         """
         if isinstance(ref, tuple):
             idx = ref[1]
             sp = self._span_by_start(idx)
             if sp is None:
                 return None
-            if sp.kind == "loop":
-                return _LoopBoxPort(self._span_rect(sp))
-            # condition / branch → start 卡本身
-            return self._nodes.get(self._steps[idx].id)
+            if sp.kind == "branch":
+                return self._nodes.get(self._steps[idx].id)
+            return _LoopBoxPort(self._span_rect(sp))
         return self._nodes.get(ref)
 
     def _units_in(self, lo: int, hi: int) -> List[object]:
         """把 [lo, hi) 里的步骤按「单元」切开：块整块算一个单元。
 
-        但块的端点**不全是框**（见 _endpoint）：
-        - loop 的端点是框（顶层外部连接用）
-        - condition / branch 的端点是 start 卡本身（让箭头指向有业务含义的卡片，不连到框上）
+        块的端点见 _endpoint：循环 / 条件接到各自的虚线框上，分支接到分支卡上。
         """
         units: List[object] = []
         i = lo
@@ -878,18 +878,25 @@ class FlowCanvas(QWidget):
         self._build_branch_fanout()
 
     def _build_branch_fanout(self):
-        """条件 → 各分支 的箭头。"""
+        """条件 → 各分支 的箭头。
+
+        只连这个条件**自己的**分支：用 _units_in 把内部切成顶层单元，
+        嵌套条件整块算一个单元（它的分支由它自己那轮循环去连），
+        否则嵌套条件里的分支会被误当成外层条件的分支，多画出错误的扇出箭头。
+        """
         for sp in self._spans:
             if sp.kind != "condition":
                 continue
             cond_node = self._nodes.get(self._steps[sp.start].id)
             if cond_node is None:
                 continue
-            for k in range(sp.inner_lo, sp.inner_hi):
-                s = self._steps[k]
-                if s.action != blocks.BRANCH:
+            for u in self._units_in(sp.inner_lo, sp.inner_hi):
+                if not isinstance(u, tuple):
                     continue
-                br_node = self._nodes.get(s.id)
+                br_sp = self._span_by_start(u[1])
+                if br_sp is None or br_sp.kind != "branch":
+                    continue
+                br_node = self._nodes.get(self._steps[br_sp.start].id)
                 if br_node is None:
                     continue
                 edge = EdgeItem(color=REGION_COLORS["condition"])
