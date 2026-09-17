@@ -4,10 +4,18 @@
 steps.json 结构：
 {
   "steps": [ {id, action, url?, locator?, value?, wait_after?, wait_target?, prompt?, note?}, ... ],
-  "variables": {"row.标题": "来自数据源的标题字段", ...}
+  "variables": {"账号": "hcw", ...}      # 只有「自定义变量」在这里
 }
+
+变量从哪来：节点自己产出。「读取数据」（read_data）节点读文件/文件夹，
+把结果放进 output_var 指定的变量（一个列表）；循环节点写 {{那个变量}} 遍历它，
+循环体里用 {{loop.item.字段}} 取当前这一项的字段。
+
+旧项目（steps.json 里有项目级 "data_source" 节）在 load() 时自动迁移成
+一个「读取数据」节点，见 migrate_project()。
 """
 import json
+import re
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -54,13 +62,17 @@ class Step:
     script_code: str = ""
     script_timeout: int = 30              # 秒（JS 生效；Python 无法强制中断）
     script_vars: str = ""                 # 逗号分隔的变量名；空=传入全部变量
-    # ---- loop_start 专用：这次循环遍历什么 ----
-    # data  数据源（在【数据源…】里配置，每行一项，产出 row.* / file.*）
-    # list  变量或手动列表（loop_items 每行一项，可写 {{变量}}）
-    # range 索引范围（loop_range：10 = 索引 0~9；0-10；{{变量}} 按变量长度）
-    loop_source: str = "data"
-    loop_items: str = ""
-    loop_range: str = ""
+    # ---- read_data 专用：读文件 / 文件夹，产出一个「列表变量」 ----
+    # data_cfg 的字段与 DataSourceConfig 一致（type/path/pattern/recursive/
+    # encoding/sheet/has_header/field_map/vars_picked）
+    output_var: str = ""                   # 产出变量名，如「文章列表」
+    data_cfg: Dict[str, Any] = field(default_factory=dict)
+    # ---- loop_start 专用：循环什么，只填一个表达式 ----
+    # 纯数字 10        跑 10 次（loop.item = 索引 0~9）
+    # {{变量}}         按变量的「长度」跑：列表 / JSON 数组 / 多行文本按项数，
+    #                  取值为整数则按该数；每一项注入 {{loop.item}}
+    # 其他文本         按行/逗号切分成多项；只有一项就只跑一次
+    loop_expr: str = ""
     # ---- condition_start 专用：条件分支 ----
     # cond_mode: equal  把 cond_expr 渲染成文本，跟分支的匹配值比相等
     #            expr   Python 表达式（能当数字的变量按数字代入），
@@ -105,12 +117,11 @@ class Step:
             d["script_timeout"] = self.script_timeout
             if self.script_vars:
                 d["script_vars"] = self.script_vars
+        if self.action == "read_data":
+            d["output_var"] = self.output_var
+            d["data_cfg"] = dict(self.data_cfg or {})
         if self.action == "loop_start":
-            d["loop_source"] = self.loop_source
-            if self.loop_items:
-                d["loop_items"] = self.loop_items
-            if self.loop_range:
-                d["loop_range"] = self.loop_range
+            d["loop_expr"] = self.loop_expr
         if self.action == "condition_start":
             d["cond_mode"] = self.cond_mode
             if self.cond_expr:
@@ -151,9 +162,9 @@ class Step:
             script_code=d.get("script_code", ""),
             script_timeout=int(d.get("script_timeout", 30)),
             script_vars=d.get("script_vars", ""),
-            loop_source=d.get("loop_source", "data") or "data",
-            loop_items=d.get("loop_items", ""),
-            loop_range=d.get("loop_range", ""),
+            output_var=d.get("output_var", ""),
+            data_cfg=dict(d.get("data_cfg") or {}),
+            loop_expr=d.get("loop_expr", ""),
             cond_mode=d.get("cond_mode", "equal") or "equal",
             cond_expr=d.get("cond_expr", ""),
             cond_branches=[dict(m) for m in d.get("cond_branches", [])
@@ -179,10 +190,12 @@ class ProjectStore:
         self.img_dir.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> Dict[str, Any]:
-        """读取整个 steps.json。"""
+        """读取整个 steps.json（旧项目的「数据源」在这里自动迁移成读取节点）。"""
         if not self.steps_file.exists():
-            return {"steps": [], "variables": {}, "data_source": {}, "layout": ""}
-        return json.loads(self.steps_file.read_text(encoding="utf-8"))
+            return {"steps": [], "variables": {}, "layout": ""}
+        return migrate_project(
+            json.loads(self.steps_file.read_text(encoding="utf-8"))
+        )
 
     def load_steps(self) -> List[Step]:
         return [Step.from_dict(s) for s in self.load().get("steps", [])]
@@ -190,23 +203,19 @@ class ProjectStore:
     def load_variables(self) -> Dict[str, str]:
         return self.load().get("variables", {})
 
-    def load_data_source(self) -> dict:
-        return self.load().get("data_source", {}) or {}
-
     def load_layout_version(self) -> str:
         """画布排版版本；与当前版本不一致时自动重排为横向布局。"""
         return self.load().get("layout", "") or ""
 
     def save(self, steps: List[Step], variables: Optional[Dict[str, str]] = None,
              layout_version: Optional[str] = None):
-        """保存步骤与变量。variables/data_source/layout 为 None 时保留原值。"""
+        """保存步骤与变量。variables/layout 为 None 时保留原值。"""
         self.ensure()
         old = self.load()
         data: Dict[str, Any] = {"steps": [s.to_dict() for s in steps]}
         data["variables"] = (
             variables if variables is not None else old.get("variables", {})
         )
-        data["data_source"] = old.get("data_source", {})
         # 画布上手动连的箭头：纯展示，执行器不读，但改动步骤时必须原样保留
         data["canvas_edges"] = old.get("canvas_edges", [])
         data["layout"] = (
@@ -218,7 +227,7 @@ class ProjectStore:
         )
 
     def save_variables(self, variables: Dict[str, str]):
-        """只更新变量，步骤与数据源保持不变。"""
+        """只更新变量，步骤保持不变。"""
         self.save(self.load_steps(), variables)
 
     def load_canvas_edges(self) -> List[list]:
@@ -242,21 +251,6 @@ class ProjectStore:
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-    def save_data_source(self, data_source: dict):
-        """只更新数据源配置，步骤与变量保持不变。"""
-        self.ensure()
-        old = self.load()
-        data = {
-            "steps": old.get("steps", []),
-            "variables": old.get("variables", {}),
-            "data_source": data_source,
-            "canvas_edges": old.get("canvas_edges", []),
-            "layout": old.get("layout", ""),
-        }
-        self.steps_file.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-
     def image_count(self) -> int:
         """img 目录内图片文件数量（删除前提示用）。"""
         if not self.img_dir.exists():
@@ -269,6 +263,220 @@ class ProjectStore:
         """删除整个项目目录（含 steps.json 与 img 截图）。"""
         import shutil
         shutil.rmtree(self.dir, ignore_errors=True)
+
+
+# ------------------------------
+# 旧项目迁移：项目级「数据源」→ 一个「读取数据」节点
+# ------------------------------
+# 文件类数据源没挑过变量时，用这些短名字当变量名（不再出现 file.content 写法）
+FILE_VAR_SHORT = {
+    "content": "内容", "name": "文件名", "stem": "文件主名",
+    "parent_name": "父文件夹名", "path": "路径", "suffix": "扩展名",
+    "size": "大小", "folder_count": "同文件夹文件数", "total": "文件总数",
+}
+DEFAULT_LIST_VAR = "数据列表"
+# {{变量}} 占位符
+_REF_RE = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+
+
+def _strip_var_prefix(name: str) -> str:
+    """去掉旧写法的 row. / file. 前缀。"""
+    for p in ("row.", "file."):
+        if name.startswith(p):
+            return name[len(p):]
+    return name
+
+
+def _resolve_field(cfg_type: str, fld: str) -> str:
+    """把字段短名还原成数据行里的原始键（file.xxx / row.xxx）。"""
+    f = (fld or "").strip()
+    if not f:
+        return ""
+    if f.startswith(("row.", "file.")):
+        return f
+    return ("file." if cfg_type in ("txt", "folder") else "row.") + f
+
+
+def _materialize_cfg(ds: Dict[str, Any]):
+    """把旧数据源配置整理成读取节点的 data_cfg。
+
+    返回 (cfg, 旧引用名→字段名 的映射, 是否已经定下了字段清单)。
+    旧项目里步骤可能写 {{标题}}（改名后）也可能写 {{file.content}}（原始名），
+    两种写法都要能翻译成新写法 {{loop.item.字段}}。
+    """
+    cfg = dict(ds)
+    cfg_type = cfg.get("type", "")
+    picked = bool(cfg.get("field_map")) or "field_map" in cfg
+    mapping: Dict[str, str] = {}
+    items: List[Dict[str, str]] = []
+    if picked:
+        for m in cfg.get("field_map") or []:
+            if not isinstance(m, dict):
+                continue
+            field = _resolve_field(cfg_type, m.get("field", ""))
+            if not field:
+                continue
+            var = _strip_var_prefix((m.get("var") or "").strip()) \
+                or _strip_var_prefix(field)
+            var = var or field
+            items.append({"field": field, "var": var})
+            mapping[field] = var
+            mapping[m.get("field", "")] = var
+            mapping[(m.get("var") or "").strip()] = var
+        cfg["field_map"] = items
+        cfg["vars_picked"] = True
+        return cfg, mapping, True
+
+    # 没挑过变量：旧行为是「产出全部原始变量」，这里换成一套看得懂的名字
+    if cfg_type in ("txt", "folder"):
+        from smart_tool.core.data_sources import FILE_FIELDS
+        for key, _label in FILE_FIELDS:
+            field = f"file.{key}"
+            var = FILE_VAR_SHORT.get(key, key)
+            items.append({"field": field, "var": var})
+            mapping[field] = var
+        cfg["field_map"] = items
+        cfg["vars_picked"] = True
+        return cfg, mapping, True
+
+    # Excel / JSON 得先读表头才知道列名；读不出来就保持原样（运行时按原始键取）
+    try:
+        from smart_tool.core.data_sources import (
+            DataSourceConfig, raw_columns,
+        )
+        cols = raw_columns(DataSourceConfig.from_dict(cfg))
+    except Exception:
+        cols = []
+    if cols:
+        for field in cols:
+            var = _strip_var_prefix(field)
+            items.append({"field": field, "var": var})
+            mapping[field] = var
+        cfg["field_map"] = items
+        cfg["vars_picked"] = True
+        return cfg, mapping, True
+    cfg["field_map"] = []
+    cfg["vars_picked"] = False
+    return cfg, mapping, False
+
+
+def _rewrite_refs(text: str, mapping: Dict[str, str], named: bool) -> str:
+    """把循环体里的字段引用改成 {{loop.item.字段}}。"""
+    def sub(m):
+        name = m.group(1).strip()
+        if name in mapping:
+            return "{{loop.item." + mapping[name] + "}}"
+        if not named and name.startswith(("row.", "file.")):
+            # 没定下字段清单（Excel/JSON 读不出表头）：保持原始键
+            return "{{loop.item." + name + "}}"
+        return m.group(0)
+    return _REF_RE.sub(sub, text)
+
+
+def _rewrite_all_refs(obj: Any, mapping: Dict[str, str], named: bool):
+    """递归改写一步里所有文本字段中的引用。"""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, str):
+                obj[k] = _rewrite_refs(v, mapping, named)
+            else:
+                _rewrite_all_refs(v, mapping, named)
+    elif isinstance(obj, list):
+        for v in obj:
+            _rewrite_all_refs(v, mapping, named)
+
+
+def _loop_body_ranges(steps: List[Dict[str, Any]],
+                      starts: List[int]) -> List[tuple]:
+    """这些「循环开始」各自对应的循环体范围（左闭右开，不含两端的标记）。"""
+    out = []
+    for a in starts:
+        depth = 0
+        for b in range(a + 1, len(steps)):
+            act = steps[b].get("action")
+            if act == "loop_start":
+                depth += 1
+            elif act == "loop_end":
+                if depth == 0:
+                    out.append((a + 1, b))
+                    break
+                depth -= 1
+    return out
+
+
+def _remap_endpoint(value: Any, id_map: Dict[Any, int]) -> Any:
+    """画布连线端点：步骤 id，或 "frame:<起始步骤id>"。"""
+    if isinstance(value, str) and value.startswith("frame:"):
+        try:
+            n = int(value[6:])
+        except ValueError:
+            return value
+        return f"frame:{id_map.get(n, n)}"
+    return id_map.get(value, value)
+
+
+def migrate_project(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """旧项目自动升级（每次 load 都会跑，结果直到下次 save 才落盘）。
+
+    旧版把「读哪个文件夹、要哪些字段」放在项目级的 data_source 里，循环节点
+    只写一句"用数据源"。现在改成影刀那样的节点式：
+
+        [5] 读取数据  输出「数据列表」 →  [6] 循环 {{数据列表}}
+
+    循环体里原来的 {{标题}} / {{file.content}} / {{row.列名}} 一并改成
+    {{loop.item.标题}}。步骤号重排成 1..N，画布手动连线跟着换号。
+    """
+    data = dict(raw or {})
+    ds = data.pop("data_source", None) or {}
+    steps = [dict(s) for s in (data.get("steps") or []) if isinstance(s, dict)]
+    data["steps"] = steps
+    if not (ds.get("type") and ds.get("path")):
+        return data
+
+    loops = [i for i, s in enumerate(steps)
+             if s.get("action") == "loop_start"
+             and (s.get("loop_source") or "data") == "data"]
+    if not loops:
+        return data
+
+    cfg, mapping, named = _materialize_cfg(ds)
+    ranges = _loop_body_ranges(steps, loops)
+    for lo, hi in ranges:
+        for s in steps[lo:hi]:
+            _rewrite_all_refs(s, mapping, named)
+
+    taken = set(data.get("variables") or {})
+    out_var = DEFAULT_LIST_VAR
+    i = 2
+    while out_var in taken:
+        out_var = f"{DEFAULT_LIST_VAR}{i}"
+        i += 1
+
+    for pos in loops:
+        s = steps[pos]
+        s["loop_expr"] = "{{" + out_var + "}}"
+        s.pop("loop_source", None)
+        s.pop("loop_items", None)
+        s.pop("loop_range", None)
+
+    read_step: Dict[str, Any] = {
+        "id": 0, "action": "read_data",
+        "output_var": out_var, "data_cfg": cfg,
+    }
+    steps.insert(loops[0], read_step)
+
+    # 顺序号重排成 1..N（画布手动连线跟着换号）
+    id_map: Dict[Any, int] = {}
+    for n, s in enumerate(steps, start=1):
+        id_map[s.get("id")] = n
+        s["id"] = n
+    if data.get("canvas_edges"):
+        data["canvas_edges"] = [
+            [_remap_endpoint(e[0], id_map), _remap_endpoint(e[1], id_map)]
+            for e in data["canvas_edges"]
+            if isinstance(e, (list, tuple)) and len(e) == 2
+        ]
+    return data
 
 
 # Windows 文件夹名非法字符
