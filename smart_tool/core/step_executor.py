@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 from playwright.sync_api import (
     Page, TimeoutError as PlaywrightTimeout, sync_playwright,
@@ -17,9 +17,7 @@ from playwright.sync_api import (
 
 from smart_tool.core import blocks, image_locator
 from smart_tool.core.blocks import Block
-from smart_tool.core.data_sources import (
-    DataSourceConfig, DataSourceError, list_columns, load_rows,
-)
+from smart_tool.core.data_sources import DataSourceConfig, load_rows
 from smart_tool.core.project_store import Locator, Step
 
 # fill 真能填的元素：input / textarea（可编辑区域另判）；<select> 要用「下拉选择」动作
@@ -122,34 +120,34 @@ def _as_list(value: Any) -> Optional[List[Any]]:
 def _item_record(item: Any) -> Dict[str, str]:
     """列表里的一项 → 本轮注入的变量。
 
-    对象（dict）会把键展开成 row.<键>，和表格/文件数据源的写法一致；
-    标量则放进 {{loop.item}}。
+    对象（例如「读取数据」读出来的一个文件）把字段展开成 {{loop.item.字段}}；
+    标量放进 {{loop.item}}。
     """
     if isinstance(item, dict):
-        rec = {f"row.{k}": _to_text(v) for k, v in item.items()}
-        rec["loop.item"] = _to_text(item)
+        rec = {"loop.item": _to_text(item)}
+        for k, v in item.items():
+            rec[f"loop.item.{k}"] = _to_text(v)
         return rec
     return {"loop.item": _to_text(item)}
 
 
 # {{变量}} 占位符
 VAR_PATTERN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
-# 循环「索引范围」写法：一个整数或 {{变量}}，可写成「起-止」（首尾都算）
-# 只写一项时它是「次数/长度」，索引从 0 开始
-LOOP_RANGE_RE = re.compile(
-    r"^\s*(\d+|\{\{[^{}]+\}\})\s*(?:-\s*(\d+|\{\{[^{}]+\}\}))?\s*$"
-)
-# 循环自动注入的变量
-LOOP_VARS = ("loop.index", "loop.zero_index", "loop.item")
-# 数据源产出的变量前缀
-DATA_VAR_PREFIXES = ("row.", "file.")
+# 循环自动注入的变量（不需要配置，循环里天然有值）
+LOOP_VARS = ("loop.item", "loop.index")
+# 运行时才有的变量前缀（{{loop.item.字段}} / {{loop.index}}）
+LOOP_PREFIX = "loop."
 
 
 def step_var_fields(step: Step) -> List[str]:
     """步骤里可能出现 {{变量}} 的文本字段。"""
     texts = [step.url, step.value, step.wait_target,
              step.resume_url, step.resume_element, step.prompt,
-             step.loop_items, step.loop_range, step.cond_expr]
+             step.loop_expr, step.cond_expr]
+    # 「读取数据」的路径可以写日期变量，如 D:\输出数据\{{年}}\{{月}}
+    path = (step.data_cfg or {}).get("path")
+    if isinstance(path, str):
+        texts.append(path)
     # 条件分支的匹配值也允许写 {{变量}}（运行时先渲染再比）
     texts += [m.get("values", "") for m in (step.cond_branches or [])]
     return [t for t in texts if t]
@@ -166,100 +164,119 @@ def collect_variables(steps: List[Step]) -> List[str]:
     return found
 
 
-def check_variables(steps: List[Step], data_columns: Optional[List[str]] = None,
+def produced_variables(steps: List[Step]) -> Dict[str, Step]:
+    """「读取数据」节点产出的变量 → 那个节点。"""
+    out: Dict[str, Step] = {}
+    for s in steps:
+        if s.action == "read_data":
+            name = (s.output_var or "").strip()
+            if name:
+                out[name] = s
+    return out
+
+
+def loop_fields(steps: List[Step], start: Step) -> List[str]:
+    """这个循环遍历的数据有哪些字段（供 {{loop.item.字段}} 使用）。
+
+    循环内容写的是 {{A}}、而 A 是某个「读取数据」节点产出的 → 返回该节点
+    配置的字段名；否则返回空（列表项是普通文本，只有 {{loop.item}} 本身）。
+    """
+    raw = (start.loop_expr or "").strip()
+    m = VAR_PATTERN.fullmatch(raw)
+    if not m:
+        return []
+    node = produced_variables(steps).get(m.group(1))
+    if node is None:
+        return []
+    fields: List[str] = []
+    for item in (node.data_cfg or {}).get("field_map") or []:
+        if isinstance(item, dict):
+            var = (item.get("var") or "").strip()
+            if var and var not in fields:
+                fields.append(var)
+    return fields
+
+
+def check_variables(steps: List[Step],
                     project_variables: Optional[dict] = None) -> List[str]:
     """运行前检查变量是否有来源，返回问题清单（空 = 没问题）。
 
-    重点盯两种情况，避免"跑起来才发现没内容"：
-    1. 循环体内引用了 row./file. 变量，但数据源压根不产出它
-       （例如正文变量没配字段映射，运行时会填进占位说明文字）
-    2. 引用的变量既不在数据源、也不在项目变量里
-    """
-    data_cols = set(data_columns or ())
-    proj_vars = set(project_variables or ())
+    现在的变量只有三种来源：
+    1. 项目变量（手工加的账号密码之类）；
+    2. 「读取数据」节点产出的列表变量（循环用它遍历）；
+    3. 循环体内自动有的 {{loop.item}} / {{loop.item.字段}} / {{loop.index}}。
 
-    # 分清三种循环：数据源循环里 row./file. 由数据源产出；
-    # 列表循环里 row.* 来自列表项（对象），静态看不出有哪些字段，不误报；
-    # 索引范围循环根本没有行数据，引用了 row./file. 要如实提示。
-    # 条件块里的步骤跟随外层循环（缩进再深也一样）。
-    data_loop_ids: set = set()
-    list_loop_ids: set = set()
-    range_loop_ids: set = set()
+    重点盯「跑起来才发现是空的」：循环外引用了 loop.*、字段名写错、
+    变量根本没来源。
+    """
+    proj_vars = set(project_variables or ())
+    produced = produced_variables(steps)
+
+    # 每个循环块里能用的 loop.* 名字（按步骤 id 记）
+    scope_by_id: Dict[int, set] = {}
     try:
         tree = blocks.parse(steps)
     except blocks.StructureError:
         tree = []       # 结构问题由别处报错，这里不做重复提示
 
-    def walk(nodes: List[Any]):
+    def walk(nodes: List[Any], scopes: List[set]):
         for n in nodes:
             if not isinstance(n, Block):
                 continue
             if n.kind == "loop":
-                src = n.start.loop_source or "data"
-                target = {"list": list_loop_ids,
-                          "range": range_loop_ids}.get(src, data_loop_ids)
-                target.update(s.id for s in n.steps)
-            walk(n.nodes)
+                names = set(LOOP_VARS)
+                names.update(f"loop.item.{f}" for f in loop_fields(steps, n.start))
+                inner = scopes + [names]
+                for s in n.steps:
+                    scope_by_id[s.id] = set().union(*inner)
+                walk(n.nodes, inner)
+            else:
+                for s in n.steps:
+                    if scopes:
+                        scope_by_id[s.id] = set().union(*scopes)
+                walk(n.nodes, scopes)
 
-    walk(tree)
+    walk(tree, [])
 
     problems: List[str] = []
     seen = set()
 
-    def add(step_id: int, name: str, reason: str):
-        key = (name, reason)
+    def add(step_id: int, text: str):
+        key = (step_id, text)
         if key in seen:
             return
         seen.add(key)
-        problems.append(f"步骤 {step_id} 引用了 {{{{{name}}}}}：{reason}")
+        problems.append(f"步骤 {step_id}：{text}")
+
+    # 先看「读取数据」节点自身配全了没有
+    for name, node in produced.items():
+        if not (node.data_cfg or {}).get("type") or not (node.data_cfg or {}).get("path"):
+            add(node.id, f"「读取数据」节点还没选好文件 / 文件夹（它要产出 {{{{{name}}}}}）")
 
     for s in steps:
+        if s.action == "read_data" and not (s.output_var or "").strip():
+            add(s.id, "「读取数据」节点还没填产出变量名（双击节点填写，如 文章列表）")
+        if s.action == "loop_start" and not (s.loop_expr or "").strip():
+            add(s.id, "「循环」节点还没填循环内容（双击节点填写：数字＝跑几次，"
+                      "或 {{变量}}＝按它的长度跑）")
         for text in step_var_fields(s):
             for name in VAR_PATTERN.findall(text):
-                if name in LOOP_VARS:
+                if name.startswith(LOOP_PREFIX):
+                    scope = scope_by_id.get(s.id, set())
+                    if not scope:
+                        add(s.id, f"{{{name}}} 只在循环体里有值，"
+                                  "请把这一步放进循环里（或改掉这个引用）")
+                    elif name not in scope:
+                        field = name[len("loop.item."):] \
+                            if name.startswith("loop.item.") else name
+                        add(s.id, f"循环遍历的数据里没有「{field}」这个字段，"
+                                  "请检查「读取数据」节点里勾选的字段名")
                     continue
-                is_data_var = name.startswith(DATA_VAR_PREFIXES)
-                if name in data_cols:
-                    # 数据源字段是「逐行注入」的：只有在「数据源」循环里才有值。
-                    # 如果这些步骤套在「索引范围 / 变量列表」循环里，运行时取不到，
-                    # 却既不报错也不提示，最后填进空值——所以这里要如实提示。
-                    if s.id in data_loop_ids or not (s.id in range_loop_ids
-                                                     or s.id in list_loop_ids):
-                        continue
-                    add(s.id, name,
-                        "这个循环不是「数据源」循环，取不到数据源的字段"
-                        "（要按行取数据请把循环方式改成「数据源」）")
+                if name in proj_vars or name in produced:
                     continue
-                if is_data_var and s.id in list_loop_ids:
-                    continue        # 来自列表项，交给运行时
-                in_project = name in proj_vars
-                if is_data_var and s.id in range_loop_ids:
-                    reason = ("循环方式是「索引范围」，没有行数据"
-                              "（要按行取数据请把循环方式改成「数据源」或「变量 / 手动列表」）")
-                elif is_data_var and s.id in data_loop_ids:
-                    reason = "数据源没有产出这个变量（可在【项目管理…】→【数据源与字段】里配置字段映射）"
-                elif is_data_var:
-                    reason = "数据源没有产出这个变量"
-                elif not in_project:
-                    reason = "找不到这个变量的来源（可加到【项目管理…】的变量里）"
-                else:
-                    continue
-                add(s.id, name, reason)
-
-    # 循环的「索引范围 / 循环项」在循环开始之前就要算出结果，
-    # 那一刻数据源还没读、行变量还不存在（典型写法：索引范围填 {{file.total}}）。
-    for s in steps:
-        if s.action != blocks.LOOP_START:
-            continue
-        src = s.loop_source or "data"
-        if src == "data":
-            continue
-        text = s.loop_range if src == "range" else s.loop_items
-        for name in VAR_PATTERN.findall(text or ""):
-            if name in data_cols and s.id not in data_loop_ids:
-                add(s.id, name,
-                    "循环开始前还没有值（它由数据源按行产出）；"
-                    "要按文件逐个循环，请把循环方式改成「数据源」")
+                add(s.id, f"{{{name}}} 找不到来源："
+                          "要么在【项目管理…】里加一个自定义变量，"
+                          "要么用「读取数据」节点产出它")
     return problems
 
 
@@ -288,7 +305,6 @@ class StepExecutor:
         log: Callable[[str], None] = print,
         on_pause: Optional[Callable[[Step], Optional[PauseHandle]]] = None,
         on_resume: Optional[Callable[[str], None]] = None,
-        data_source: Optional[dict] = None,
     ):
         """
         :param project_dir: 项目目录，用于解析 locator.value 中相对路径的截图
@@ -298,7 +314,6 @@ class StepExecutor:
                          此时仅靠 resume_condition 自动检测，manual 条件则等回车。
         :param on_resume: 暂停结束回调，参数为原因：
                           auto（信号自动检测）/manual（人工继续）/abort（人工终止）。
-        :param data_source: 数据源配置 dict（loop_start/loop_end 之间按行循环）。
         """
         self.steps = steps
         self.variables = variables or {}
@@ -307,7 +322,6 @@ class StepExecutor:
         self.log = log
         self.on_pause = on_pause
         self.on_resume = on_resume
-        self.data_source = data_source or {}
         self._stop = False
         self._page: Optional[Page] = None
 
@@ -417,14 +431,14 @@ class StepExecutor:
         return result in values
 
     def _run_loop(self, block: Block):
-        """按「循环方式」逐项执行循环体。
+        """按循环内容逐项执行循环体。
 
-        来源三种：
-        - 数据源：文件/表格的每一行（产出 row.* / file.*）
-        - 变量或手动列表：每项注入 loop.item；项是对象时，其键按 row.* 注入
-        - 索引范围：按次数/索引循环，loop.item = 当前索引
-        三者都会注入 loop.index（1 起）与 loop.zero_index；
-        项变量只覆盖本次循环，静态变量（如项目变量里的手工测试值）作兜底。
+        循环表达式（循环节点里唯一的那个输入框）：
+        - 数字 10        → 跑 10 次，loop.item = 当前索引（0 起）
+        - {{变量}}       → 变量值是列表/多行文本就逐项遍历、是数字就跑那么多次
+        - 其他文本       → 按行 / 逗号拆成多项
+        每一轮注入 {{loop.item}}（当前项，对象会展开成 {{loop.item.字段}}）
+        与 {{loop.index}}（第几轮，从 1 开始）。
         """
         start_step = block.start
         records, source_label = self._loop_records(start_step)
@@ -439,147 +453,69 @@ class StepExecutor:
                 self.log("已停止。")
                 break
             self.log(f"──── 循环 {i}/{total} ────")
-            self.variables = {
-                **base_vars, **rec,
-                "loop.index": str(i),
-                "loop.zero_index": str(i - 1),
-            }
+            self.variables = {**base_vars, **rec, "loop.index": str(i)}
             self._run_nodes(block.nodes)
         self.log(f"[循环结束] 完成 {total} 项")
         # 恢复循环外的变量；但保留脚本在循环里新造的变量（累加器之类）
-        row_keys = set()
-        for rec in records:
-            row_keys.update(rec.keys())
         carried = {
             k: v for k, v in self.variables.items()
-            if k not in row_keys and k not in LOOP_VARS and k not in base_vars
+            if not k.startswith(LOOP_PREFIX) and k not in base_vars
         }
         self.variables = {**base_vars, **carried}
 
     def _loop_records(self, start_step: Step):
         """准备每一项的记录，返回 (记录列表, 来源说明)；None 表示没有可循环的数据。"""
-        src = start_step.loop_source or "data"
-        if src == "range":
-            numbers = self._resolve_loop_range(start_step)
-            if not numbers:
-                self.log("[循环] 索引范围是空的，跳过循环体。")
-                return None, ""
-            label = (f"索引范围 {numbers[0]}-{numbers[-1]}"
-                     if len(numbers) > 1 else f"索引范围 {numbers[0]}")
-            return [{"loop.item": _to_text(n)} for n in numbers], label
-        if src == "list":
-            items = self._resolve_loop_items(start_step)
-            if not items:
-                self.log("[循环] 列表来源是空的，跳过循环体。")
-                return None, ""
-            return [_item_record(x) for x in items], "循环项列表"
-        cfg = DataSourceConfig.from_dict(self.data_source)
-        if not cfg.configured:
-            raise DataSourceError(
-                "存在「循环」节点，但既没配置数据源，也没填循环项。\n"
-                "请在循环节点里把循环方式改成「变量 / 手动列表」或「索引范围」，"
-                "或点【项目管理…】→【数据源与字段】配置文件路径"
-            )
-        rows = load_rows(cfg)
-        if not rows:
-            self.log(f"[循环] 数据源 {Path(cfg.path).name} 没有数据行，跳过循环体。")
-            return None, ""
-        return rows, f"数据源：{Path(cfg.path).name}"
-
-    def _resolve_loop_items(self, start_step: Step) -> List[Any]:
-        """解析「循环项」输入框。
-
-        - 整框只写了一个 {{变量}}：直接取该变量的值当列表
-          （值可以是真列表、JSON 数组，或换行/逗号分隔的文本）
-        - 否则按行拆成多项，行内的 {{变量}} 做文本替换
-        """
-        raw = (start_step.loop_items or "").strip()
+        raw = (start_step.loop_expr or "").strip()
         if not raw:
-            return []
+            raise ValueError(
+                "「循环」节点还没填循环内容，请双击它填写：\n"
+                "    写数字＝跑几次（如 10）；写变量＝按它的长度跑（如 {{文章列表}}）"
+            )
+        items, label = self._loop_items(raw)
+        if not items:
+            self.log(f"[循环] {label} 是空的，跳过循环体。")
+            return None, ""
+        return [_item_record(x) for x in items], label
+
+    def _loop_items(self, raw: str):
+        """把循环表达式解析成「要重复的项」列表，返回 (列表, 来源说明)。"""
+        # 1) 纯数字：跑这么多次，每一项就是当前索引
+        if raw.isdigit():
+            n = int(raw)
+            if n <= 0:
+                self.log(f"  循环次数 {raw} 不是正数，本次不执行循环体。")
+                return [], f"循环 {raw} 次"
+            return list(range(n)), f"循环 {n} 次"
+
+        # 2) 整框只写了一个变量：按它的值来决定跑几项
         m = VAR_PATTERN.fullmatch(raw)
         if m:
             name = m.group(1)
-            if name in self.variables:
-                items = _as_list(self.variables[name])
-                if items is not None:
-                    self.log(f"  循环来源变量 {{{{{name}}}}} → {len(items)} 项")
-                    return items
+            if name not in self.variables:
+                raise ValueError(
+                    f"循环内容「{raw}」里的变量 {{{{{name}}}}} 现在还没有值。\n"
+                    "    如果它由「读取数据」节点产出，请把那个节点放到循环前面。"
+                )
+            value = self.variables[name]
+            text = str(value).strip()
+            if text.isdigit():          # 变量值是数字 → 当作次数
+                n = int(text)
+                self.log(f"  变量 {{{{{name}}}}} = {n} → 循环 {n} 次")
+                return list(range(max(0, n))), f"变量 {{{{{name}}}}}（{n} 次）"
+            items = _as_list(value) or []
+            return items, f"变量 {{{{{name}}}}}（{len(items)} 项）"
+
+        # 3) 其他写法：渲染成文本后按行 / 逗号拆
         text = self._resolve_value(raw)
-        return [line.strip() for line in re.split(r"[\r\n]+", text) if line.strip()]
-
-    def _resolve_loop_range(self, start_step: Step) -> List[int]:
-        """解析「索引范围」循环要跑的数字序列，返回 [起, ..., 止]。
-
-        写法与含义（首尾都算）：
-        - `10`          → 索引 0~9（共 10 次）
-        - `0-10`        → 索引 0~10（共 11 次）
-        - `5-10`        → 索引 5~10（共 6 次）
-        - `{{变量}}`     → 按变量的「长度」跑：列表 / 多行文本按项数（3 项 → 0~2），
-                          取值为整数则按该数（5 → 0~4）
-        - `0-{{列表}}`   → 从 0 跑到列表最后一项的索引
-        """
-        raw = (start_step.loop_range or "").strip()
-        if not raw:
+        lost = [n for n in VAR_PATTERN.findall(text) if n not in self.variables]
+        if lost:
+            names = "、".join(f"{{{{{n}}}}}" for n in lost)
             raise ValueError(
-                "「循环」的循环方式选了「索引范围」，但没填范围。\n"
-                "例如 10（跑 10 次）、0-10、5-10、{{次数}}、0-{{列表}}。"
+                f"循环内容「{raw}」里的变量 {names} 现在还没有值。\n"
+                "    如果它由「读取数据」节点产出，请把那个节点放到循环前面。"
             )
-        m = LOOP_RANGE_RE.match(raw)
-        if m is None:
-            raise ValueError(
-                f"索引范围「{raw}」格式不对：只能写数字、数字-数字，或 {{变量}}。\n"
-                "例如 10、0-10、5-10、{{次数}}、0-{{列表}}。"
-            )
-        kind1, value1 = self._range_term(m.group(1), raw)
-        if m.group(2) is None:
-            # 只写一项：它是「次数 / 变量长度」，数字从 0 开始数
-            if value1 <= 0:
-                self.log(f"  索引范围 {raw} 算出来是 0 次，本次不执行循环体。")
-                return []
-            begin, end = 0, value1 - 1
-        else:
-            kind2, value2 = self._range_term(m.group(2), raw)
-            begin = value1 if kind1 == "num" else 0
-            end = value2 if kind2 == "num" else value2 - 1
-        if begin > end:
-            self.log(f"  索引范围 {begin}-{end}：起始索引大于结束索引，本次不执行循环体。")
-            return []
-        return list(range(begin, end + 1))
-
-    def _range_term(self, term: str, raw: str) -> Tuple[str, int]:
-        """解析索引范围里的一项 → (kind, 值)。
-
-        kind="num"：当数字用（字面数字，或取值为整数的变量）；
-        kind="len"：当变量长度用（列表 / JSON 数组 / 换行·逗号分隔文本的项数）。
-        """
-        term = term.strip()
-        m = VAR_PATTERN.fullmatch(term)
-        if m is None:
-            return "num", int(term)
-        name = m.group(1)
-        if name not in self.variables:
-            # 说清楚"为什么没有"和"该怎么办"：数据源字段是逐行注入的，
-            # 循环还没开始当然取不到（典型写法：索引范围填 {{file.total}}）
-            hint = ""
-            cols = (list_columns(DataSourceConfig.from_dict(self.data_source))
-                    if self.data_source else [])
-            if name in cols:
-                hint = ("\n它是数据源按行产出的字段（每行一个文件），"
-                        "循环还没开始所以取不到。\n"
-                        "要按文件逐个循环，请把循环方式改成「数据源」。")
-            raise ValueError(
-                f"索引范围「{raw}」引用了变量 {{{{{name}}}}}，但当前没有这个变量的值。{hint}"
-            )
-        value = self.variables[name]
-        text = str(value).strip()
-        if text.isdigit():
-            return "num", int(text)
-        items = _as_list(value)
-        if not items:
-            raise ValueError(
-                f"索引范围「{raw}」里的变量 {{{{{name}}}}} 是空的，算不出长度。"
-            )
-        return "len", len(items)
+        items = _as_list(text) or []
+        return items, f"循环内容：{raw[:30]}（{len(items)} 项）"
 
     # ------------------------------
     # 步骤分发
@@ -589,6 +525,8 @@ class StepExecutor:
         try:
             if step.action == "navigate":
                 self._navigate(step)
+            elif step.action == "read_data":
+                self._read_data(step)
             elif step.action == "click":
                 self._click(step)
             elif step.action == "fill":
@@ -758,6 +696,38 @@ class StepExecutor:
     # ------------------------------
     # 动作
     # ------------------------------
+    def _read_data(self, step: Step):
+        """「读取数据」节点：读文件 / 文件夹，把结果放进 output_var。
+
+        产出的是一个「列表变量」：每一项是一个文件（或表格的一行），
+        字段名就是节点里勾选的那些；循环节点写 {{这个变量}} 就能逐项遍历，
+        循环体里用 {{loop.item.字段}} 取字段。
+        """
+        var = (step.output_var or "").strip()
+        if not var:
+            raise ValueError(
+                "「读取数据」节点还没填产出变量名。\n"
+                "   双击这个节点，填一个名字（如 文章列表），循环节点里就能引用它。"
+            )
+        cfg = DataSourceConfig.from_dict(step.data_cfg or {})
+        if not cfg.configured:
+            raise ValueError(
+                f"「读取数据」节点还没选好文件 / 文件夹（它要产出 {{{{{var}}}}}）。\n"
+                "   双击这个节点，选好路径并【读取预览】勾选字段。"
+            )
+        cfg.path = self._resolve_value(cfg.path).strip()
+        rows = load_rows(cfg)
+        if not rows:
+            self.log(f"  没读到数据（{Path(cfg.path).name}），变量 {{{{{var}}}}} 是空的。")
+        self.variables[var] = _to_text(rows)
+        fields: List[str] = []
+        for r in rows[:1]:
+            fields = list(r.keys())
+        self.log(f"  读取到 {len(rows)} 项 → 变量 {{{{{var}}}}}")
+        if fields:
+            names = "、".join(f"{{{{loop.item.{f}}}}}" for f in fields[:6])
+            self.log(f"  每个文件的字段：{names}" + ("…" if len(fields) > 6 else ""))
+
     def _navigate(self, step: Step):
         """打开网页。
 
