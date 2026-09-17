@@ -4,8 +4,8 @@
 - 每个步骤是一张可自由拖动的圆角卡片，按 steps 列表顺序连线
 - 默认【横向蛇形排版】：从左到右排列，超出宽度自动换行，
   下一行反向（右→左），使连线始终最短；可随时点【自动排版】重排
-- 「循环开始/结束」之间用紫色虚线框圈出循环体，并画一条"下一轮"回流虚线
-  （新增「循环」时这两个节点由系统一起创建，设置只存在循环开始节点上）
+- 「循环开始/结束」这一对节点用紫色虚线框圈在一起，画布上当「一块」看：
+  框内部不画箭头，外部连线直接接到框上（左边进、右边出）
 - 位置持久化到每个步骤的 pos；执行顺序由步骤列表顺序决定
 """
 from pathlib import Path
@@ -42,9 +42,8 @@ MARGIN_Y = 18
 DEFAULT_PER_ROW = 6
 MAX_PER_ROW = 12
 
-# 循环框留白（顶部留够回流虚线的高度）
+# 循环框留白（顶部留够标签与连线的高度）
 REGION_PAD = (-14, -22, 14, 14)
-BACK_EDGE_LIFT = 16.0
 
 # 场景留白：起点侧留小一点（内容不会缩在一个巨大空白画布的角落），
 # 拖动方向留足空间，方便继续往外拖
@@ -169,6 +168,10 @@ class NodeItem(QGraphicsItem):
         return self._h
 
     # ---- 连接锚点 ----
+    def center(self) -> QPointF:
+        """卡片中心（判断「是否同一行」用，比左上角稳）。"""
+        return self.mapToScene(QPointF(NODE_W / 2, self._h / 2))
+
     def top_port(self) -> QPointF:
         return self.mapToScene(QPointF(NODE_W / 2, 0))
 
@@ -180,12 +183,6 @@ class NodeItem(QGraphicsItem):
 
     def right_port(self) -> QPointF:
         return self.mapToScene(QPointF(NODE_W, self._h / 2))
-
-    def left_port_top(self) -> QPointF:
-        return self.mapToScene(QPointF(0, HEADER_H))
-
-    def left_port_bottom(self) -> QPointF:
-        return self.mapToScene(QPointF(0, self._h - 10))
 
     def boundingRect(self) -> QRectF:
         return QRectF(0, 0, NODE_W, self._h)
@@ -304,27 +301,15 @@ class EdgeItem(QGraphicsPathItem):
             path.cubicTo(p1.x(), p1.y() + dy, p2.x(), p2.y() - dy, p2.x(), p2.y())
         self.setPath(path)
 
-    def connect_nodes(self, a: NodeItem, b: NodeItem, back: bool = False):
-        """相邻节点连线：同行走左右，跨行走上/下；回流边走上方弧线。"""
-        ap, bp = a.pos(), b.pos()
-        dx, dy = bp.x() - ap.x(), bp.y() - ap.y()
-        same_row = abs(dy) < 20
+    def connect_nodes(self, a, b):
+        """相邻两端连线：同行走左右，跨行走上/下。
 
-        if back:
-            if same_row:
-                p1, p2 = a.top_port(), b.top_port()
-                sp = QPointF(p1.x(), p1.y() - BACK_EDGE_LIFT)
-                ep = QPointF(p2.x(), p2.y() - BACK_EDGE_LIFT)
-                path = QPainterPath(sp)
-                mid = (ep.x() - sp.x()) / 2
-                path.cubicTo(sp.x() + mid, sp.y(), ep.x() - mid, ep.y(),
-                             ep.x(), ep.y())
-                path.lineTo(p2)
-                self._end = p2
-                self.setPath(path)
-            else:
-                self.update_path(a.left_port_bottom(), b.left_port_top())
-            return
+        a、b 可以是步骤卡片（NodeItem），也可以是循环虚线框（_LoopBoxPort）——
+        循环整块当成一个端点，外部箭头直接接到框上。
+        """
+        ac, bc = a.center(), b.center()
+        dx, dy = bc.x() - ac.x(), bc.y() - ac.y()
+        same_row = abs(dy) < 20
 
         if same_row:
             if dx >= 0:
@@ -358,6 +343,31 @@ class EdgeItem(QGraphicsPathItem):
         tri.closeSubpath()
         painter.drawPath(tri)
         painter.restore()
+
+
+class _LoopBoxPort:
+    """把循环虚线框当成一个连线端点：外部箭头接到框上，框内部不画箭头。
+
+    只需要提供 connect_nodes 用到的那几个锚点，接口与 NodeItem 一致。
+    """
+
+    def __init__(self, rect: QRectF):
+        self._rect = rect
+
+    def center(self) -> QPointF:
+        return self._rect.center()
+
+    def left_port(self) -> QPointF:
+        return QPointF(self._rect.left(), self._rect.center().y())
+
+    def right_port(self) -> QPointF:
+        return QPointF(self._rect.right(), self._rect.center().y())
+
+    def top_port(self) -> QPointF:
+        return QPointF(self._rect.center().x(), self._rect.top())
+
+    def bottom_port(self) -> QPointF:
+        return QPointF(self._rect.center().x(), self._rect.bottom())
 
 
 class LoopRegion(QGraphicsRectItem):
@@ -461,7 +471,7 @@ class FlowCanvas(QWidget):
         self._data_source: dict = {}
         self._nodes: Dict[int, NodeItem] = {}
         self._edges: List[EdgeItem] = []
-        self._edge_pairs: List[Tuple[EdgeItem, int, int, bool]] = []
+        self._edge_pairs: List[Tuple[EdgeItem, object, object]] = []
         self._loop_ranges: List[Tuple[int, int]] = []
         self._regions: List[LoopRegion] = []
         self._placeholder = None
@@ -692,34 +702,50 @@ class FlowCanvas(QWidget):
         """找出所有循环体的 [起, 止] 索引（不支持嵌套）。"""
         return loop_ranges(steps)
 
-    def _build_edges(self):
-        """按 steps 列表顺序连线；循环体内部连线用紫色。"""
-        self._loop_ranges = self._loop_ranges_of(self._steps)
-        loop_idx = set()
-        for a, b in self._loop_ranges:
-            loop_idx.update(range(a, b))
+    def _flow_units(self) -> List[object]:
+        """连线的「单元」列表：普通步骤 → 它的 id；循环 → ("box", 循环开始下标)。
 
-        for i in range(len(self._steps) - 1):
-            a = self._nodes[self._steps[i].id]
-            b = self._nodes[self._steps[i + 1].id]
-            color = "#7a4fb5" if i in loop_idx else "#9aa4b2"
-            edge = EdgeItem(color=color)
+        循环开始/结束是配合使用的一对节点，画布上整块当一个节点看：
+        框内部不画箭头，外部连线接到框上。
+        """
+        starts = {a: b for a, b in self._loop_ranges}
+        units: List[object] = []
+        i = 0
+        while i < len(self._steps):
+            end = starts.get(i)
+            if end is not None:
+                units.append(("box", i))
+                i = end + 1
+            else:
+                units.append(self._steps[i].id)
+                i += 1
+        return units
+
+    def _endpoint(self, ref):
+        """连线单元 → 端点对象（步骤卡片或循环虚线框）；拿不到返回 None。"""
+        if isinstance(ref, tuple):
+            _, a_idx = ref
+            for a, b in self._loop_ranges:
+                if a == a_idx:
+                    return _LoopBoxPort(self._loop_rect(a, b))
+            return None
+        return self._nodes.get(ref)
+
+    def _build_edges(self):
+        """按 steps 顺序连线；循环整块只连外部两端，框内部不画箭头。"""
+        self._loop_ranges = self._loop_ranges_of(self._steps)
+        units = self._flow_units()
+
+        for k in range(len(units) - 1):
+            a = self._endpoint(units[k])
+            b = self._endpoint(units[k + 1])
+            if a is None or b is None:
+                continue
+            edge = EdgeItem(color="#9aa4b2")
             self._scene.addItem(edge)
             edge.connect_nodes(a, b)
             self._edges.append(edge)
-            self._edge_pairs.append((edge, self._steps[i].id,
-                                     self._steps[i + 1].id, False))
-
-        # 循环回流虚线：循环结束 → 循环开始
-        for a_idx, b_idx in self._loop_ranges:
-            n_start = self._nodes[self._steps[a_idx].id]
-            n_end = self._nodes[self._steps[b_idx].id]
-            back = EdgeItem(color="#7a4fb5", dashed=True)
-            self._scene.addItem(back)
-            back.connect_nodes(n_end, n_start, back=True)
-            self._edges.append(back)
-            self._edge_pairs.append(
-                (back, n_end.step.id, n_start.step.id, True))
+            self._edge_pairs.append((edge, units[k], units[k + 1]))
 
     def _build_loop_regions(self):
         for a_idx, b_idx in self._loop_ranges:
@@ -756,11 +782,11 @@ class FlowCanvas(QWidget):
         """节点拖动时实时更新连线、循环框与场景范围。"""
         if not self._nodes:
             return
-        for edge, id_a, id_b, back in self._edge_pairs:
-            node_a, node_b = self._nodes.get(id_a), self._nodes.get(id_b)
-            if node_a is None or node_b is None:
+        for edge, ref_a, ref_b in self._edge_pairs:
+            pa, pb = self._endpoint(ref_a), self._endpoint(ref_b)
+            if pa is None or pb is None:
                 continue
-            edge.connect_nodes(node_a, node_b, back=back)
+            edge.connect_nodes(pa, pb)
         for region, (a_idx, b_idx) in zip(self._regions, self._loop_ranges):
             region.update_rect(self._loop_rect(a_idx, b_idx),
                                self._loop_label(self._steps[a_idx]))

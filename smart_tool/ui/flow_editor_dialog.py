@@ -281,8 +281,8 @@ class FlowEditorDialog(QDialog):
         idx = self._selected_row()
         has = idx >= 0
         block = loop_block_at(self._steps, idx) if has else None
-        if block:
-            lo, hi = block
+        if block and idx in (block[0], block[1]):
+            lo, hi = block            # 选中循环的任一端：整块上下移动
         elif has:
             lo, hi = self._move_bounds(idx)
         else:
@@ -398,12 +398,14 @@ class FlowEditorDialog(QDialog):
         s = self._steps[idx]
         name = ACTION_META.get(s.action, (s.action, ""))[0]
         block = loop_block_at(self._steps, idx)
-        if block:
+        if block and idx in (block[0], block[1]):
+            # 只删除循环的「两端」才连循环体一起删；
+            # 循环体里的普通步骤就是删它自己
             a, b = block
             body = b - a - 1
             reply = QMessageBox.question(
                 self, "删除循环",
-                f"「循环」是一个容器节点，删除会连同里面的 {body} 个步骤一起去掉。\n"
+                f"「循环」是一对配套节点，删除会连同里面的 {body} 个步骤一起去掉。\n"
                 f"确定删除这个循环吗？"
             )
             if reply != QMessageBox.StandardButton.Yes:

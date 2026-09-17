@@ -513,11 +513,12 @@ class WebAutomationTab(QWidget):
         if row < 0:
             return
         block = loop_block_at(self._steps, row)
-        if block:
+        if block and row in (block[0], block[1]):
+            # 只删循环的「两端」才连循环体一起删；体内的普通步骤只删自己
             a, b = block
             reply = QMessageBox.question(
                 self, "删除循环",
-                f"「循环」是容器节点，删除会连同里面的 {b - a - 1} 个步骤一起去掉。\n"
+                f"「循环」是一对配套节点，删除会连同里面的 {b - a - 1} 个步骤一起去掉。\n"
                 f"确定删除这个循环吗？",
             )
             if reply != QMessageBox.StandardButton.Yes:
@@ -609,8 +610,8 @@ class WebAutomationTab(QWidget):
             act("删除", self._delete_selected_step)
             menu.addSeparator()
             block = loop_block_at(self._steps, row)
-            if block:
-                lo, hi = block            # 选中「循环」：整块上下移动
+            if block and row in (block[0], block[1]):
+                lo, hi = block            # 选中循环的任一端：整块上下移动
             else:
                 lo, hi = self._move_bounds(row)
             act("上移", lambda: self._move_selected(-1), row > lo)
