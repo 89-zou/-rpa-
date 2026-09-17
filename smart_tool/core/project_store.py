@@ -26,6 +26,16 @@ from smart_tool import paths
 # 自动备份：每次真改内容写盘前，把现有的 steps.json 存成 bak1，最多留这么多份
 BACKUP_KEEP = 3
 
+# 项目场景：网页（Playwright，XPath / 元素捕获）或桌面（全屏截图定位 + 系统鼠标键盘）
+SCENE_WEB, SCENE_DESKTOP = "web", "desktop"
+SCENES = ((SCENE_WEB, "网页自动化（浏览器）"),
+          (SCENE_DESKTOP, "桌面应用（截图定位 + 鼠标键盘）"))
+
+
+def normalize_scene(value) -> str:
+    """只认 desktop，其余都当网页场景。"""
+    return SCENE_DESKTOP if value == SCENE_DESKTOP else SCENE_WEB
+
 
 @dataclass
 class Locator:
@@ -89,6 +99,10 @@ class Step:
     cond_expr: str = ""
     # 分支清单，顺序＝各分支块的先后： [{"name": "北京", "values": "北京,上海"}, ...]
     cond_branches: List[Dict[str, str]] = field(default_factory=list)
+    # ---- 桌面场景专用（scene=desktop）----
+    win_title: str = ""                  # win_activate：窗口标题里的一小段
+    keys: str = ""                       # hotkey：要按的键，如 ctrl+s、enter
+    click_times: int = 1                 # click：点几次（2＝双击）
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {"id": self.id, "action": self.action}
@@ -138,6 +152,12 @@ class Step:
             if self.cond_expr:
                 d["cond_expr"] = self.cond_expr
             d["cond_branches"] = [dict(m) for m in self.cond_branches]
+        if self.action == "win_activate" and self.win_title:
+            d["win_title"] = self.win_title
+        if self.action == "hotkey" and self.keys:
+            d["keys"] = self.keys
+        if self.action == "click" and int(self.click_times or 1) != 1:
+            d["click_times"] = int(self.click_times)
         if self.pos is not None:
             d["pos"] = [float(self.pos[0]), float(self.pos[1])]
         return d
@@ -180,6 +200,9 @@ class Step:
             cond_expr=d.get("cond_expr", ""),
             cond_branches=[dict(m) for m in d.get("cond_branches", [])
                            if isinstance(m, dict)],
+            win_title=d.get("win_title", ""),
+            keys=d.get("keys", ""),
+            click_times=int(d.get("click_times", 1) or 1),
         )
 
 
@@ -219,8 +242,9 @@ class ProjectStore:
         return self.load().get("layout", "") or ""
 
     def save(self, steps: List[Step], variables: Optional[Dict[str, str]] = None,
-             layout_version: Optional[str] = None):
-        """保存步骤与变量。variables/layout 为 None 时保留原值。"""
+             layout_version: Optional[str] = None,
+             scene: Optional[str] = None):
+        """保存步骤与变量。variables/layout/scene 为 None 时保留原值。"""
         old = self.load()
         data: Dict[str, Any] = {"steps": [s.to_dict() for s in steps]}
         data["variables"] = (
@@ -234,6 +258,10 @@ class ProjectStore:
         )
         if old.get("real_mouse"):
             data["real_mouse"] = True     # 项目级开关，别被保存步骤时弄丢
+        scene_val = normalize_scene(
+            scene if scene is not None else old.get("scene"))
+        if scene_val == SCENE_DESKTOP:
+            data["scene"] = SCENE_DESKTOP
         self._write(data)
 
     def save_variables(self, variables: Dict[str, str]):
@@ -266,6 +294,14 @@ class ProjectStore:
         data = dict(self.load())
         data["real_mouse"] = bool(on)
         self._write(data)
+
+    def load_scene(self) -> str:
+        """这个项目的场景：web（浏览器）/ desktop（桌面应用）。"""
+        return normalize_scene(self.load().get("scene"))
+
+    @property
+    def is_desktop(self) -> bool:
+        return self.load_scene() == SCENE_DESKTOP
 
     # ------------------------------
     # 写盘 + 自动备份
@@ -647,18 +683,27 @@ def list_projects() -> List[ProjectStore]:
     return result
 
 
-def create_project(name: str, initial_url: str = "") -> ProjectStore:
-    """新建项目。initial_url 非空时自动生成第 1 步 navigate。"""
+def create_project(name: str, initial_url: str = "",
+                   scene: str = SCENE_WEB) -> ProjectStore:
+    """新建项目。
+
+    :param initial_url: 网页场景下非空时自动生成第 1 步「打开网页」。
+    :param scene: 场景；桌面场景不带网址，改为先放一个「激活窗口」占位。
+    """
     paths.ensure_dirs()
     err = validate_project_name(name)
     if err:
         raise ValueError(err)
+    scene = normalize_scene(scene)
     store = ProjectStore(paths.PROJECTS_DIR / name.strip())
     store.ensure()
     if not store.steps_file.exists():
         steps: List[Step] = []
-        url = initial_url.strip()
-        if url:
-            steps.append(Step(id=1, action="navigate", url=url))
-        store.save(steps, {})
+        if scene == SCENE_DESKTOP:
+            steps.append(Step(id=1, action="win_activate"))
+        else:
+            url = initial_url.strip()
+            if url:
+                steps.append(Step(id=1, action="navigate", url=url))
+        store.save(steps, {}, scene=scene)
     return store

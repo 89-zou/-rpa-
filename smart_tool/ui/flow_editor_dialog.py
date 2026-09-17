@@ -128,13 +128,15 @@ class FlowEditorDialog(QDialog):
 
     def __init__(self, project_dir, steps: List[Step],
                  parent=None,
-                 project_variables: Optional[dict] = None):
+                 project_variables: Optional[dict] = None,
+                 scene: str = "web"):
         super().__init__(parent)
         self.setWindowTitle("流程编辑")
         self.setMinimumSize(720, 580)
         self.project_dir = Path(project_dir)
         self._store = ProjectStore(self.project_dir)
         self.project_variables = project_variables or {}
+        self.scene = scene
         # 本地副本：改一次就立刻写盘一次，关掉弹窗也不会丢
         self._steps: List[Step] = [
             Step.from_dict(s.to_dict()) for s in steps
@@ -331,6 +333,7 @@ class FlowEditorDialog(QDialog):
             variable_names=step_executor.available_variables(
                 self._steps, self.project_variables),
             default_url=self._default_url(),
+            scene=self.scene,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             return dlg.get_step()
@@ -387,6 +390,7 @@ class FlowEditorDialog(QDialog):
             variable_names=step_executor.available_variables(
                 self._steps, self.project_variables),
             default_url=self._default_url(),
+            scene=self.scene,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
