@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
 )
 
 from smart_tool.core.project_store import Locator, Step
+from smart_tool.ui.element_picker_dialog import ElementPickerDialog
 from smart_tool.ui.read_data_panel import ReadDataPanel
 
 ACTIONS = [
@@ -120,7 +121,8 @@ class StepEditDialog(QDialog):
     """新建/编辑步骤。get_step() 在 accept 后取结果。"""
 
     def __init__(self, project_dir: Path, step: Optional[Step] = None,
-                 parent=None, variable_names: Optional[List[str]] = None):
+                 parent=None, variable_names: Optional[List[str]] = None,
+                 default_url: str = ""):
         super().__init__(parent)
         self.project_dir = Path(project_dir)
         self.img_dir = self.project_dir / "img"
@@ -128,6 +130,8 @@ class StepEditDialog(QDialog):
         self._step_id = step.id if step else 0
         # 可插入的变量名（自定义变量 + 读取节点产出的 + loop.*）
         self._var_names_list = list(variable_names or [])
+        # 元素捕获时默认打开的地址（项目里第一个「打开网页」）
+        self._default_url = (default_url or "").strip()
         self.setWindowTitle("编辑步骤" if self._editing else "新建步骤")
         self.setMinimumWidth(760)
         self._init_ui()
@@ -199,14 +203,27 @@ class StepEditDialog(QDialog):
         loc_layout.setContentsMargins(0, 0, 0, 0)
         self.locator_value = QLineEdit()
         self.locator_value.setPlaceholderText("//input[@id='username']")
+        self.btn_capture = QPushButton("捕获元素…")
+        self.btn_capture.setToolTip(
+            "打开浏览器窗口，在页面上点一下目标元素：\n"
+            "自动填好 XPath，并把元素的截图存进 img/ 当兜底。"
+        )
+        self.btn_capture.clicked.connect(lambda: self._capture_element("main"))
         self.btn_pick_image = QPushButton("选择截图…")
         self.btn_pick_image.clicked.connect(self._pick_image)
         loc_layout.addWidget(self.locator_value, 1)
+        loc_layout.addWidget(self.btn_capture)
         loc_layout.addWidget(self.btn_pick_image)
         form.addRow("定位路径：", loc_row)
 
+        self.capture_hint = QLabel("")
+        self.capture_hint.setWordWrap(True)
+        self.capture_hint.setStyleSheet("color: #0f766e;")
+        form.addRow("", self.capture_hint)
+
         self.image_hint = QLabel(
-            "截图请自行用任意工具裁剪目标元素，选择后会复制到项目 img/ 目录。"
+            "直接用截图定位：可以用【捕获元素…】自动生成，"
+            "也可以自己裁剪一张（选择后会复制到项目 img/ 目录）。"
         )
         self.image_hint.setWordWrap(True)
         self.image_hint.setStyleSheet("color: #888;")
@@ -219,6 +236,35 @@ class StepEditDialog(QDialog):
             "border: 1px dashed #bbb; border-radius: 4px; color: #999;"
         )
         form.addRow("截图预览：", self.preview)
+
+        # --- 兜底截图（XPath 失效时用）---
+        self.fallback_edit = QLineEdit()
+        self.fallback_edit.setReadOnly(True)
+        self.fallback_edit.setPlaceholderText(
+            "选填：XPath 失效时用它兜底（点【捕获元素…】会自动生成）"
+        )
+        self.btn_capture_fb = QPushButton("捕获元素…")
+        self.btn_capture_fb.clicked.connect(lambda: self._capture_element("fallback"))
+        self.btn_fallback_pick = QPushButton("选择图片…")
+        self.btn_fallback_pick.clicked.connect(self._pick_fallback_image)
+        self.btn_fallback_clear = QPushButton("清除")
+        self.btn_fallback_clear.clicked.connect(self.fallback_edit.clear)
+        self.fallback_row = QWidget()
+        fb_layout = QHBoxLayout(self.fallback_row)
+        fb_layout.setContentsMargins(0, 0, 0, 0)
+        fb_layout.addWidget(self.fallback_edit, 1)
+        fb_layout.addWidget(self.btn_capture_fb)
+        fb_layout.addWidget(self.btn_fallback_pick)
+        fb_layout.addWidget(self.btn_fallback_clear)
+        form.addRow("兜底截图：", self.fallback_row)
+
+        self.fallback_hint = QLabel(
+            "选填。配了它以后：XPath 等不到元素 / 点不动时，会自动改用这张图做模板匹配，"
+            "命中后按坐标点击或填入（日志里会写明走了兜底）。"
+        )
+        self.fallback_hint.setWordWrap(True)
+        self.fallback_hint.setStyleSheet("color: #888;")
+        form.addRow("", self.fallback_hint)
 
         # --- 输入值组（fill/select）：右侧下拉可直接关联数据源变量 ---
         self.value_edit = QLineEdit()
@@ -494,7 +540,12 @@ class StepEditDialog(QDialog):
             self._show(w, is_read)
         for w in self._locator_widgets:
             self._show(w, is_locate)
+        is_xpath = is_locate and self.locator_type.currentData() == "xpath"
         self.btn_pick_image.setVisible(is_image)
+        self.btn_capture.setVisible(is_xpath)
+        self._show(self.capture_hint, is_locate)
+        for w in (self.fallback_row, self.fallback_hint):
+            self._show(w, is_xpath)
         for w in self._image_widgets:
             self._show(w, is_image)
         for w in self._value_widgets:
@@ -685,20 +736,13 @@ class StepEditDialog(QDialog):
         )
 
     # ------------------------------
-    # 截图选择
+    # 截图选择 / 元素捕获
     # ------------------------------
-    def _pick_image(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择元素截图",
-            str(self.project_dir),
-            "图片 (*.png *.jpg *.jpeg *.bmp *.webp)",
-        )
-        if not path:
-            return
-        src = Path(path)
+    def _copy_into_img(self, src: Path) -> Optional[str]:
+        """把一张图拷进项目 img/，返回相对路径；失败返回 None。"""
         if src.suffix.lower() not in IMG_EXTS:
             QMessageBox.warning(self, "格式不支持", "请选择 png/jpg/bmp/webp 图片。")
-            return
+            return None
         self.img_dir.mkdir(parents=True, exist_ok=True)
         # 重名自动加后缀，避免覆盖已有截图
         dst = self.img_dir / src.name
@@ -709,11 +753,72 @@ class StepEditDialog(QDialog):
         try:
             shutil.copy2(src, dst)
         except OSError as e:
-            QMessageBox.critical(self, "复制失败", f"截图复制到 img/ 失败：\n{e}")
+            QMessageBox.critical(self, "复制失败", f"图片复制到 img/ 失败：\n{e}")
+            return None
+        return dst.relative_to(self.project_dir).as_posix()
+
+    def _pick_image(self):
+        """定位方式＝截图：选一张图当主定位。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择元素截图",
+            str(self.project_dir),
+            "图片 (*.png *.jpg *.jpeg *.bmp *.webp)",
+        )
+        if not path:
             return
-        rel = dst.relative_to(self.project_dir).as_posix()
-        self.locator_value.setText(rel)
-        self._show_preview(dst)
+        rel = self._copy_into_img(Path(path))
+        if rel:
+            self.locator_value.setText(rel)
+            self._show_preview(self.project_dir / rel)
+
+    def _pick_fallback_image(self):
+        """兜底截图：选一张已有图片。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择兜底截图（XPath 失效时用）",
+            str(self.project_dir),
+            "图片 (*.png *.jpg *.jpeg *.bmp *.webp)",
+        )
+        if not path:
+            return
+        rel = self._copy_into_img(Path(path))
+        if rel:
+            self.fallback_edit.setText(rel)
+
+    def _capture_element(self, target: str):
+        """打开元素捕获窗口，把抓到的 XPath / 截图填进表单。
+
+        target="main"     抓到的东西填主定位（XPath），顺手把截图放进兜底栏
+        target="fallback" 只要截图，填兜底栏
+        """
+        url = self.url_edit.text().strip() or self._default_url
+        dlg = ElementPickerDialog(url, self.project_dir, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+            return
+        data = dlg.result_data
+        xpath = (data.get("xpath") or "").strip()
+        image = data.get("image") or ""
+        count = data.get("count", 1)
+        desc = data.get("desc", "")
+        if target == "main":
+            if xpath:
+                self.locator_value.setText(xpath)
+                self.locator_type.setCurrentIndex(
+                    max(0, self.locator_type.findData("xpath")))
+                warn = "" if count == 1 else f"（命中 {count} 个，建议核对）"
+                self.capture_hint.setText(f"已捕获：{desc} → {xpath}{warn}")
+            if image and not self.fallback_edit.text().strip():
+                self.fallback_edit.setText(image)
+        else:
+            if image:
+                self.fallback_edit.setText(image)
+            else:
+                self.capture_hint.setText(
+                    "只抓到了 XPath，没抓到截图（元素可能在 iframe 里）："
+                    "可以点【选择图片…】手工裁剪一张。"
+                )
+        if image:
+            self._show_preview(self.project_dir / image)
+        self._sync_visibility()
 
     def _show_preview(self, path: Path):
         pix = QPixmap(str(path))
@@ -743,6 +848,7 @@ class StepEditDialog(QDialog):
                 self.locator_type.findData(s.locator.type)
             )
             self.locator_value.setText(s.locator.value)
+            self.fallback_edit.setText(s.locator.image or "")
             if s.locator.type == "image" and s.locator.value:
                 img_path = self.project_dir / s.locator.value
                 if img_path.exists():
@@ -894,6 +1000,7 @@ class StepEditDialog(QDialog):
             step.locator = Locator(
                 type=self.locator_type.currentData(),
                 value=self.locator_value.text().strip(),
+                image=self.fallback_edit.text().strip(),
             )
             if action in ("fill", "select"):
                 step.value = self.value_edit.text().strip()
