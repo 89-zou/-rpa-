@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
-    QDialog, QFileDialog, QHBoxLayout, QLabel, QMenu, QMessageBox,
+    QDialog, QHBoxLayout, QLabel, QMenu, QMessageBox,
     QPushButton, QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -29,8 +29,8 @@ from smart_tool.ui.project_picker_dialog import (
 from smart_tool.ui.step_editor_dialog import StepEditDialog
 
 
-# 画布上方的常驻提示（连线模式时会被临时替换成操作提示）
-CANVAS_HINT = "双击节点编辑，右键增删改，Ctrl+滚轮缩放"
+# 画布上方的常驻提示（连线操作时会被临时替换成提示）
+CANVAS_HINT = "双击节点编辑｜右键增删改｜Ctrl+滚轮缩放｜框内节点：选中后点右边小箭头可连线"
 
 
 class ExecutorWorker(QThread):
@@ -134,13 +134,6 @@ class WebAutomationTab(QWidget):
         self.btn_data = QPushButton("数据源…")
         self.btn_data.clicked.connect(self._edit_data_source)
         edit_layout.addWidget(self.btn_data)
-        self.btn_pick_data = QPushButton("换数据文件夹…")
-        self.btn_pick_data.setToolTip(
-            "直接选一个文件夹当数据源（默认递归读里面的 *.txt）。\n"
-            "每天数据放在不同文件夹时，跑之前点一下就行，不用改项目。"
-        )
-        self.btn_pick_data.clicked.connect(self._pick_data_folder)
-        edit_layout.addWidget(self.btn_pick_data)
         edit_layout.addSpacing(12)
         self.btn_flow_edit = QPushButton("流程编辑…")
         self.btn_flow_edit.clicked.connect(self._open_flow_editor)
@@ -149,15 +142,6 @@ class WebAutomationTab(QWidget):
         self.btn_layout.setToolTip("按横向蛇形重新排列所有节点（超出宽度自动换行）")
         self.btn_layout.clicked.connect(self._auto_layout)
         edit_layout.addWidget(self.btn_layout)
-        self.btn_connect = QPushButton("连线")
-        self.btn_connect.setCheckable(True)
-        self.btn_connect.setToolTip(
-            "手动在画布上连线（只影响显示，不改执行顺序）：\n"
-            "  点一个节点 / 循环框 / 条件框当起点，再点一个当终点；\n"
-            "  点橙色箭头即可删掉它。再点一次本按钮退出。"
-        )
-        self.btn_connect.toggled.connect(self._toggle_connect)
-        edit_layout.addWidget(self.btn_connect)
         edit_layout.addStretch()
         self.hint_label = QLabel(CANVAS_HINT)
         self.hint_label.setStyleSheet("color: #888;")
@@ -257,7 +241,6 @@ class WebAutomationTab(QWidget):
             QMessageBox.warning(self, "提示", f"找不到项目：{path or name}")
             return False
 
-        self.btn_connect.setChecked(False)
         self._current_store = store
         self._steps = store.load_steps()
         self._data_source = store.load_data_source()
@@ -279,18 +262,8 @@ class WebAutomationTab(QWidget):
         self._update_edit_buttons()
         return True
 
-    def _toggle_connect(self, on: bool):
-        """开关画布连线模式。"""
-        if on and self._current_store is None:
-            self.btn_connect.setChecked(False)
-            self._require_project()
-            return
-        self.canvas.set_connect_mode(on)
-        if not on:
-            self.hint_label.setText(CANVAS_HINT)
-
     def _on_connect_status(self, message: str):
-        """连线模式下的操作提示（选起点 / 已连上 / 已删除…）。"""
+        """画布连线操作的状态提示（已选起点 / 已连上 / 已删除…）。"""
         self.hint_label.setText(message)
 
     def _persist_canvas_edges(self):
@@ -303,7 +276,6 @@ class WebAutomationTab(QWidget):
         self._current_store = None
         self._steps = []
         self._data_source = {}
-        self.btn_connect.setChecked(False)
         self.canvas.set_manual_edges([])
         self.canvas.set_placeholder_text(NO_PROJECT_PLACEHOLDER)
         self.canvas.load_steps([], {})
@@ -349,37 +321,7 @@ class WebAutomationTab(QWidget):
             self.canvas.load_steps(self._steps, self._data_source)
             self._append_log(f"数据源已设置：{self._data_source.get('path', '')}")
 
-    def _pick_data_folder(self):
-        """选一个文件夹当数据源（每天换目录时不用改项目设置）。
-
-        选完直接写进项目的【数据源】路径并保存：数据源只有这一份配置，
-        循环卡片的「数据源」标签、字段映射、运行时的取数都跟着变。
-        """
-        if not self._require_project():
-            return
-        if self._worker is not None:
-            QMessageBox.warning(self, "提示", "执行进行中，请先停止再改数据源。")
-            return
-        cur = (self._data_source or {}).get("path") or ""
-        start = cur if cur and Path(cur).is_dir() else str(Path.home())
-        folder = QFileDialog.getExistingDirectory(self, "选择数据文件夹", start)
-        if not folder:
-            return
-        ds = dict(self._data_source or {})
-        ds["type"] = "folder"
-        ds["path"] = folder.replace("\\", "/")
-        if not ds.get("pattern"):
-            ds["pattern"] = "*.txt"
-        if "recursive" not in ds:
-            ds["recursive"] = True
-        self._data_source = ds
-        self._current_store.save_data_source(ds)
-        # 循环卡片上的「数据源」标签要跟着换
-        self.canvas.load_steps(self._steps, self._data_source)
-        self._append_log(
-            f"数据文件夹已切换：{ds['path']}"
-            f"（{ds['pattern']}{'，含子文件夹' if ds['recursive'] else ''}）"
-        )
+    # 说明：换数据文件夹已并入【变量管理…】（那边能看到数据源实际匹配到几行）
 
     # ------------------------------
     # 选择 / 按钮状态
@@ -397,10 +339,8 @@ class WebAutomationTab(QWidget):
         """按项目/运行状态切换按钮。"""
         editable = self._worker is None and self._current_store is not None
         self.btn_data.setEnabled(editable)
-        self.btn_pick_data.setEnabled(editable)
         self.btn_flow_edit.setEnabled(editable)
         self.btn_layout.setEnabled(editable)
-        self.btn_connect.setEnabled(editable)
         self.btn_new.setEnabled(self._worker is None)
         self.btn_load.setEnabled(self._worker is None)
         self.btn_run.setEnabled(self._worker is None and editable)
@@ -707,7 +647,6 @@ class WebAutomationTab(QWidget):
             self._append_log("已取消运行（变量检查未通过）。")
             return
         # 运行前把画布上的位置等落盘
-        self.btn_connect.setChecked(False)       # 连线模式不影响运行，退出它
         self._current_store.save(self._steps)
         variables = self._current_store.load_variables()
         self.btn_run.setEnabled(False)

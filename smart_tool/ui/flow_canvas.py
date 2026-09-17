@@ -6,13 +6,12 @@
   下一行反向（右→左），使连线始终最短；可随时点【自动排版】重排
 - 「循环开始/结束」「条件/分支/条件结束」这类配套节点用虚线框圈在一起：
   **结束端（循环结束 / 条件结束）在画布上不画卡片**（只在【流程编辑】里显示）
-- 自动连线**只画「相邻的两个普通步骤卡片」**之间的灰色箭头（循环体 / 分支体
-  内部也照样连）；涉及循环、条件的一律不自动画——先后顺序看编号就够了，
-  也免得把并行的分支画成顺序
-- 想画哪条箭头，点工具栏【连线】自己在画布上连（点起点 → 点终点）；
-  点橙色箭头即可删掉。只影响画布展示，不动执行顺序
-  （存在 steps.json 的 canvas_edges 里，执行器不读它）
-- 箭头连到「一个块」时，直接落在它最外层的虚线框上（不伸进框里去够卡片）
+- 自动连线只在**最外层**按「单元」顺序连：一个单元＝一个普通步骤卡片，或一个
+  循环 / 条件（整块当一端，箭头直接落在它的虚线框上）；**块内部（循环体 /
+  条件体 / 分支体）一条自动箭头都不画**，先后顺序看编号就够了
+- 想画框内的箭头：选中框内节点 → 点它右边出现的小箭头 → 再点另一个节点，
+  连这一条（要再连一条就再操作一遍）；点橙色箭头即可删掉它。
+  纯画布展示，不动执行顺序（存在 steps.json 的 canvas_edges 里，执行器不读）
 - 虚线框只有循环（紫）和条件（蓝）两种：**分支不套框**（靠分支卡片区分）
 - **拖虚线框＝整块移动**（块里嵌套的块与所有卡片一起走）；拖单个卡片仍是单独移动
 - 块可以嵌套（分支里放循环等），框按层级一层层套
@@ -164,6 +163,48 @@ def step_summary(s: Step, data_source: dict,
     return []
 
 
+class _ConnectHandle(QGraphicsItem):
+    """节点被选中时，出现在它右边的小箭头：点它就从这里连一条线。
+
+    点箭头 → 再点另一个节点 / 框 = 连一条，连完自动结束（不做常驻模式，
+    因为只是偶尔连一条，常驻反而碍事）。
+    """
+
+    SIZE = 11.0
+
+    def __init__(self, node: "NodeItem"):
+        super().__init__(node)
+        self._canvas = node.canvas
+        self._node = node
+        self.setZValue(20)
+        self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("从这里连一条线：点我，再点另一个节点 / 循环框 / 条件框")
+        self.setVisible(False)
+
+    def boundingRect(self) -> QRectF:
+        return QRectF(0, 0, self.SIZE, self.SIZE)
+
+    def paint(self, painter: QPainter, option, widget=None):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#2f6fed"), 0.8))
+        painter.setBrush(QBrush(QColor("#e8f0ff")))
+        painter.drawEllipse(self.boundingRect().adjusted(0.4, 0.4, -0.4, -0.4))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor("#2f6fed")))
+        tri = QPainterPath()
+        tri.moveTo(3.0, 3.2)
+        tri.lineTo(8.4, 5.5)
+        tri.lineTo(3.0, 7.8)
+        tri.closeSubpath()
+        painter.drawPath(tri)
+
+    def mousePressEvent(self, event):
+        # 必须自己吃掉这次点击，否则会被父节点当成「拖动卡片」
+        event.accept()
+        self._canvas.begin_connect(self._node)
+
+
 class NodeItem(QGraphicsItem):
     """步骤卡片。"""
 
@@ -171,6 +212,7 @@ class NodeItem(QGraphicsItem):
                  branch_text: str = ""):
         super().__init__()
         self.step = step
+        self.canvas = canvas
         self._canvas = canvas
         self._name, color = ACTION_META.get(step.action, (step.action, "#888888"))
         self._color = QColor(color)
@@ -186,6 +228,23 @@ class NodeItem(QGraphicsItem):
         if step.pos:
             self.setPos(QPointF(step.pos[0], step.pos[1]))
         self._press_pos: Optional[QPointF] = None
+        # 选中时出现在右侧的连线小箭头（只有块内的节点才显示：
+        # 最外层本来就自动连了，不需要手动连）
+        self._connectable = False
+        self.connect_handle = _ConnectHandle(self)
+        self.connect_handle.setPos(
+            NODE_W + 2, self._h / 2 - _ConnectHandle.SIZE / 2
+        )
+
+    def set_connectable(self, flag: bool):
+        """标记这个节点要不要给连线小箭头（块内才给）。"""
+        self._connectable = bool(flag)
+        self._sync_handle()
+
+    def _sync_handle(self):
+        self.connect_handle.setVisible(
+            self._connectable and self.isSelected() and not self._canvas._readonly
+        )
 
     @property
     def node_height(self) -> float:
@@ -222,6 +281,7 @@ class NodeItem(QGraphicsItem):
                 self._canvas.scene_refresh_overlays()
         elif change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
             self.update()
+            self._sync_handle()
         return super().itemChange(change, value)
 
     def mousePressEvent(self, event):
@@ -529,10 +589,16 @@ class _View(QGraphicsView):
         self.customContextMenuRequested.connect(self._show_menu)
 
     def mousePressEvent(self, event):
-        """连线模式下：左键点击交给画布处理（选端点 / 删手动箭头）。"""
-        if (self._canvas.connect_mode()
-                and event.button() == Qt.MouseButton.LeftButton):
-            self._canvas.handle_connect_click(self.itemAt(event.pos()))
+        """左键：连线途中 → 完成连线；点橙色箭头 → 删掉它；其余走默认。"""
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        if self._canvas.has_pending_connect():
+            self._canvas.finish_connect(self.itemAt(event.pos()))
+            event.accept()
+            return
+        item = self.itemAt(event.pos())
+        if isinstance(item, EdgeItem) and self._canvas.delete_manual_edge(item):
             event.accept()
             return
         super().mousePressEvent(event)
@@ -590,8 +656,8 @@ class FlowCanvas(QWidget):
         self._spans: List[blocks.Span] = []
         self._manual_edges: List[Tuple[object, object]] = []   # 手动连线（ref 对）
         self._manual_edge_items: List[EdgeItem] = []           # 与 _manual_edges 一一对应
-        self._connect_mode = False                             # 是否处于连线模式
-        self._pending_source = None                            # 连线模式下已选的起点
+        self._pending_source = None                            # 正在连线的起点（点小箭头后设上）
+        self._readonly = False                                 # 执行期间禁止拖动/连线
         self._regions: List[LoopRegion] = []
         self._region_spans: List[blocks.Span] = []   # 与 _regions 一一对应
         self._block_moving = False                   # 整块拖动中：跳过逐节点刷新
@@ -770,6 +836,7 @@ class FlowCanvas(QWidget):
         self._regions = []
         self._region_spans = []
         self._placeholder = None
+        self._pending_source = None      # 重建后起点引用会失效，直接清掉
         self._scene.clear()
 
         self._spans = blocks.spans(self._steps)
@@ -778,6 +845,8 @@ class FlowCanvas(QWidget):
                 continue        # 成对标记的结束端不画卡片（流程编辑里能看到）
             node = NodeItem(s, self._data_source, self,
                             branch_text=self._branch_text_of(s))
+            # 块内的节点才给「连线小箭头」：最外层是自动连好的，不用手动连
+            node.set_connectable(self._inside_block(s))
             self._scene.addItem(node)
             self._nodes[s.id] = node
 
@@ -862,6 +931,11 @@ class FlowCanvas(QWidget):
     def _span_by_start(self, index: int):
         return next((sp for sp in self._spans if sp.start == index), None)
 
+    def _inside_block(self, step: Step) -> bool:
+        """这个步骤是不是在某个块（循环体 / 条件体 / 分支体）里面。"""
+        idx = next((i for i, s in enumerate(self._steps) if s is step), -1)
+        return idx >= 0 and blocks.enclosing_span(self._spans, idx) is not None
+
     def _endpoint(self, ref):
         """连线单元 → 端点对象（步骤卡片或块虚线框）。
 
@@ -903,34 +977,19 @@ class FlowCanvas(QWidget):
         return units
 
     def _build_edges(self):
-        """自动连线：**只连「相邻的两个普通步骤卡片」**。
+        """自动连线：**只在最外层**按「单元」顺序连。
 
-        循环 / 条件相关的箭头（框的进出、循环体内的扇出、条件→各分支、
-        分支卡→分支体）一律不自动画：
-        - 先后顺序本来就能从编号看出来；
-        - 想画哪条，点工具栏的【连线】自己在画布上连（也能删），
-          比自动猜更准，也不会把并行的分支画成顺序。
-
-        块内部照样递归进去，所以「循环体里相邻的两个普通步骤」「分支体里
-        相邻的普通步骤」之间仍然会自动连。
+        - 一个单元＝一个普通步骤卡片，或者一个循环 / 条件（整块当一端，
+          箭头直接落在它的虚线框上），所以「4. 点击 → 5. 循环框」会连上；
+        - **块内部（循环体、条件体、分支体）一条自动箭头都不画**：
+          先后顺序看编号就够了，也不会把并行的分支画成顺序；
+        - 想画哪条，选中框内节点 → 点它右边的小箭头 → 再点另一个节点，
+          只连这一条（要再连一条就再操作一遍）。
         """
-        self._collect_edges(0, len(self._steps))
-        self._build_manual_edges()
-
-    def _collect_edges(self, lo: int, hi: int):
-        """连 [lo, hi) 里相邻的普通步骤，并递归进块内部。"""
-        units = self._units_in(lo, hi)
+        units = self._units_in(0, len(self._steps))
         for k in range(len(units) - 1):
-            a, b = units[k], units[k + 1]
-            if isinstance(a, tuple) or isinstance(b, tuple):
-                continue        # 任一端是块（框 / 分支标记）→ 不自动画
-            self._add_edge(a, b)
-        for u in units:
-            if not isinstance(u, tuple):
-                continue
-            sp = self._span_by_start(u[1])
-            if sp is not None:
-                self._collect_edges(sp.inner_lo, sp.inner_hi)
+            self._add_edge(units[k], units[k + 1])
+        self._build_manual_edges()
 
     def _add_edge(self, ref_a, ref_b) -> None:
         """连一条灰色箭头（任一端拿不到就跳过）。"""
@@ -946,6 +1005,67 @@ class FlowCanvas(QWidget):
     # ------------------------------
     # 手动连线（只在画布上展示，不参与执行顺序）
     # ------------------------------
+    def begin_connect(self, node: "NodeItem"):
+        """点了节点右边的小箭头：从这里开始连一条线。
+
+        不做成「常驻模式」——连一条就够了，连完自动结束；
+        要再连一条，重新点一次小箭头。
+        """
+        ref = self._anchor_of_item(node)
+        if ref is None:
+            return
+        if self._pending_source == ref:
+            self._pending_source = None
+            self.connect_status.emit("已取消连线。")
+            return
+        self._pending_source = ref
+        node.setSelected(True)
+        self.connect_status.emit(
+            f"起点：{self._anchor_label(ref)} → 再点一个节点 / 循环框 / 条件框；"
+            "点空白处取消。"
+        )
+
+    def has_pending_connect(self) -> bool:
+        """是否正等着点终点。"""
+        return self._pending_source is not None
+
+    def finish_connect(self, item) -> None:
+        """连线途中点了另一个图元：连上或取消。"""
+        if self._pending_source is None:
+            return
+        src = self._pending_source
+        self._pending_source = None
+        if item is None:
+            self.connect_status.emit("已取消连线（点到了空白处）。")
+            return
+        ref = self._anchor_of_item(item)
+        if ref is None:
+            self.connect_status.emit("只能连到节点卡片或循环 / 条件框，已取消。")
+            return
+        if ref == src:
+            self.connect_status.emit("起点和终点是同一个，已取消。")
+            return
+        if (src, ref) in self._manual_edges:
+            self.connect_status.emit("这两点之间已经有连线了。")
+            return
+        self._manual_edges.append((src, ref))
+        self._rebuild_scene(keep_view=True)
+        self.edges_changed.emit()
+        self.connect_status.emit(
+            "已连上（橙色箭头）。要再连一条，重新点节点右边的小箭头。"
+        )
+
+    def delete_manual_edge(self, item) -> bool:
+        """点一条橙色箭头＝删掉它；返回是否真的删了。"""
+        if item not in self._manual_edge_items:
+            return False
+        idx = self._manual_edge_items.index(item)
+        self._manual_edges.pop(idx)
+        self._rebuild_scene(keep_view=True)
+        self.edges_changed.emit()
+        self.connect_status.emit("已删除这条手动连线。")
+        return True
+
     def set_manual_edges(self, edges: List[list]):
         """载入手动连线。
 
@@ -1007,68 +1127,8 @@ class FlowCanvas(QWidget):
             self._manual_edge_items.append(edge)   # 与 _manual_edges 一一对应
 
     # ------------------------------
-    # 连线模式
+    # 连线端点识别
     # ------------------------------
-    def set_connect_mode(self, on: bool):
-        """开关「连线」模式：点起点 → 点终点＝连一条；点橙色箭头＝删掉它。"""
-        self._connect_mode = bool(on)
-        self._pending_source = None
-        self._view.setCursor(
-            Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor
-        )
-        if on:
-            self.connect_status.emit(
-                "连线模式：点一个节点/循环框/条件框当起点，再点一个当终点；"
-                "点橙色箭头可以删掉它。再点一次【连线】退出。"
-            )
-        else:
-            self.connect_status.emit("已退出连线模式。")
-
-    def connect_mode(self) -> bool:
-        return self._connect_mode
-
-    def handle_connect_click(self, item) -> None:
-        """连线模式下点了某个图元（由视图转发过来）。"""
-        # 点到手动箭头 → 删除
-        if isinstance(item, EdgeItem):
-            if item in self._manual_edge_items:
-                idx = self._manual_edge_items.index(item)
-                self._manual_edges.pop(idx)
-                self._rebuild_scene(keep_view=True)
-                self.edges_changed.emit()
-                self.connect_status.emit("已删除这条手动连线。")
-            else:
-                self.connect_status.emit(
-                    "这条是自动画的箭头（灰色/蓝色），不能删。"
-                )
-            return
-
-        ref = self._anchor_of_item(item)
-        if ref is None:
-            self.connect_status.emit("这里连不了：请点节点卡片、循环框或条件框。")
-            return
-        if self._pending_source is None:
-            self._pending_source = ref
-            if isinstance(item, NodeItem):
-                item.setSelected(True)      # 起点给个高亮，好认
-            self.connect_status.emit(
-                f"起点已选：{self._anchor_label(ref)}。再点一个节点/框作为终点。"
-            )
-            return
-        if ref == self._pending_source:
-            self._pending_source = None
-            self.connect_status.emit("起点和终点是同一个，已取消。")
-            return
-        if (self._pending_source, ref) in self._manual_edges:
-            self._pending_source = None
-            self.connect_status.emit("这两点之间已经有手动连线了。")
-            return
-        self._manual_edges.append((self._pending_source, ref))
-        self._pending_source = None
-        self._rebuild_scene(keep_view=True)
-        self.edges_changed.emit()
-        self.connect_status.emit("已连上（橙色箭头）。可以继续连，或退出连线模式。")
-
     def _anchor_of_item(self, item):
         """图元 → 连线端点 ref；不是可连的图元返回 None。"""
         if isinstance(item, NodeItem):
@@ -1228,10 +1288,12 @@ class FlowCanvas(QWidget):
             node.setSelected(sid == step_id)
 
     def set_readonly(self, readonly: bool):
-        """执行期间禁止拖动。"""
+        """执行期间禁止拖动、也收起连线小箭头。"""
+        self._readonly = bool(readonly)
         for node in self._nodes.values():
             node.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable,
                          not readonly)
+            node._sync_handle()
 
     def fit_all(self):
         if self._nodes:
