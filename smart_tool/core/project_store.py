@@ -207,6 +207,8 @@ class ProjectStore:
             variables if variables is not None else old.get("variables", {})
         )
         data["data_source"] = old.get("data_source", {})
+        # 画布上手动连的箭头：纯展示，执行器不读，但改动步骤时必须原样保留
+        data["canvas_edges"] = old.get("canvas_edges", [])
         data["layout"] = (
             layout_version if layout_version is not None
             else old.get("layout", "")
@@ -219,6 +221,27 @@ class ProjectStore:
         """只更新变量，步骤与数据源保持不变。"""
         self.save(self.load_steps(), variables)
 
+    def load_canvas_edges(self) -> List[list]:
+        """画布上手动连的箭头（纯展示，不参与执行）。
+
+        每一条是两端：步骤 id，或 "frame:<起始步骤id>"（循环 / 条件框）。
+        """
+        out: List[list] = []
+        for e in self.load().get("canvas_edges", []) or []:
+            if isinstance(e, (list, tuple)) and len(e) == 2:
+                out.append([e[0], e[1]])
+        return out
+
+    def save_canvas_edges(self, edges: List[list]):
+        """只更新画布手动连线，其余配置保持不变。"""
+        self.ensure()
+        old = self.load()
+        data = dict(old)
+        data["canvas_edges"] = [[a, b] for a, b in edges]
+        self.steps_file.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
     def save_data_source(self, data_source: dict):
         """只更新数据源配置，步骤与变量保持不变。"""
         self.ensure()
@@ -227,6 +250,7 @@ class ProjectStore:
             "steps": old.get("steps", []),
             "variables": old.get("variables", {}),
             "data_source": data_source,
+            "canvas_edges": old.get("canvas_edges", []),
             "layout": old.get("layout", ""),
         }
         self.steps_file.write_text(

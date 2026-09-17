@@ -29,6 +29,10 @@ from smart_tool.ui.project_picker_dialog import (
 from smart_tool.ui.step_editor_dialog import StepEditDialog
 
 
+# 画布上方的常驻提示（连线模式时会被临时替换成操作提示）
+CANVAS_HINT = "双击节点编辑，右键增删改，Ctrl+滚轮缩放"
+
+
 class ExecutorWorker(QThread):
     """在后台线程执行 StepExecutor。"""
     log_signal = pyqtSignal(str)
@@ -145,10 +149,17 @@ class WebAutomationTab(QWidget):
         self.btn_layout.setToolTip("按横向蛇形重新排列所有节点（超出宽度自动换行）")
         self.btn_layout.clicked.connect(self._auto_layout)
         edit_layout.addWidget(self.btn_layout)
-        edit_layout.addStretch()
-        self.hint_label = QLabel(
-            "双击节点编辑，右键增删改，Ctrl+滚轮缩放"
+        self.btn_connect = QPushButton("连线")
+        self.btn_connect.setCheckable(True)
+        self.btn_connect.setToolTip(
+            "手动在画布上连线（只影响显示，不改执行顺序）：\n"
+            "  点一个节点 / 循环框 / 条件框当起点，再点一个当终点；\n"
+            "  点橙色箭头即可删掉它。再点一次本按钮退出。"
         )
+        self.btn_connect.toggled.connect(self._toggle_connect)
+        edit_layout.addWidget(self.btn_connect)
+        edit_layout.addStretch()
+        self.hint_label = QLabel(CANVAS_HINT)
         self.hint_label.setStyleSheet("color: #888;")
         edit_layout.addWidget(self.hint_label)
         layout.addLayout(edit_layout)
@@ -160,6 +171,8 @@ class WebAutomationTab(QWidget):
         self.canvas.positions_changed.connect(self._persist_positions_only)
         self.canvas.auto_layout_applied.connect(self._on_auto_layout_applied)
         self.canvas.context_menu_requested.connect(self._show_canvas_menu)
+        self.canvas.edges_changed.connect(self._persist_canvas_edges)
+        self.canvas.connect_status.connect(self._on_connect_status)
         layout.addWidget(self.canvas, 3)
 
         # 运行栏
@@ -244,6 +257,7 @@ class WebAutomationTab(QWidget):
             QMessageBox.warning(self, "提示", f"找不到项目：{path or name}")
             return False
 
+        self.btn_connect.setChecked(False)
         self._current_store = store
         self._steps = store.load_steps()
         self._data_source = store.load_data_source()
@@ -255,6 +269,8 @@ class WebAutomationTab(QWidget):
         )
         self.canvas.load_steps(self._steps, self._data_source,
                                auto_layout=False, keep_view=False)
+        # 画布上手动连的箭头（纯展示，随项目保存）
+        self.canvas.set_manual_edges(store.load_canvas_edges())
         if need_layout:
             self.canvas.request_layout_when_ready()
         self.canvas.set_placeholder_text(DEFAULT_PLACEHOLDER)
@@ -263,11 +279,32 @@ class WebAutomationTab(QWidget):
         self._update_edit_buttons()
         return True
 
+    def _toggle_connect(self, on: bool):
+        """开关画布连线模式。"""
+        if on and self._current_store is None:
+            self.btn_connect.setChecked(False)
+            self._require_project()
+            return
+        self.canvas.set_connect_mode(on)
+        if not on:
+            self.hint_label.setText(CANVAS_HINT)
+
+    def _on_connect_status(self, message: str):
+        """连线模式下的操作提示（选起点 / 已连上 / 已删除…）。"""
+        self.hint_label.setText(message)
+
+    def _persist_canvas_edges(self):
+        """手动连线改了 → 落盘。纯展示数据，不影响执行。"""
+        if self._current_store:
+            self._current_store.save_canvas_edges(self.canvas.manual_edges())
+
     def _clear_project(self):
         """卸载当前项目（未载入状态）。"""
         self._current_store = None
         self._steps = []
         self._data_source = {}
+        self.btn_connect.setChecked(False)
+        self.canvas.set_manual_edges([])
         self.canvas.set_placeholder_text(NO_PROJECT_PLACEHOLDER)
         self.canvas.load_steps([], {})
         self.project_label.setText("当前项目：（未载入，请点【载入项目…】）")
@@ -363,6 +400,7 @@ class WebAutomationTab(QWidget):
         self.btn_pick_data.setEnabled(editable)
         self.btn_flow_edit.setEnabled(editable)
         self.btn_layout.setEnabled(editable)
+        self.btn_connect.setEnabled(editable)
         self.btn_new.setEnabled(self._worker is None)
         self.btn_load.setEnabled(self._worker is None)
         self.btn_run.setEnabled(self._worker is None and editable)
@@ -669,6 +707,7 @@ class WebAutomationTab(QWidget):
             self._append_log("已取消运行（变量检查未通过）。")
             return
         # 运行前把画布上的位置等落盘
+        self.btn_connect.setChecked(False)       # 连线模式不影响运行，退出它
         self._current_store.save(self._steps)
         variables = self._current_store.load_variables()
         self.btn_run.setEnabled(False)
