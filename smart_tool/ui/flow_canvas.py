@@ -4,8 +4,10 @@
 - 每个步骤是一张可自由拖动的圆角卡片，按 steps 列表顺序连线
 - 默认【横向蛇形排版】：从左到右排列，超出宽度自动换行，
   下一行反向（右→左），使连线始终最短；可随时点【自动排版】重排
-- 「循环开始/结束」「条件/分支/条件结束」这类配合节点用虚线框圈在一起，画布上当
-  「一块」看：框内部不画箭头，外部连线直接接到框上（左边进、右边出）
+- 「循环开始/结束」「条件/分支/条件结束」这类配套节点用虚线框圈在一起：
+  **结束端（循环结束 / 条件结束）在画布上不画卡片**（只在【流程编辑】里显示），
+  块内部不画顺序箭头，外部连线直接接到框上（左边进、右边出）；
+  条件框内部另有「条件 → 各分支」的扇出箭头
 - 块可以嵌套（分支里放循环等），框按层级一层层套，颜色区分：循环紫、条件蓝、分支浅蓝
 - 位置持久化到每个步骤的 pos；执行顺序由步骤列表顺序决定
 """
@@ -358,6 +360,11 @@ class EdgeItem(QGraphicsPathItem):
         painter.restore()
 
 
+# 画布上不画卡片的标记：成对标记的「结束」那一端只在【流程编辑】里显示，
+# 画布上用虚线框表示这一块的结束位置就够了
+HIDDEN_ACTIONS = ("loop_end", "condition_end")
+
+
 def _region_pad(depth: int) -> Tuple[float, float, float, float]:
     """块框的留白：层级越深留白越大，保证嵌套时里面的框不会被外面的框压住。"""
     d = 13.0 * max(0, depth)
@@ -591,28 +598,33 @@ class FlowCanvas(QWidget):
     def assign_auto_layout(self, steps: List[Step],
                            per_row: Optional[int] = None):
         """横向蛇形排版：左→右填满一行后换行，下一行反向，原地写回 pos。"""
-        if not steps:
+        visible = [s for s in steps if s.action not in HIDDEN_ACTIONS]
+        if not visible:
             return
         per_row = max(1, per_row or self.compute_per_row())
-        heights = [node_height_for(s, self._data_source) for s in steps]
+        heights = [node_height_for(s, self._data_source) for s in visible]
         # 块框会往外扩（层级越深越大），行距跟着放大，免得框压到上一行
         max_depth = max((sp.depth for sp in blocks.spans(steps)), default=0)
         gap_y = GAP_Y + 13.0 * (max_depth + 1)
 
         y = float(MARGIN_Y)
-        for row_start in range(0, len(steps), per_row):
-            row_end = min(row_start + per_row, len(steps))
+        for row_start in range(0, len(visible), per_row):
+            row_end = min(row_start + per_row, len(visible))
             row_h = max(heights[row_start:row_end])
             row_idx = row_start // per_row
             for i in range(row_start, row_end):
                 col = i % per_row
                 if row_idx % 2 == 1:        # 奇数行反向（蛇形回折）
                     col = per_row - 1 - col
-                steps[i].pos = [
+                visible[i].pos = [
                     float(MARGIN_X + col * (NODE_W + GAP_X)),
                     y,
                 ]
             y += row_h + gap_y
+        # 不画卡片的结束标记：给个占位坐标，免得每次都被判成「缺位置」而重排
+        for i, s in enumerate(steps):
+            if s.action in HIDDEN_ACTIONS and i > 0 and steps[i - 1].pos:
+                s.pos = list(steps[i - 1].pos)
 
     def apply_auto_layout(self):
         """对外入口：按当前宽度重排全部节点并刷新画布。"""
@@ -641,7 +653,8 @@ class FlowCanvas(QWidget):
         self._steps = steps
 
         if auto_layout is None:
-            auto_layout = any(s.pos is None for s in steps)
+            auto_layout = any(s.pos is None for s in steps
+                              if s.action not in HIDDEN_ACTIONS)
         if auto_layout:
             self.assign_auto_layout(steps)
         if keep_view is None:
@@ -675,6 +688,8 @@ class FlowCanvas(QWidget):
 
         self._spans = blocks.spans(self._steps)
         for s in self._steps:
+            if s.action in HIDDEN_ACTIONS:
+                continue        # 成对标记的结束端不画卡片（流程编辑里能看到）
             node = NodeItem(s, self._data_source, self,
                             branch_text=self._branch_text_of(s))
             self._scene.addItem(node)
@@ -772,9 +787,14 @@ class FlowCanvas(QWidget):
         i = lo
         while i < hi:
             sp = self._span_by_start(i)
-            if sp is not None and sp.end < hi:
+            complete = sp is not None and (
+                sp.inner_hi <= hi if sp.kind == "branch" else sp.end < hi
+            )
+            if complete:
                 units.append(("box", i))
-                i = sp.end + 1
+                i = sp.inner_hi if sp.kind == "branch" else sp.end + 1
+            elif self._steps[i].action in HIDDEN_ACTIONS:
+                i += 1          # 不画卡片的结束标记，不参与连线
             else:
                 units.append(self._steps[i].id)
                 i += 1
@@ -785,10 +805,33 @@ class FlowCanvas(QWidget):
 
         - 同一层里的相邻单元依次连线；
         - 循环块/条件块整块算一个单元，外部箭头直接接到框上；
-        - 循环体与条件内部（各分支之间是并列关系）不画箭头；
+        - 循环体内部不画箭头；
+        - 条件框内部从「条件」节点扇出箭头指向各个「分支」（一眼看出会走哪几个分支）；
         - 分支内部的步骤是顺序执行的，照常连线。
         """
         self._collect_edges(0, len(self._steps), draw=True)
+        self._build_branch_fanout()
+
+    def _build_branch_fanout(self):
+        """条件 → 各分支 的箭头。"""
+        for sp in self._spans:
+            if sp.kind != "condition":
+                continue
+            cond_node = self._nodes.get(self._steps[sp.start].id)
+            if cond_node is None:
+                continue
+            for k in range(sp.inner_lo, sp.inner_hi):
+                s = self._steps[k]
+                if s.action != blocks.BRANCH:
+                    continue
+                br_node = self._nodes.get(s.id)
+                if br_node is None:
+                    continue
+                edge = EdgeItem(color=REGION_COLORS["condition"])
+                self._scene.addItem(edge)
+                edge.connect_nodes(cond_node, br_node)
+                self._edges.append(edge)
+                self._edge_pairs.append((edge, cond_node.step.id, br_node.step.id))
 
     def _collect_edges(self, lo: int, hi: int, draw: bool):
         units = self._units_in(lo, hi)
