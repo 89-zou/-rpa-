@@ -8,7 +8,9 @@
   **结束端（循环结束 / 条件结束）在画布上不画卡片**（只在【流程编辑】里显示），
   块内部不画顺序箭头，外部连线直接接到框上（左边进、右边出）；
   条件框内部另有「条件 → 各分支」的扇出箭头
-- 块可以嵌套（分支里放循环等），框按层级一层层套，颜色区分：循环紫、条件蓝、分支浅蓝
+- 虚线框只有循环（紫）和条件（蓝）两种：**分支不套框**（靠分支卡片与扇出箭头区分）
+- **拖虚线框＝整块移动**（块里嵌套的块与所有卡片一起走）；拖单个卡片仍是单独移动
+- 块可以嵌套（分支里放循环等），框按层级一层层套
 - 位置持久化到每个步骤的 pos；执行顺序由步骤列表顺序决定
 """
 from pathlib import Path
@@ -209,7 +211,8 @@ class NodeItem(QGraphicsItem):
             return QPointF(min(max(p.x(), POS_MIN), POS_MAX),
                            min(max(p.y(), POS_MIN), POS_MAX))
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
-            self._canvas.scene_refresh_overlays()
+            if not self._canvas._block_moving:
+                self._canvas.scene_refresh_overlays()
         elif change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
             self.update()
         return super().itemChange(change, value)
@@ -371,11 +374,10 @@ def _region_pad(depth: int) -> Tuple[float, float, float, float]:
     return (-14 - d, -22 - d, 14 + d, 14 + d)
 
 
-# 每类块的颜色：循环紫、条件蓝、分支浅蓝
+# 会画虚线框的块：循环紫、条件蓝（分支不画框，靠卡片与扇出箭头区分）
 REGION_COLORS = {
     "loop": "#7a4fb5",
     "condition": "#2f6fb3",
-    "branch": "#5b8fd0",
 }
 
 
@@ -405,22 +407,59 @@ class _LoopBoxPort:
 
 
 class LoopRegion(QGraphicsRectItem):
-    """块虚线背景框（循环 / 条件 / 分支共用，靠颜色区分）。"""
+    """块虚线背景框（循环 / 条件共用，靠颜色区分）。
 
-    def __init__(self, color: str = "#7a4fb5"):
+    拖这个框＝把块里所有卡片一起移动；块里的卡片照样能单独拖。
+    """
+
+    def __init__(self, color: str = "#7a4fb5", canvas=None, span=None):
         super().__init__()
         self._label = ""
         self._color = QColor(color)
+        self._canvas = canvas
+        self._span = span
+        self._press: Optional[QPointF] = None
         self.setZValue(-10)
         self.setPen(QPen(self._color, 1.0, Qt.PenStyle.DashLine))
         fill = QColor(color)
         fill.setAlpha(22)
         self.setBrush(QBrush(fill))
+        self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.setToolTip("拖动这里：整个块（含里面的步骤）一起移动")
 
     def update_rect(self, rect: QRectF, label: str):
         self._label = label
         self.setRect(rect)
         self.update()
+
+    # ---- 拖框 = 整块移动 ----
+    def mousePressEvent(self, event):
+        if self._canvas is None or self._span is None:
+            super().mousePressEvent(event)
+            return
+        self._press = event.scenePos()
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._press is None:
+            super().mouseMoveEvent(event)
+            return
+        now = event.scenePos()
+        delta = now - self._press
+        if delta.isNull():
+            return
+        self._press = now
+        self._canvas.move_block(self._span, delta)
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if self._press is None:
+            super().mouseReleaseEvent(event)
+            return
+        self._press = None
+        self._canvas.commit_block_move()
+        event.accept()
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -511,6 +550,8 @@ class FlowCanvas(QWidget):
         self._edge_pairs: List[Tuple[EdgeItem, object, object]] = []
         self._spans: List[blocks.Span] = []
         self._regions: List[LoopRegion] = []
+        self._region_spans: List[blocks.Span] = []   # 与 _regions 一一对应
+        self._block_moving = False                   # 整块拖动中：跳过逐节点刷新
         self._placeholder = None
         # 空画布提示语（未载入项目 / 项目没有步骤 时不一样）
         self._placeholder_text = DEFAULT_PLACEHOLDER
@@ -683,6 +724,7 @@ class FlowCanvas(QWidget):
         self._edge_pairs = []
         self._spans = []
         self._regions = []
+        self._region_spans = []
         self._placeholder = None
         self._scene.clear()
 
@@ -855,12 +897,38 @@ class FlowCanvas(QWidget):
                                     draw=(sp.kind == "branch"))
 
     def _build_regions(self):
-        """每个块画一个虚线框（嵌套时框也嵌套）。"""
+        """循环 / 条件各画一个虚线框（嵌套时框也嵌套）；分支不画框。"""
         for sp in self._spans:
-            region = LoopRegion(REGION_COLORS.get(sp.kind, "#7a4fb5"))
+            if sp.kind not in REGION_COLORS:
+                continue        # 分支不套框：靠卡片与「条件→分支」箭头区分
+            region = LoopRegion(REGION_COLORS[sp.kind], self, sp)
             region.update_rect(self._span_rect(sp), self._region_label(sp))
             self._scene.addItem(region)
             self._regions.append(region)
+            self._region_spans.append(sp)
+
+    # ------------------------------
+    # 拖框 = 整块移动
+    # ------------------------------
+    def move_block(self, span, delta: QPointF):
+        """把块里的所有卡片按 delta 一起移动（拖框时用）。"""
+        self._block_moving = True
+        try:
+            for k in range(span.start, span.end + 1):
+                if k >= len(self._steps):
+                    break
+                node = self._nodes.get(self._steps[k].id)
+                if node is not None:
+                    node.setPos(node.pos() + delta)
+        finally:
+            self._block_moving = False
+        self.scene_refresh_overlays()
+
+    def commit_block_move(self):
+        """整块移动结束：写回每个步骤的坐标并通知保存。"""
+        for node in self._nodes.values():
+            node.step.pos = [node.pos().x(), node.pos().y()]
+        self.positions_changed.emit()
 
     def _span_rect(self, sp) -> QRectF:
         """块框的矩形：把块里所有卡片圈起来，再按层级留白。"""
@@ -909,7 +977,7 @@ class FlowCanvas(QWidget):
             if pa is None or pb is None:
                 continue
             edge.connect_nodes(pa, pb)
-        for region, sp in zip(self._regions, self._spans):
+        for region, sp in zip(self._regions, self._region_spans):
             region.update_rect(self._span_rect(sp), self._region_label(sp))
         # 拖动中同步扩大场景范围，保证被拖远的节点仍能滚回来
         self._sync_scene_rect(keep_view=False, expand_only=True)
