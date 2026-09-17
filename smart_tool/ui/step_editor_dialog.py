@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
 )
 
 from smart_tool.core.project_store import Locator, Step
+from smart_tool.ui.desktop_picker import DesktopPickerDialog
 from smart_tool.ui.element_picker_dialog import ElementPickerDialog
 from smart_tool.ui.read_data_panel import ReadDataPanel
 from smart_tool.ui.screen_capture import ScreenCaptureDialog
@@ -626,7 +627,7 @@ class StepEditDialog(QDialog):
         self._show(self.click_times_combo,
                    self.desktop and action == "click")
         self.btn_pick_image.setVisible(is_image or (is_locate and self.desktop))
-        self.btn_capture.setVisible(is_xpath)
+        self.btn_capture.setVisible(is_xpath or (is_locate and self.desktop))
         self.btn_shot.setVisible(is_locate and self.desktop)
         self._show(self.capture_hint, is_locate)
         for w in (self.fallback_row, self.fallback_hint):
@@ -662,6 +663,12 @@ class StepEditDialog(QDialog):
             )
             self.btn_pick_image.setText("选择图片…")
             self.btn_pick_image.setToolTip("从项目 img/ 里选一张已有图片")
+            self.btn_capture.setText("捕获元素…")
+            self.btn_capture.setToolTip(
+                "桌面元素捕获：全屏遮罩上鼠标划到哪就高亮哪个控件，\n"
+                "点一下自动把这个控件裁成模板（UI Automation 给精确位置）。\n"
+                "右键＝选上一层（框住容器），按住左键拖＝手动框选，Esc＝取消。"
+            )
         else:
             self.locator_value.setPlaceholderText(
                 "选择截图后自动填入 img/xxx.png" if is_image
@@ -891,11 +898,14 @@ class StepEditDialog(QDialog):
             self.fallback_edit.setText(rel)
 
     def _capture_element(self, target: str):
-        """打开元素捕获窗口，把抓到的 XPath / 截图填进表单。
+        """捕获元素。
 
-        target="main"     抓到的东西填主定位（XPath），顺手把截图放进兜底栏
-        target="fallback" 只要截图，填兜底栏
+        网页场景：打开浏览器点元素 → 拿到 XPath + 元素图（截图进兜底栏）。
+        桌面场景：全屏遮罩 + UI Automation → 点一下自动裁出控件的图当模板。
         """
+        if self.desktop:
+            self._capture_desktop_control(target)
+            return
         url = self.url_edit.text().strip() or self._default_url
         dlg = ElementPickerDialog(url, self.project_dir, self)
         if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
@@ -924,6 +934,25 @@ class StepEditDialog(QDialog):
                 )
         if image:
             self._show_preview(self.project_dir / image)
+        self._sync_visibility()
+
+    def _capture_desktop_control(self, target: str):
+        """桌面场景的捕获：划到哪高亮哪，点一下自动裁图当模板。"""
+        dlg = DesktopPickerDialog(self.project_dir, self)
+        if not dlg.run() or not dlg.result_path:
+            return
+        text = dlg.result_text or dlg.result_path
+        if target == "wait":
+            self.wait_target.setText(dlg.result_path)
+            self.capture_hint.setText(f"已捕获等待模板：{text}")
+        else:
+            self.locator_value.setText(dlg.result_path)
+            self.capture_hint.setText(
+                f"已捕获：{text}　→　{dlg.result_path}"
+                + ("　（窗口标题可填到【激活窗口】那一步里）"
+                   if dlg.window_title else "")
+            )
+        self._show_preview(self.project_dir / dlg.result_path)
         self._sync_visibility()
 
     def _capture_screen(self, target: str):

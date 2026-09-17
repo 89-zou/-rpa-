@@ -91,11 +91,33 @@ def _ensure_dpi_aware():
 # ------------------------------
 # 截图
 # ------------------------------
+def screen_origin() -> Tuple[int, int]:
+    """虚拟桌面左上角在 Windows 坐标里的位置（多屏时可能是负数）。
+
+    截图拿到的是「整个虚拟桌面」的图，图内坐标要加上这个原点才是屏幕坐标。
+    """
+    if sys.platform != "win32":
+        return 0, 0
+    import ctypes
+    u = ctypes.windll.user32
+    return (int(u.GetSystemMetrics(76)),      # SM_XVIRTUALSCREEN
+            int(u.GetSystemMetrics(77)))      # SM_YVIRTUALSCREEN
+
+
 def grab_screen():
-    """截全屏，返回 PIL Image（物理像素）。"""
+    """截全屏，返回 PIL Image（物理像素）。
+
+    多屏时截**整个虚拟桌面**（配合 screen_origin 换算坐标），
+    这样目标程序在副屏上也能找到。
+    """
     _ensure_dpi_aware()
     try:
         from PIL import ImageGrab
+    except Exception as e:
+        raise DesktopError(f"没能加载 Pillow：{e}\n{missing_hint()}") from e
+    try:
+        return ImageGrab.grab(all_screens=True)
+    except TypeError:               # 老版本 Pillow 没有这个参数
         return ImageGrab.grab()
     except Exception as e:
         raise DesktopError(f"截屏失败：{e}") from e
@@ -134,9 +156,10 @@ def locate(template_path: Path, threshold: Optional[float] = None,
         found = image_locator.best_match(screen, template, threshold=limit)
         if found:
             conf, x, y, w, h, scale = found
-            log(f"  截图匹配成功：屏幕({x + w / 2:.0f},{y + h / 2:.0f}) "
+            ox, oy = screen_origin()        # 图内坐标 → 屏幕坐标
+            log(f"  截图匹配成功：屏幕({ox + x + w / 2:.0f},{oy + y + h / 2:.0f}) "
                 f"置信度={conf:.3f} 缩放={scale}")
-            return DesktopMatch(x + w / 2, y + h / 2, w, h, conf, scale)
+            return DesktopMatch(ox + x + w / 2, oy + y + h / 2, w, h, conf, scale)
         if time.monotonic() >= deadline:
             raise DesktopError(
                 f"屏幕上没找到这张图（{path.name}，试了 {tries} 次，"
