@@ -910,13 +910,15 @@ class FlowCanvas(QWidget):
     def _build_block_io_edges(self, sp):
         """画块的入口/出口箭头。
 
-        - loop：loop_start 卡 → 循环体第一单元；循环体最后单元 → 循环框
-        - branch：分支卡 → 分支体第一单元；分支体最后单元 → 条件框（汇聚）
+        - loop：loop_start 卡 → 循环体第一单元；循环体最后单元 → loop_start 卡（回路）
+          不连到框上——框只是视觉边界，不参与箭头连接
+        - branch：分支卡 → 分支体第一单元；**没有出口箭头**
+          （分支执行完自然走到条件结束，不需要额外箭头标示）
         - condition：入口由 _build_branch_fanout 处理（条件卡→各分支卡），
-          出口由各分支的出口箭头统一汇聚到条件框，这里不用画
+          不需要画出口
         """
         if sp.kind == "condition":
-            return  # 条件块自己不画入口/出口，由分支的出口箭头汇聚
+            return
         # 内部可见单元（不含开始标记本身）
         # branch 的 inner_hi 是 end+1（右闭），其他块 inner_hi 是 end（不含结束标记）
         inner_hi = sp.inner_hi if sp.kind == "branch" else sp.end
@@ -924,9 +926,10 @@ class FlowCanvas(QWidget):
         if not inner_units:
             return
 
-        # ---- 入口：开始标记卡 → 内部第一单元 ----
         start_node = self._nodes.get(self._steps[sp.start].id)
         first_ep = self._endpoint(inner_units[0])
+
+        # ---- 入口：开始标记卡 → 内部第一单元（loop 与 branch 都画） ----
         if start_node and first_ep:
             edge = EdgeItem(color="#9aa4b2")
             self._scene.addItem(edge)
@@ -934,28 +937,20 @@ class FlowCanvas(QWidget):
             self._edges.append(edge)
             self._edge_pairs.append((edge, start_node.step.id, inner_units[0]))
 
-        # ---- 出口：内部最后单元 → 块框 ----
-        last_ep = self._endpoint(inner_units[-1])
-        if sp.kind == "loop":
-            box_port = _LoopBoxPort(self._span_rect(sp))
-        elif sp.kind == "branch":
-            # 分支出口汇聚到所属条件框
-            cond = next(
-                (p for p in self._spans if p.kind == "condition"
-                 and p.start <= sp.start and p.end >= sp.end),
-                None,
-            )
-            if cond is None:
-                return
-            box_port = _LoopBoxPort(self._span_rect(cond))
-        else:
+        # ---- 出口：只给 loop 画 → loop_start 卡形成回路 ----
+        # branch 不画出口，condition 也不画（扇出已经表达了并行结构）
+        if sp.kind != "loop":
             return
-        if last_ep and box_port:
+        last_ep = self._endpoint(inner_units[-1])
+        # 回路：最后单元 → loop_start 卡（视觉上是个弯回来的灰色箭头）
+        if last_ep and start_node:
             edge = EdgeItem(color="#9aa4b2")
             self._scene.addItem(edge)
-            edge.connect_nodes(last_ep, box_port)
+            edge.connect_nodes(last_ep, start_node)
             self._edges.append(edge)
-            self._edge_pairs.append((edge, inner_units[-1], ("box", sp.start)))
+            # 注意：ref 要存 step id 而不是 ("box", ...)，否则 scene_refresh_overlays
+            # 里 _endpoint 会查 _LoopBoxPort 导致刷新后箭头又跳回框上
+            self._edge_pairs.append((edge, inner_units[-1], start_node.step.id))
 
     def _build_regions(self):
         """循环 / 条件各画一个虚线框（嵌套时框也嵌套）；分支不画框。
