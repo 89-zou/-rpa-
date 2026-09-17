@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox, QWidget
 
 from smart_tool.core import desktop
 from smart_tool.core import desktop_uia
+from smart_tool.core import crash_guard
 from smart_tool.core.desktop_uia import UiControl
 
 # 鼠标位置轮询间隔（毫秒）；太快会一直查 UIA，太慢会拖影
@@ -134,21 +135,36 @@ class InputHook:
         return 1                        # 吃掉，别让目标程序收到
 
     def _next(self, code, wparam, lparam) -> int:
-        # lparam 是指针，回调拿到的是无符号大整数，要转回有符号再往下传
-        return ctypes.windll.user32.CallNextHookEx(
-            None, code, wparam, _as_signed(lparam))
+        """转给下一个钩子。
+
+        **绝对不能抛异常**：异常一旦逃出 Windows 回调，系统会以
+        STATUS_FATAL_USER_CALLBACK_EXCEPTION（0xc000041d）把整个进程杀掉，
+        而且不会留 Python 的崩溃日志（事件日志里只会看到 qwindows.dll）。
+        """
+        try:
+            return ctypes.windll.user32.CallNextHookEx(
+                None, code, wparam, _as_signed(lparam))
+        except Exception:
+            return 0
 
     def _mouse_cb(self, code, wparam, lparam):
-        if code >= 0 and wparam in MOUSE_EVENTS:
-            return self._emit(MOUSE_EVENTS[wparam])
-        return self._next(code, wparam, lparam)
+        try:
+            if code >= 0 and wparam in MOUSE_EVENTS:
+                return self._emit(MOUSE_EVENTS[wparam])
+            return self._next(code, wparam, lparam)
+        except Exception:
+            return self._next(code, wparam, lparam)
 
     def _kbd_cb(self, code, wparam, lparam):
-        if code >= 0 and wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-            info = ctypes.cast(lparam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
-            if info.vkCode == VK_ESCAPE:
-                return self._emit("esc")
-        return self._next(code, wparam, lparam)
+        try:
+            if code >= 0 and wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                info = ctypes.cast(
+                    lparam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
+                if info.vkCode == VK_ESCAPE:
+                    return self._emit("esc")
+            return self._next(code, wparam, lparam)
+        except Exception:
+            return self._next(code, wparam, lparam)
 
 
 def _as_signed(value: int) -> int:
@@ -201,6 +217,13 @@ class _Overlay(QWidget):
         )
 
     def paintEvent(self, _event):
+        # 画东西时出错只丢一帧，绝不能让异常逃进 Qt 的事件分发（会直接终止进程）
+        try:
+            self._paint()
+        except Exception:
+            pass
+
+    def _paint(self):
         if self.blank:
             return                  # 完全透明（截图那一瞬间）
         p = QPainter(self)
@@ -253,6 +276,7 @@ class DesktopPickerDialog(QDialog):
         self._captured = False
         self._loop: Optional[QEventLoop] = None
         self._hidden: list = []     # 捕获期间临时藏起来的自家窗口
+        self._error = ""            # 上一轮出错的原因（显示在遮罩上）
 
         self.overlay = _Overlay(self)
         self.hook = InputHook(self._pending.append)
@@ -286,10 +310,12 @@ class DesktopPickerDialog(QDialog):
             if w is self.overlay or w is self or not w.isVisible():
                 continue
             try:
+                crash_guard.note("桌面捕获：临时隐藏本工具窗口")
                 w.hide()
                 self._hidden.append(w)
             except Exception:
                 pass
+        crash_guard.note("桌面捕获：显示遮罩")
         self.overlay.show()
         self.overlay.raise_()
         self.timer.start(POLL_MS)
@@ -315,6 +341,25 @@ class DesktopPickerDialog(QDialog):
     # 主循环
     # ------------------------------
     def _tick(self):
+        """定时器槽：查鼠标位置、更新高亮、处理钩子事件。
+
+        整体包一层 try/except：Qt 槽里抛异常在 PyQt6 里是「致命」的
+        （会走 abort，界面直接消失），所以这里宁可记一笔也别让它逃出去。
+        """
+        try:
+            self._tick_inner()
+        except Exception as e:
+            try:
+                self._error = f"{type(e).__name__}: {e}"
+                self.overlay.title = "桌面元素捕获"
+                self.overlay.info = "出错了（已跳过这一轮）"
+                self.overlay.hint = f"{self._error}　Esc＝退出"
+                self.overlay.blank = False
+                self.overlay.update()
+            except Exception:
+                pass            # 连提示都画不出来就算了，千万别往外抛
+
+    def _tick_inner(self):
         if self._captured:
             return
         pos = _cursor_pos()
@@ -323,6 +368,7 @@ class DesktopPickerDialog(QDialog):
             if not self._left_down:
                 self._up = 0            # 换位置就把「上一层」归零（拖框中不动它）
             self._dirty = True
+            crash_guard.note(f"桌面捕获：查询控件 ({pos[0]},{pos[1]})")
         if self._left_down:
             self._drag_to = pos         # 拖框中：跟着鼠标画框
 
@@ -435,6 +481,7 @@ class DesktopPickerDialog(QDialog):
         self.overlay.update()
         QApplication.processEvents()
         time.sleep(0.08)                # 等这一帧真的合成上去
+        crash_guard.note("桌面捕获：截屏取模板")
         try:
             img = desktop.grab_screen()
         except Exception as e:

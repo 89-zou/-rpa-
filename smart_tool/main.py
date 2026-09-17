@@ -8,6 +8,7 @@ from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from smart_tool import paths
+from smart_tool.core import crash_guard
 from smart_tool.ui.main_window import MainWindow
 
 
@@ -16,8 +17,12 @@ def install_crash_handler():
 
     没有它的话，Qt 槽函数里抛出的异常会让程序毫无提示地直接退出（闪退），
     既看不到原因，也没留下任何线索。
+
+    另外再挂一层「原生崩溃兜底」：像访问冲突、回调里逃出异常这类崩溃，
+    Python 层根本来不及反应，由 crash_guard 记下异常代码和最后一步在干什么。
     """
     log_file = paths.ROOT_DIR / "crash.log"
+    crash_guard.install(log_file)
 
     def hook(exc_type, exc, tb):
         text = "".join(traceback.format_exception(exc_type, exc, tb))

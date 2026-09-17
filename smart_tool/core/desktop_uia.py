@@ -114,10 +114,13 @@ def _auto():
 
 
 def _screen_size() -> Tuple[int, int]:
-    """虚拟桌面总宽高（多屏时包含所有屏）。"""
-    import ctypes
-    u = ctypes.windll.user32
-    return u.GetSystemMetrics(78), u.GetSystemMetrics(79)   # SM_CXVIRTUALSCREEN/Y
+    """虚拟桌面总宽高（多屏时包含所有屏）；拿不到就返回 0。"""
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        return u.GetSystemMetrics(78), u.GetSystemMetrics(79)  # SM_CX/CYVIRTUALSCREEN
+    except Exception:
+        return 0, 0
 
 
 def control_at(x: float, y: float, up: int = 0) -> Optional[UiControl]:
@@ -125,20 +128,19 @@ def control_at(x: float, y: float, up: int = 0) -> Optional[UiControl]:
 
     :param up: 往父控件走的层数（0＝就是鼠标下那个；1＝它的父容器……）
     返回 None 表示这里查不到有意义的控件（桌面空白、自绘界面、UIA 不响应）。
+
+    整个函数**不会抛异常**：调用它的地方是 Qt 定时器槽，抛出去会把程序搞崩。
     """
-    auto = _auto()
     try:
+        auto = _auto()
         ctrl = auto.ControlFromPoint(int(round(x)), int(round(y)))
+        for _ in range(max(0, int(up))):
+            if ctrl is None:
+                return None
+            ctrl = ctrl.GetParentControl()
+        return _describe(ctrl)
     except Exception:
         return None
-    for _ in range(max(0, int(up))):
-        if ctrl is None:
-            return None
-        try:
-            ctrl = ctrl.GetParentControl()
-        except Exception:
-            return None
-    return _describe(ctrl)
 
 
 def _describe(ctrl) -> Optional[UiControl]:

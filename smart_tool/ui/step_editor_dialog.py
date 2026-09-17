@@ -898,14 +898,18 @@ class StepEditDialog(QDialog):
             self.fallback_edit.setText(rel)
 
     def _capture_element(self, target: str):
-        """捕获元素。
+        """捕获元素（按钮槽：整段包住，异常绝不能逃进 Qt 的事件分发）。"""
+        try:
+            if self.desktop:
+                self._capture_desktop_control(target)
+                return
+            self._capture_web_element(target)
+        except Exception as e:
+            QMessageBox.critical(self, "捕获失败",
+                                 f"{type(e).__name__}: {e}")
 
-        网页场景：打开浏览器点元素 → 拿到 XPath + 元素图（截图进兜底栏）。
-        桌面场景：全屏遮罩 + UI Automation → 点一下自动裁出控件的图当模板。
-        """
-        if self.desktop:
-            self._capture_desktop_control(target)
-            return
+    def _capture_web_element(self, target: str):
+        """网页场景：打开浏览器点元素 → 拿到 XPath + 元素图（截图进兜底栏）。"""
         url = self.url_edit.text().strip() or self._default_url
         dlg = ElementPickerDialog(url, self.project_dir, self)
         if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
@@ -957,18 +961,22 @@ class StepEditDialog(QDialog):
 
     def _capture_screen(self, target: str):
         """截屏拖框取模板（桌面场景）：target=main 填定位，wait 填等待目标。"""
-        dlg = ScreenCaptureDialog(self.project_dir, self)
-        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_path:
-            return
-        if target == "wait":
-            self.wait_target.setText(dlg.result_path)
-            self.capture_hint.setText(f"已取等待模板：{dlg.result_path}")
-        else:
-            self.locator_value.setText(dlg.result_path)
-            self.capture_hint.setText(
-                f"已取模板：{dlg.result_path}（只框控件本身，别带大片背景）"
-            )
-        self._sync_visibility()
+        try:
+            dlg = ScreenCaptureDialog(self.project_dir, self)
+            if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_path:
+                return
+            if target == "wait":
+                self.wait_target.setText(dlg.result_path)
+                self.capture_hint.setText(f"已取等待模板：{dlg.result_path}")
+            else:
+                self.locator_value.setText(dlg.result_path)
+                self.capture_hint.setText(
+                    f"已取模板：{dlg.result_path}（只框控件本身，别带大片背景）"
+                )
+            self._sync_visibility()
+        except Exception as e:
+            QMessageBox.critical(self, "截屏取模板失败",
+                                 f"{type(e).__name__}: {e}")
 
     def _show_preview(self, path: Path):
         pix = QPixmap(str(path))
