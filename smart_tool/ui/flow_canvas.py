@@ -42,6 +42,7 @@ LAYOUT_VERSION = "h2"
 # 卡片尺寸（保持紧凑，便于一屏看清整条流程；Ctrl+滚轮可放大细看）
 NODE_W = 140
 HEADER_H = 16
+TYPE_LINE_H = 9        # 标题下面的「类型行」（点击 / 填入 / 循环开始…）
 BODY_LINE_H = 9
 BODY_PAD = 3
 
@@ -92,7 +93,8 @@ ACTION_META = {
 def node_height_for(step: Step, data_source: dict) -> float:
     """卡片高度（排版与绘制共用同一算法，避免对不齐）。"""
     lines = max(1, len(step_summary(step, data_source)))
-    return HEADER_H + lines * BODY_LINE_H + BODY_PAD * 2
+    # 标题行 + 类型行 + 正文行
+    return HEADER_H + TYPE_LINE_H + lines * BODY_LINE_H + BODY_PAD * 2
 
 
 def _range_summary(text: str) -> str:
@@ -261,17 +263,30 @@ class NodeItem(QGraphicsItem):
         painter.drawRoundedRect(header, radius, radius)
         painter.drawRect(QRectF(0, HEADER_H - radius, NODE_W, radius))
 
-        # 标题
+        # 标题：编号 + 自定义名称（没写名称就用动作默认名）
         painter.setPen(QPen(QColor("#ffffff")))
         title_font = QFont()
         title_font.setBold(True)
         title_font.setPointSizeF(TITLE_FONT_PT)
         painter.setFont(title_font)
-        title = f"{self.step.id}. {self._name}"
+        title = f"{self.step.id}. {self.step.title or self._name}"
         painter.drawText(
             QRectF(5, 0, NODE_W - 9, HEADER_H),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
             title,
+        )
+
+        # 类型行：动作名（点击 / 填入 / 循环开始…），小字灰色，一眼看出这是什么节点
+        painter.setPen(QPen(QColor("#8a94a2")))
+        type_font = QFont()
+        type_font.setPointSizeF(BODY_FONT_PT)
+        painter.setFont(type_font)
+        fm_type = QFontMetrics(type_font)
+        painter.drawText(
+            QRectF(4, HEADER_H, NODE_W - 8, TYPE_LINE_H),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            fm_type.elidedText(self._name, Qt.TextElideMode.ElideRight,
+                               int(NODE_W - 8)),
         )
 
         # 正文摘要
@@ -280,7 +295,7 @@ class NodeItem(QGraphicsItem):
         body_font.setPointSizeF(BODY_FONT_PT)
         painter.setFont(body_font)
         fm = QFontMetrics(body_font)
-        y = HEADER_H + BODY_PAD
+        y = HEADER_H + TYPE_LINE_H + BODY_PAD
         for line in self._lines:
             text = fm.elidedText(line, Qt.TextElideMode.ElideRight, NODE_W - 8)
             painter.drawText(
