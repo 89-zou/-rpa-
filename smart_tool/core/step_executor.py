@@ -40,9 +40,10 @@ PAUSE_POLL_INTERVAL = 0.5
 PAUSE_LOG_INTERVAL = 10
 # Playwright 页面默认超时（毫秒）。脚本节点会临时改小，用完恢复到这个值。
 DEFAULT_PAGE_TIMEOUT_MS = 30000
-# 打开网页的等待上限（毫秒）。站点慢的时候「load」事件迟迟不触发，
+# 打开网页的默认等待上限（秒）。站点慢的时候「load」事件迟迟不触发，
 # 所以只等到 DOM 解析完成就算打开，页面是否稳定交给步骤里的「步骤后等待」。
-NAV_TIMEOUT_MS = 60000
+# 每条【打开网页】可以在步骤编辑器里单独改这个秒数。
+NAV_TIMEOUT_DEFAULT_S = 120
 # 点击元素的等待上限（毫秒）
 CLICK_TIMEOUT_MS = 20000
 # 每个步骤之间的最小缓冲（秒）。站点慢的时候连点太密会丢事件
@@ -764,16 +765,18 @@ class StepExecutor:
         会把 load 事件拖到几十秒，等它很容易一步就把整个流程卡死。
         页面「是否稳定」交给这一步的「步骤后等待」（页面加载完成 / 元素出现…），
         那些等待是轮询实现，超时也只记一条日志、不会中断流程。
+
+        等多久由这一步的「打开超时」决定（默认 NAV_TIMEOUT_DEFAULT_S 秒）。
         """
+        secs = int(step.nav_timeout or NAV_TIMEOUT_DEFAULT_S)
         try:
             self._page.goto(step.url, wait_until="domcontentloaded",
-                            timeout=NAV_TIMEOUT_MS)
+                            timeout=secs * 1000)
         except PlaywrightTimeout as e:
             raise TimeoutError(
-                f"打开网页超过 {NAV_TIMEOUT_MS // 1000}s 还没响应：{step.url}\n"
+                f"打开网页超过 {secs}s 还没响应：{step.url}\n"
                 f"   当前页面：{self._current_url() or '（空白页）'}\n"
-                "   站点慢的话，可以在这条【打开网页】上设「额外等待」，"
-                "或调大 step_executor.py 里的 NAV_TIMEOUT_MS。"
+                f"   可以双击这一步，把「打开超时」调大（现在 {secs} 秒）。"
             ) from e
 
     def _click(self, step: Step):

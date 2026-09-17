@@ -168,6 +168,15 @@ class StepEditDialog(QDialog):
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("https://example.com/login")
         form.addRow("网址 URL：", self.url_edit)
+        self.nav_timeout = QSpinBox()
+        self.nav_timeout.setRange(5, 3600)
+        self.nav_timeout.setSuffix(" 秒")
+        self.nav_timeout.setToolTip(
+            "打开这个网址最多等几秒（默认 120）。\n"
+            "站点慢就调大；只等到网页结构解析完就算打开，\n"
+            "页面是否稳定由下面的「步骤后等待」负责。"
+        )
+        form.addRow("打开超时：", self.nav_timeout)
 
         # --- 定位组（click/fill/select）---
         self.locator_type = QComboBox()
@@ -460,7 +469,7 @@ class StepEditDialog(QDialog):
         root.addWidget(buttons)
 
         # 各字段的 label buddy 不便单独拿，统一用 widget 列表控制显隐
-        self._navigate_widgets = [self.url_edit]
+        self._navigate_widgets = [self.url_edit, self.nav_timeout]
         self._locator_widgets = [self.locator_type, loc_row]
         self._image_widgets = [self.image_hint, self.preview]
         self._value_widgets = [value_row, self.value_hint]
@@ -784,6 +793,7 @@ class StepEditDialog(QDialog):
         self.action_combo.setCurrentIndex(max(0, idx))
 
         self.url_edit.setText(s.url)
+        self.nav_timeout.setValue(int(s.nav_timeout or 120))
         if s.locator:
             self.locator_type.setCurrentIndex(
                 self.locator_type.findData(s.locator.type)
@@ -943,6 +953,7 @@ class StepEditDialog(QDialog):
 
         if action == "navigate":
             step.url = self.url_edit.text().strip()
+            step.nav_timeout = int(self.nav_timeout.value())
         elif action in ("click", "fill", "select"):
             step.locator = Locator(
                 type=self.locator_type.currentData(),
