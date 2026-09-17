@@ -376,9 +376,12 @@ class DataSourceDialog(QDialog):
                     continue
                 text = first[src]
                 warn = "（空！请检查文件）" if not text.strip() else ""
+                # 数量类变量的取值就是个数，别写成「共 1 字」
+                detail = (f"取值 {text}" if text.strip().isdigit()
+                          else f"共 {len(text)} 字")
                 lines.append(
                     f"    {{{{{var}}}}} ← {self._source_label(src)}"
-                    f"，共 {len(text)} 字{warn}"
+                    f"，{detail}{warn}"
                 )
         self.var_hint.setPlainText("\n".join(lines))
 
