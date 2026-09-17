@@ -173,10 +173,10 @@ class WebAutomationTab(QWidget):
         self.btn_abort.clicked.connect(self._resolve_pause_abort)
         run_layout.addWidget(self.btn_abort)
         run_layout.addStretch()
-        # 日志折叠开关（︿ 收起 / ﹀ 展开）
-        self._log_collapsed = False
-        self.btn_log_toggle = QPushButton("︿ 日志")
-        self.btn_log_toggle.setToolTip("收起日志面板")
+        # 日志折叠开关（︿ 收起 / ﹀ 展开）：默认收起，不占画布地方
+        self._log_collapsed = True
+        self.btn_log_toggle = QPushButton("﹀ 日志")
+        self.btn_log_toggle.setToolTip("展开日志面板")
         self.btn_log_toggle.setFixedWidth(84)
         self.btn_log_toggle.clicked.connect(self._toggle_log)
         run_layout.addWidget(self.btn_log_toggle)
@@ -186,6 +186,7 @@ class WebAutomationTab(QWidget):
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumHeight(160)
+        self.log_text.setVisible(False)      # 默认收起
         layout.addWidget(self.log_text, 1)
 
     def _toggle_log(self):
