@@ -16,6 +16,7 @@ from playwright.sync_api import (
 )
 
 from smart_tool.core import blocks, image_locator
+from smart_tool.core import real_mouse as real_mouse_mod
 from smart_tool.core.blocks import Block
 from smart_tool.core.data_sources import DataSourceConfig, load_rows
 from smart_tool.core.project_store import Locator, Step
@@ -334,6 +335,7 @@ class StepExecutor:
         log: Callable[[str], None] = print,
         on_pause: Optional[Callable[[Step], Optional[PauseHandle]]] = None,
         on_resume: Optional[Callable[[str], None]] = None,
+        real_mouse: bool = False,
     ):
         """
         :param project_dir: 项目目录，用于解析 locator.value 中相对路径的截图
@@ -343,6 +345,8 @@ class StepExecutor:
                          此时仅靠 resume_condition 自动检测，manual 条件则等回车。
         :param on_resume: 暂停结束回调，参数为原因：
                           auto（信号自动检测）/manual（人工继续）/abort（人工终止）。
+        :param real_mouse: 用 OS 级真实鼠标点击（pyautogui）代替合成事件，
+                           给 canvas / 拖拽类站点用。默认关。
         """
         self.steps = steps
         self.variables = variables or {}
@@ -351,6 +355,8 @@ class StepExecutor:
         self.log = log
         self.on_pause = on_pause
         self.on_resume = on_resume
+        self.real_mouse = bool(real_mouse) and not headless
+        self._real_mouse = None
         self._stop = False
         self._page: Optional[Page] = None
 
@@ -380,6 +386,13 @@ class StepExecutor:
     def run(self):
         """启动浏览器并按块树执行步骤（循环 / 条件可互相嵌套）。"""
         nodes = blocks.parse(self.steps)
+        if self.real_mouse:
+            self.log(
+                "真实鼠标模式已开启：浏览器窗口要保持可见、在最前面，"
+                "全程别动鼠标键盘（鼠标会被程序占用）。\n"
+                "   紧急情况把鼠标猛地甩到屏幕左上角可急停；"
+                "用不了时会自动退回普通点击。"
+            )
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=self.headless)
             context = browser.new_context()
@@ -783,11 +796,14 @@ class StepExecutor:
             raise ValueError("click 步骤缺少 locator")
         if step.locator.type == "image":
             m = self._locate_by_image(step.locator)
-            self._page.mouse.click(m.x, m.y)
+            self._mouse_click(m.x, m.y)
             return
         loc = self._resolve_xpath(step.locator)
         try:
-            loc.click(timeout=CLICK_TIMEOUT_MS)
+            if self.real_mouse:
+                self._click_by_real_mouse(loc)
+            else:
+                loc.click(timeout=CLICK_TIMEOUT_MS)
         except Exception as e:
             if self._retry_by_image(step, f"点击没成功（{_first_line(e)}）"):
                 return
@@ -796,6 +812,50 @@ class StepExecutor:
                 f"   当前页面：{self._current_url() or '（正在跳转中）'}\n"
                 "   多半是上一步之后没跳到你以为的页面，或这个 XPath 属于另一个页面。"
             ) from e
+
+    # ------------------------------
+    # 鼠标：普通（CDP 合成）/ 真实（OS 级）
+    # ------------------------------
+    def _mouse_click(self, x: float, y: float):
+        """在 viewport 坐标 (x, y) 点一下鼠标。
+
+        默认走 Playwright 的合成事件；开了「真实鼠标」就交给 pyautogui 发
+        OS 级输入（个别站点只认真输入）。用不了就记一条日志、退回普通点击，
+        不让整个流程因为它挂掉。
+        """
+        if self.real_mouse:
+            try:
+                if self._real_mouse is None:
+                    self._real_mouse = real_mouse_mod.RealMouse(
+                        self._page, log=self.log)
+                self._real_mouse.click(x, y)
+                return
+            except real_mouse_mod.RealMouseUnavailable as e:
+                self.log(f"  真实鼠标用不了：{_first_line(e)}")
+                self.real_mouse = False        # 本次运行不再试
+            except Exception as e:
+                if type(e).__name__ == "FailSafeException":
+                    self.log("  真实鼠标急停（你把鼠标甩到屏幕角落了）→ 这一步改用普通点击")
+                else:
+                    self.log(f"  真实鼠标出错：{_first_line(e)} → 改用普通点击")
+        self._page.mouse.click(x, y)
+
+    def _click_by_real_mouse(self, loc, timeout_ms: int = CLICK_TIMEOUT_MS):
+        """真实鼠标模式下点一个元素：等它可见 → 滚进视野 → 取中心发真点击。
+
+        真点击绕过了 Playwright 的可点击性检查，所以这里自己补上「等可见 +
+        滚进视野」，免得点到别的东西上。
+        """
+        loc.wait_for(state="visible", timeout=timeout_ms)
+        try:
+            loc.scroll_into_view_if_needed(timeout=FOCUS_CLICK_TIMEOUT_MS)
+        except Exception:
+            pass                    # 滚不动就算了，box 拿得到就行
+        box = loc.bounding_box()
+        if not box:
+            raise TimeoutError("元素没有可见位置，算不出真实点击的坐标")
+        self._mouse_click(box["x"] + box["width"] / 2,
+                          box["y"] + box["height"] / 2)
 
     # ------------------------------
     # 兜底：XPath 不行就改用元素截图定位
@@ -823,7 +883,7 @@ class StepExecutor:
         except Exception as e:
             self.log(f"  兜底截图也没匹配上：{_first_line(e)}")
             return False
-        self._page.mouse.click(m.x, m.y)
+        self._mouse_click(m.x, m.y)
         self.log(f"  已按截图坐标点击（置信度 {m.confidence:.2f}）")
         return True
 
@@ -833,7 +893,7 @@ class StepExecutor:
         insertText 直接走输入法通道，中文等非 ASCII 字符也能可靠写入。
         """
         m = self._locate_by_image(locator)
-        self._page.mouse.click(m.x, m.y)
+        self._mouse_click(m.x, m.y)
         self._page.keyboard.press("Control+A")
         self._page.keyboard.press("Delete")
         self._page.keyboard.insert_text(text)
@@ -940,7 +1000,10 @@ class StepExecutor:
         让 Playwright 自己报真正的错误原因。
         """
         try:
-            loc.click(timeout=FOCUS_CLICK_TIMEOUT_MS)
+            if self.real_mouse:
+                self._click_by_real_mouse(loc, FOCUS_CLICK_TIMEOUT_MS)
+            else:
+                loc.click(timeout=FOCUS_CLICK_TIMEOUT_MS)
             self.log("  已点击元素中心获取焦点")
             return True
         except Exception as e:

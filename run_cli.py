@@ -30,9 +30,12 @@ def main():
 
     steps = store.load_steps()
     variables = store.load_variables()
-    print(f"加载项目 [{name}]，共 {len(steps)} 步。")
+    real = store.load_real_mouse()
+    print(f"加载项目 [{name}]，共 {len(steps)} 步。"
+          + ("（真实鼠标：开）" if real else ""))
     executor = StepExecutor(
         steps, variables, headless=False, project_dir=store.dir,
+        real_mouse=real,
     )
     try:
         executor.run()

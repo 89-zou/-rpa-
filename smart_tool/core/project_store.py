@@ -232,6 +232,8 @@ class ProjectStore:
             layout_version if layout_version is not None
             else old.get("layout", "")
         )
+        if old.get("real_mouse"):
+            data["real_mouse"] = True     # 项目级开关，别被保存步骤时弄丢
         self._write(data)
 
     def save_variables(self, variables: Dict[str, str]):
@@ -253,6 +255,16 @@ class ProjectStore:
         """只更新画布手动连线，其余配置保持不变。"""
         data = dict(self.load())
         data["canvas_edges"] = [[a, b] for a, b in edges]
+        self._write(data)
+
+    def load_real_mouse(self) -> bool:
+        """这个项目要不要用「真实鼠标」（OS 级点击，默认关）。"""
+        return bool(self.load().get("real_mouse"))
+
+    def save_real_mouse(self, on: bool):
+        """只更新「真实鼠标」开关，其余配置保持不变。"""
+        data = dict(self.load())
+        data["real_mouse"] = bool(on)
         self._write(data)
 
     # ------------------------------
