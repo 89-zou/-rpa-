@@ -20,6 +20,18 @@ from smart_tool.core.data_sources import (
 )
 from smart_tool.core.project_store import Locator, Step
 
+# fill 真能填的元素：input / textarea（可编辑区域另判）；<select> 要用「下拉选择」动作
+FILLABLE_TAGS = ("input", "textarea")
+# 这些 input 类型 fill 填不了
+UNFILLABLE_INPUT_TYPES = ("checkbox", "radio", "file", "button", "submit",
+                          "reset", "image", "hidden")
+# 拦下来之后建议换成哪个动作
+ACTION_HINT = {
+    "select": "这是下拉框，请把动作改成「下拉选择」。",
+    "checkbox": "这是勾选框，请把动作改成「点击」。",
+    "radio": "这是单选按钮，请把动作改成「点击」。",
+}
+
 # 暂停轮询间隔（秒）：兼顾响应速度与 CPU 占用
 PAUSE_POLL_INTERVAL = 0.5
 # 等待期间日志节流（秒），避免刷屏
@@ -732,11 +744,46 @@ class StepExecutor:
             self._page.keyboard.insert_text(text)
         else:
             loc = self._resolve_xpath(step.locator)
+            self._ensure_fillable(loc)
             # 先点一下元素中心拿焦点，再填入：
             # 富文本框、需要激活才可写的框，直接 fill 会填不进去。
             self._focus_by_click(loc)
             loc.fill(text, timeout=20000)
             self._verify_filled(loc, text)
+
+    def _ensure_fillable(self, loc) -> None:
+        """填入前确认目标是「fill 真能填的元素」，否则给一句看得懂的中文提示。
+
+        手写 XPath 很容易指到外层容器（例如把标题框写成 #edit-slug-box 这个 div），
+        Playwright 只会抛一大段英文报错；这里提前拦下来，顺便说清该换哪个动作。
+        元素还没出现时不在这里干等，交给 Playwright 报它自己的错。
+        """
+        try:
+            if loc.count() == 0:
+                return
+            info = loc.first.evaluate(
+                "el => ({tag: el.tagName.toLowerCase(), id: el.id,"
+                "        type: (el.getAttribute('type') || '').toLowerCase(),"
+                "        editable: el.isContentEditable})"
+            )
+        except Exception:
+            return              # 读不到信息就不拦
+        if not info:
+            return
+        tag = info.get("tag") or ""
+        itype = info.get("type") or ""
+        if info.get("editable"):
+            return
+        if tag in FILLABLE_TAGS and itype not in UNFILLABLE_INPUT_TYPES:
+            return
+        who = f"<{tag}{(' id=' + info['id']) if info.get('id') else ''}>"
+        hint = ACTION_HINT.get(tag if tag == "select" else itype)
+        raise ValueError(
+            f"这个 XPath 定位到的是 {who}，不能直接填。"
+            + (f"\n   {hint}" if hint
+               else "\n   只有 input / textarea / 可编辑区域能填，"
+                    "请检查这个 XPath 是不是指到了外层容器或不可填的控件。")
+        )
 
     def _verify_filled(self, loc, expected: str) -> bool:
         """填完读回一次，并把「实际填到了哪个元素」写进日志。
