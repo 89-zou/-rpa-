@@ -90,6 +90,13 @@ class _ShotView(QWidget):
 
     # ---- 绘制 ----
     def paintEvent(self, _event):
+        # 画东西出错只丢一帧；异常逃进 Qt 的事件分发会直接终止进程
+        try:
+            self._paint()
+        except Exception:
+            pass
+
+    def _paint(self):
         p = QPainter(self)
         p.fillRect(self.rect(), QColor("#2b2b2b"))
         if not self._pix or self._pix.isNull():
@@ -239,34 +246,40 @@ class ScreenCaptureDialog(QDialog):
     # 截屏
     # ------------------------------
     def _start_countdown(self):
-        if not desktop.available():
-            QMessageBox.critical(self, "缺少依赖",
-                                 desktop.missing_hint())
-            self.reject()
-            return
-        self._left = COUNTDOWN_S
-        self._tick()
+        try:
+            if not desktop.available():
+                QMessageBox.critical(self, "缺少依赖", desktop.missing_hint())
+                self.reject()
+                return
+            self._left = COUNTDOWN_S
+            self._tick()
+        except Exception as e:
+            QMessageBox.critical(self, "截屏失败", str(e))
 
     def _tick(self):
-        if self._left > 0:
-            self.status.setText(
-                f"{self._left} 秒后自动截屏——请趁现在把目标窗口切到最前面"
-                "（本窗口别挡着它）"
-            )
-            self._left -= 1
-            QTimer.singleShot(1000, self._tick)
-            return
-        self.status.setText("正在截屏…")
-        QTimer.singleShot(50, self._grab)
+        """倒计时槽：整段包住，别让异常逃进 Qt 的事件分发。"""
+        try:
+            if self._left > 0:
+                self.status.setText(
+                    f"{self._left} 秒后自动截屏——请趁现在把目标窗口切到最前面"
+                    "（本窗口别挡着它）"
+                )
+                self._left -= 1
+                QTimer.singleShot(1000, self._tick)
+                return
+            self.status.setText("正在截屏…")
+            QTimer.singleShot(50, self._grab)
+        except Exception as e:
+            self.status.setText(f"出错：{e}")
 
     def _grab(self):
         try:
             self._img = desktop.grab_screen()
+            self.view.set_pixmap(pil_to_pixmap(self._img))
         except Exception as e:
             self.status.setText("截屏失败")
             QMessageBox.critical(self, "截屏失败", str(e))
             return
-        self.view.set_pixmap(pil_to_pixmap(self._img))
         self._reset_view()
         self.status.setText(
             f"截图完成（{self._img.width} × {self._img.height}）："
@@ -279,19 +292,27 @@ class ScreenCaptureDialog(QDialog):
         self.size_label.setText("")
 
     def _on_picked(self):
-        sel = self.view.selection()
-        if sel is None:
-            self.size_label.setText(f"框太小了（至少 {MIN_SIZE}×{MIN_SIZE} 像素）")
-            self.preview.setPixmap(QPixmap())
-            return
-        x, y, w, h = sel
-        crop = self._img.crop((x, y, x + w, y + h))
-        self.preview.setPixmap(pil_to_pixmap(crop).scaled(
-            150, 90, Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation))
-        self.size_label.setText(f"已选 {w} × {h} 像素")
-        if not self.name_edit.text().strip():
-            self.name_edit.setText(self._default_name())
+        """框选完成（鼠标松开）——槽函数，整段包住别让异常逃出去。"""
+        try:
+            if self._img is None:
+                self.size_label.setText("还没截屏，先点【重新截屏】")
+                return
+            sel = self.view.selection()
+            if sel is None:
+                self.size_label.setText(
+                    f"框太小了（至少 {MIN_SIZE}×{MIN_SIZE} 像素）")
+                self.preview.setPixmap(QPixmap())
+                return
+            x, y, w, h = sel
+            crop = self._img.crop((x, y, x + w, y + h))
+            self.preview.setPixmap(pil_to_pixmap(crop).scaled(
+                150, 90, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation))
+            self.size_label.setText(f"已选 {w} × {h} 像素")
+            if not self.name_edit.text().strip():
+                self.name_edit.setText(self._default_name())
+        except Exception as e:
+            self.size_label.setText(f"出错了：{e}")
 
     # ------------------------------
     # 保存

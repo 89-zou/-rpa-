@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 from smart_tool.core import image_locator
+from smart_tool.core.crash_guard import note
 
 # 找图时的默认等待：桌面程序渲染慢，一次没找到就多试几次
 DEFAULT_WAIT_S = 10.0
@@ -110,6 +111,7 @@ def grab_screen():
     多屏时截**整个虚拟桌面**（配合 screen_origin 换算坐标），
     这样目标程序在副屏上也能找到。
     """
+    note("桌面：截屏")
     _ensure_dpi_aware()
     try:
         from PIL import ImageGrab
@@ -142,6 +144,7 @@ def locate(template_path: Path, threshold: Optional[float] = None,
     if not path.exists():
         raise DesktopError(f"模板图不存在：{path}\n"
                            "（在步骤编辑器里点【截屏取模板…】重新截一张）")
+    note(f"桌面：找图 {path.name}")
     template = image_locator.imread_unicode(path)
     th, tw = template.shape[:2]
     if th < 4 or tw < 4:
@@ -207,6 +210,7 @@ def move(x: float, y: float):
 
 def click(x: float, y: float, times: int = 1):
     """在屏幕坐标点一下（times=2 就是双击）。"""
+    note(f"桌面：点击 ({x:.0f},{y:.0f}) x{times}")
     gui = _gui()
     _ensure_dpi_aware()
     gui.moveTo(int(round(x)), int(round(y)))
@@ -237,6 +241,7 @@ def type_text(text: str, log: Callable[[str], None] = print):
     """
     if not text:
         return
+    note(f"桌面：输入文字（{len(text)} 字）")
     if sys.platform != "win32":
         _gui().write(text, interval=0.02)
         return
@@ -306,6 +311,7 @@ def hotkey(keys: str):
     parts = [p for p in re.split(r"[+,]", raw) if p]
     if not parts:
         raise DesktopError("「按键」没填要按什么（例：enter、ctrl+s、alt+f4）")
+    note(f"桌面：按键 {keys}")
     mapped = [KEY_ALIASES.get(p, p.lower()) for p in parts]
     _gui().hotkey(*mapped)
 
@@ -342,6 +348,7 @@ def activate_window(keyword: str,
     kw = (keyword or "").strip().lower()
     if not kw:
         raise DesktopError("「激活窗口」没填窗口标题关键字（填标题里的一小段即可）")
+    note(f"桌面：激活窗口（{keyword}）")
     try:
         import pygetwindow as gw
     except Exception as e:
