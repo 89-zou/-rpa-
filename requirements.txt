@@ -1,0 +1,5 @@
+PyQt6>=6.5
+playwright>=1.40
+opencv-python>=4.8
+openpyxl>=3.1
+xlrd>=2.0

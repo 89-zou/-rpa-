@@ -1,0 +1,183 @@
+# -*- coding: utf-8 -*-
+"""项目对话框：新建项目、载入项目。
+
+- NewProjectDialog：填名称 + 起始网址即可建项目（放在【载入项目…】旁边）
+- ProjectPickerDialog：从项目文件夹里挑选，也可以浏览到别的文件夹
+"""
+from pathlib import Path
+from typing import List, Optional
+
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (
+    QAbstractItemView, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
+    QPushButton, QVBoxLayout,
+)
+
+from smart_tool import paths
+from smart_tool.core.project_store import (
+    ProjectStore, create_project, list_projects,
+)
+
+
+class NewProjectDialog(QDialog):
+    """新建项目：名称 +（选填）起始网址。建好后 created_store 即新项目。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("新建项目")
+        self.setMinimumWidth(460)
+        self.created_store: Optional[ProjectStore] = None
+
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("如：WP官网发文")
+        form.addRow("项目名称：", self.name_edit)
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("选填，填了会自动生成第 1 步「打开网页」")
+        form.addRow("起始网址：", self.url_edit)
+        root.addLayout(form)
+
+        tip = QLabel(f"项目会创建在：{paths.PROJECTS_DIR}")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color: #777;")
+        root.addWidget(tip)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("创建并载入")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        self.name_edit.setFocus()
+
+    def _on_accept(self):
+        try:
+            self.created_store = create_project(
+                self.name_edit.text().strip(), initial_url=self.url_edit.text().strip()
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "无法创建", str(e))
+            return
+        self.accept()
+
+
+class ProjectPickerDialog(QDialog):
+    """选择要载入的项目。选好后 chosen_path 即项目目录。"""
+
+    def __init__(self, current_path: Optional[Path] = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("载入项目")
+        self.setMinimumSize(560, 440)
+        self.chosen_path: Optional[Path] = None
+        self._current_path = Path(current_path).resolve() if current_path else None
+        self._stores: List[ProjectStore] = []
+        self._init_ui()
+        self._reload()
+
+    # ------------------------------
+    # UI
+    # ------------------------------
+    def _init_ui(self):
+        root = QVBoxLayout(self)
+
+        tip = QLabel(
+            f"项目文件夹：{paths.PROJECTS_DIR}\n"
+            "选中一个项目后点【载入】；也可以浏览到其他文件夹（需含 steps.json）。"
+        )
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color: #777;")
+        root.addWidget(tip)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.list_widget.itemDoubleClicked.connect(lambda _: self._choose_from_list())
+        self.list_widget.itemSelectionChanged.connect(self._update_buttons)
+        root.addWidget(self.list_widget, 1)
+
+        self.path_label = QLabel("")
+        self.path_label.setStyleSheet("color: #999;")
+        self.path_label.setWordWrap(True)
+        root.addWidget(self.path_label)
+
+        bottom = QHBoxLayout()
+        self.btn_browse = QPushButton("浏览其他文件夹…")
+        self.btn_browse.clicked.connect(self._browse)
+        bottom.addWidget(self.btn_browse)
+        bottom.addStretch()
+        self.btn_load = QPushButton("载入")
+        self.btn_load.setDefault(True)
+        self.btn_load.clicked.connect(self._choose_from_list)
+        bottom.addWidget(self.btn_load)
+        self.btn_cancel = QPushButton("取消")
+        self.btn_cancel.clicked.connect(self.reject)
+        bottom.addWidget(self.btn_cancel)
+        root.addLayout(bottom)
+
+    # ------------------------------
+    # 列表
+    # ------------------------------
+    def _reload(self):
+        self._stores = list_projects()
+        self.list_widget.clear()
+        select_row = -1
+        for i, s in enumerate(self._stores):
+            item = QListWidgetItem(
+                f"{s.name}    （{len(s.load_steps())} 步，"
+                f"{s.image_count()} 张截图）"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, str(s.dir))
+            self.list_widget.addItem(item)
+            if self._current_path and s.dir.resolve() == self._current_path:
+                select_row = i
+        if select_row >= 0:
+            self.list_widget.setCurrentRow(select_row)
+        elif self._stores:
+            self.list_widget.setCurrentRow(0)
+
+        # 当前项目不在列表里（从别处载入的）→ 提示一下
+        if self._current_path and not any(
+            s.dir.resolve() == self._current_path for s in self._stores
+        ) and (self._current_path / "steps.json").exists():
+            self.path_label.setText(f"当前项目在别处：{self._current_path}")
+        self._update_buttons()
+
+    def _update_buttons(self):
+        self.btn_load.setEnabled(self.list_widget.currentItem() is not None)
+        item = self.list_widget.currentItem()
+        if item is not None:
+            self.path_label.setText(item.data(Qt.ItemDataRole.UserRole))
+        elif not self.path_label.text():
+            self.path_label.setText("没有可选项目，请用【浏览其他文件夹…】")
+
+    # ------------------------------
+    # 选择
+    # ------------------------------
+    def _choose_from_list(self):
+        item = self.list_widget.currentItem()
+        if item is None:
+            return
+        self.chosen_path = Path(item.data(Qt.ItemDataRole.UserRole))
+        self.accept()
+
+    def _browse(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "选择项目文件夹", str(paths.PROJECTS_DIR)
+        )
+        if not folder:
+            return
+        d = Path(folder)
+        if not (d / "steps.json").exists():
+            QMessageBox.warning(
+                self, "不是项目文件夹",
+                f"这个文件夹里没有 steps.json，不是自动化项目：\n{d}\n\n"
+                f"如果是新项目，请到【项目管理…】里新建。",
+            )
+            return
+        self.chosen_path = d
+        self.accept()
