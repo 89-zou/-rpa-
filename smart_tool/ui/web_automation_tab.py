@@ -7,11 +7,11 @@ from typing import List, Optional, Tuple
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QMenu, QMessageBox,
+    QCheckBox, QDialog, QHBoxLayout, QLabel, QMenu, QMessageBox,
     QPushButton, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from smart_tool.core import blocks
+from smart_tool.core import blocks, real_mouse
 from smart_tool.core.project_store import (
     ProjectStore, Step, list_projects, rename_field_refs,
 )
@@ -45,6 +45,7 @@ class ExecutorWorker(QThread):
         variables: dict,
         project_dir=None,
         headless: bool = False,
+        real_mouse: bool = False,
     ):
         super().__init__()
         self._pause_handle: Optional[PauseHandle] = None
@@ -56,6 +57,7 @@ class ExecutorWorker(QThread):
             log=self.log_signal.emit,
             on_pause=self._on_pause,
             on_resume=self.pause_resolved.emit,
+            real_mouse=real_mouse,
         )
 
     def _on_pause(self, step: Step) -> PauseHandle:
@@ -171,6 +173,19 @@ class WebAutomationTab(QWidget):
         self.btn_abort.setEnabled(False)
         self.btn_abort.clicked.connect(self._resolve_pause_abort)
         run_layout.addWidget(self.btn_abort)
+        run_layout.addSpacing(12)
+        self.chk_real_mouse = QCheckBox("真实鼠标")
+        self.chk_real_mouse.setToolTip(
+            "用操作系统级的真实鼠标点击（pyautogui）代替浏览器合成事件。\n"
+            "个别站点（canvas 画板、拖拽控件、盯自动化特征的站）需要它。\n\n"
+            "代价：\n"
+            "· 浏览器窗口必须可见、在最前面，全程别动鼠标键盘（会占用你的鼠标）；\n"
+            "· 第一次点击前会先花两次移动做坐标标定；\n"
+            "· 用不了（窗口被挡住 / pyautogui 没装）会自动退回普通点击，日志里会写明。\n\n"
+            "紧急情况：把鼠标猛地甩到屏幕左上角可急停。默认关闭。"
+        )
+        self.chk_real_mouse.stateChanged.connect(self._on_real_mouse_toggled)
+        run_layout.addWidget(self.chk_real_mouse)
         run_layout.addStretch()
         # 日志折叠开关（︿ 收起 / ﹀ 展开）：默认收起，不占画布地方
         self._log_collapsed = True
@@ -187,6 +202,24 @@ class WebAutomationTab(QWidget):
         self.log_text.setMaximumHeight(160)
         self.log_text.setVisible(False)      # 默认收起
         layout.addWidget(self.log_text, 1)
+
+    def _on_real_mouse_toggled(self, _state):
+        """「真实鼠标」开关：立即写进项目（每个项目各存各的）。"""
+        on = self.chk_real_mouse.isChecked()
+        if self._current_store:
+            self._current_store.save_real_mouse(on)
+        if not on:
+            self._append_log("真实鼠标已关闭，恢复浏览器合成点击。")
+        elif not real_mouse.available():
+            self._append_log(
+                "真实鼠标：pyautogui 没装，运行时仍会用普通点击。"
+                "装法：.venv\\Scripts\\python -m pip install pyautogui"
+            )
+        else:
+            self._append_log(
+                "真实鼠标已开启：运行时用系统级鼠标点击。"
+                "浏览器窗口要保持可见、在最前面，全程别动鼠标键盘。"
+            )
 
     def _toggle_log(self):
         """收起/展开日志面板，按钮符号在 ︿ 与 ﹀ 之间切换。"""
@@ -238,6 +271,9 @@ class WebAutomationTab(QWidget):
 
         self._current_store = store
         self._steps = store.load_steps()
+        self.chk_real_mouse.blockSignals(True)
+        self.chk_real_mouse.setChecked(store.load_real_mouse())
+        self.chk_real_mouse.blockSignals(False)
         # 旧版纵向排版、或新项目还没排过版 → 请求横向蛇形排版。
         # 画布尚未显示时它会挂起，等拿到真实宽度再排（避免列数过窄）。
         need_layout = (
@@ -269,6 +305,9 @@ class WebAutomationTab(QWidget):
         """卸载当前项目（未载入状态）。"""
         self._current_store = None
         self._steps = []
+        self.chk_real_mouse.blockSignals(True)
+        self.chk_real_mouse.setChecked(False)
+        self.chk_real_mouse.blockSignals(False)
         self.canvas.set_manual_edges([])
         self.canvas.set_placeholder_text(NO_PROJECT_PLACEHOLDER)
         self.canvas.load_steps([])
@@ -319,6 +358,7 @@ class WebAutomationTab(QWidget):
         self.btn_new.setEnabled(self._worker is None)
         self.btn_load.setEnabled(self._worker is None)
         self.btn_run.setEnabled(self._worker is None and editable)
+        self.chk_real_mouse.setEnabled(self._worker is None)
 
     def _require_project(self) -> bool:
         if not self._current_store:
@@ -622,6 +662,7 @@ class WebAutomationTab(QWidget):
             self._steps, variables,
             project_dir=self._current_store.dir,
             headless=False,
+            real_mouse=self.chk_real_mouse.isChecked(),
         )
         self._worker.log_signal.connect(self._append_log)
         self._worker.finished.connect(self._on_finished)

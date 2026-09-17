@@ -3,3 +3,5 @@ playwright>=1.40
 opencv-python>=4.8
 openpyxl>=3.1
 xlrd>=2.0
+# 「真实鼠标」开关用（OS 级鼠标点击）；没装也不影响其他功能
+pyautogui>=0.9.54
