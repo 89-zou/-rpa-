@@ -20,8 +20,10 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from smart_tool.core import data_sources, project_store, step_executor
 from smart_tool.core.data_sources import DataSourceConfig
 from smart_tool.core.project_store import ProjectStore, Step, list_projects
+from smart_tool.ui.step_editor_dialog import StepEditDialog
 
 # 变量行类型（存在「来源」列的 UserRole 里，用来区分增删改行为）
 KIND_DATA, KIND_PROJECT = "data", "project"
@@ -41,6 +43,8 @@ class ProjectManagerDialog(QDialog):
         self._open_name: Optional[str] = None
         self._store: Optional[ProjectStore] = None
         self._loading = False
+        # 在这里改过哪个项目的步骤（改过当前项目 → 主界面要重新载入）
+        self._changed_project: Optional[str] = None
         self._init_ui()
         self._reload(select_name=current_name)
 
@@ -96,11 +100,14 @@ class ProjectManagerDialog(QDialog):
 
         tip = QLabel(
             "步骤里用 {{变量名}} 引用。变量只有两个来源：\n"
-            "· 读取节点 ＝「读取数据」节点从文件/文件夹读出来的变量"
-            "（换文件夹、改字段名请去画布上双击那个节点）；\n"
-            "· 自定义创建 ＝ 手工加的（账号密码之类），来源不可改。\n"
-            "循环里的 {{loop.item}} / {{loop.item.字段}} / {{loop.index}} 是运行时自动有的，"
-            "不用在这里配置。"
+            "· 读取节点 ＝「读取数据」节点从文件/文件夹读到的："
+            "第一行是它产出的列表变量（如 数据列表），"
+            "下面几行是每个文件的字段（如 loop.item.标题）。\n"
+            "  这两类都是**只读展示**，不能在这里改或删；"
+            "点某行的【来源】就能跳进那个节点，换文件夹、改字段名都在那里做"
+            "（改名后别处的引用会自动跟着改）。\n"
+            "· 自定义创建 ＝ 手工加的（账号密码之类），可增删改，改完立即保存。\n"
+            "循环里的 {{loop.index}}（第几轮）不用配置。"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color: #777;")
@@ -207,21 +214,38 @@ class ProjectManagerDialog(QDialog):
         )
 
     def _append_data_node(self, node: Step):
-        """一个「读取数据」节点产出的变量（字段名写在来源里，不单列成运行时变量）。"""
+        """一个「读取数据」节点：列出它产出的变量与读到的每个文件字段。
+
+        这些都是展示，不能在这里改名/删除——改名请点【来源】跳进那个节点改。
+        """
         cfg = DataSourceConfig.from_dict(node.data_cfg or {})
         var = (node.output_var or "").strip()
         where = Path(cfg.path).name if cfg.path else "（未选路径）"
-        fields = [m.get("var", "").strip()
-                  for m in cfg.field_map if (m.get("var") or "").strip()]
-        if fields:
-            detail = "字段：" + "、".join(fields) \
-                + "（循环里用 {{loop.item.字段名}} 取）"
-        else:
-            detail = "还没勾选字段"
         self._append_row(
             var or "（未填产出变量名）", PLACEHOLDER,
-            f"读取节点：{where}\n{detail}", KIND_DATA,
+            f"读取节点：{where}\n循环节点里填 {{{{{var}}}}} 就能逐项遍历",
+            KIND_DATA, node.id,
         )
+        for m in (node.data_cfg or {}).get("field_map") or []:
+            if not isinstance(m, dict):
+                continue
+            field = (m.get("var") or "").strip()
+            if not field:
+                continue
+            self._append_row(
+                f"loop.item.{field}", PLACEHOLDER,
+                f"读取节点：{where} 的字段（每个文件一项，读的是 "
+                f"{self._source_label(cfg.type, m.get('field', ''))}）",
+                KIND_DATA, node.id,
+            )
+
+    @staticmethod
+    def _source_label(cfg_type: str, fld: str) -> str:
+        """字段来源的中文说法（文件类显示中文字段名）。"""
+        key = data_sources.resolve_src_key(cfg_type, fld)
+        if key.startswith("file."):
+            return dict(data_sources.FILE_FIELDS).get(key[5:], key[5:])
+        return key[5:] if key.startswith("row.") else key
 
     @staticmethod
     def _data_summary(readers: List[Step]) -> str:
@@ -239,7 +263,8 @@ class ProjectManagerDialog(QDialog):
             lines.append(f"「{s.output_var or '未命名'}」← {name} {where}")
         return "\n".join(lines) + "\n循环节点里填 {{变量名}}，就按它读到的项数跑那么多次。"
 
-    def _append_row(self, name: str, value: str, source: str, kind: str):
+    def _append_row(self, name: str, value: str, source: str, kind: str,
+                    node_id: int = 0):
         row = self.var_table.rowCount()
         self.var_table.insertRow(row)
 
@@ -256,12 +281,20 @@ class ProjectManagerDialog(QDialog):
         src_item = QTableWidgetItem(source)
         src_item.setFlags(src_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         src_item.setData(Qt.ItemDataRole.UserRole, kind)
-        src_item.setToolTip(source)
+        src_item.setData(Qt.ItemDataRole.UserRole + 1, node_id)
+        src_item.setToolTip(
+            source + "\n（点一下可以跳进这个「读取数据」节点改名 / 换文件夹）"
+            if kind == KIND_DATA else source
+        )
         self.var_table.setItem(row, COL_SRC, src_item)
 
     def _row_kind(self, row: int) -> str:
         item = self.var_table.item(row, COL_SRC)
         return (item.data(Qt.ItemDataRole.UserRole) if item else "") or ""
+
+    def _row_node_id(self, row: int) -> int:
+        item = self.var_table.item(row, COL_SRC)
+        return int(item.data(Qt.ItemDataRole.UserRole + 1) or 0) if item else 0
 
     def _on_var_changed(self, item: QTableWidgetItem):
         """改名 / 改值 → 立即保存（只对自定义变量生效）。"""
@@ -272,14 +305,41 @@ class ProjectManagerDialog(QDialog):
         self._save_variables()
 
     def _on_var_clicked(self, row: int, col: int):
-        """点「来源」列：告诉用户去哪里改这个变量。"""
+        """点「来源」列：跳进那个「读取数据」节点（改名 / 换文件夹都在那做）。"""
         if col != COL_SRC or self._row_kind(row) != KIND_DATA:
             return
-        QMessageBox.information(
-            self, "改这里",
-            "读取节点产出的变量在节点里改：\n"
-            "回到主界面，在画布上双击那个「读取数据」节点，\n"
-            "就能换文件夹 / 改字段名（改完回到这里刷新即可）。",
+        node_id = self._row_node_id(row)
+        if node_id:
+            self._edit_reader_node(node_id)
+
+    def _edit_reader_node(self, node_id: int):
+        """打开「读取数据」节点；改完写回，并把它改名导致的引用一起改掉。"""
+        if self._store is None:
+            return
+        steps = self._store.load_steps()
+        idx = next((i for i, s in enumerate(steps) if s.id == node_id), -1)
+        if idx < 0:
+            return
+        old = steps[idx]
+        dlg = StepEditDialog(
+            self._store.dir, old, self,
+            variable_names=step_executor.available_variables(
+                steps, self._store.load_variables()),
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_step = dlg.get_step()
+        new_step.pos = old.pos
+        steps[idx] = new_step
+        notes = project_store.rename_field_refs(steps, old, new_step, skip=idx)
+        for i, s in enumerate(steps, start=1):
+            s.id = i
+        self._store.save(steps)
+        self._changed_project = self._store.name
+        self._load_var_list()
+        self._set_status(
+            "已保存；" + "；".join(notes) if notes
+            else "已保存（引用没变，不用改别处）"
         )
 
     def _add_var_row(self):
@@ -319,8 +379,8 @@ class ProjectManagerDialog(QDialog):
         if any(self._row_kind(r) == KIND_DATA for r in rows):
             QMessageBox.information(
                 self, "提示",
-                "「读取节点」产出的变量不在这里删：\n"
-                "请双击那个「读取数据」节点，把对应字段的勾去掉。",
+                "「读取节点」的变量不在这里删：\n"
+                "点它那一行的【来源】跳进节点，把对应字段的勾去掉就行。",
             )
         project_rows = [r for r in rows if self._row_kind(r) == KIND_PROJECT]
         if project_rows:
@@ -377,3 +437,8 @@ class ProjectManagerDialog(QDialog):
     @property
     def open_project_name(self) -> Optional[str]:
         return self._open_name
+
+    @property
+    def changed_project_name(self) -> Optional[str]:
+        """在这个弹窗里改过步骤的项目（主界面据此决定要不要重新载入）。"""
+        return self._changed_project

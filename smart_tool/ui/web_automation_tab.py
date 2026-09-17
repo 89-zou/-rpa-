@@ -12,7 +12,9 @@ from PyQt6.QtWidgets import (
 )
 
 from smart_tool.core import blocks
-from smart_tool.core.project_store import ProjectStore, Step, list_projects
+from smart_tool.core.project_store import (
+    ProjectStore, Step, list_projects, rename_field_refs,
+)
 from smart_tool.core.step_executor import (
     PauseHandle, StepExecutor, available_variables, check_variables,
 )
@@ -293,6 +295,9 @@ class WebAutomationTab(QWidget):
             # 当前项目刚被删掉了
             self._append_log("当前项目已被删除，请重新载入项目。")
             self._clear_project()
+        elif self._current_store and dlg.changed_project_name == current:
+            # 在弹窗里点【来源】改过当前项目的「读取数据」节点 → 内存里的步骤已过期
+            self._load_project(path=self._current_store.dir)
 
     # ------------------------------
     # 选择 / 按钮状态
@@ -484,6 +489,10 @@ class WebAutomationTab(QWidget):
                 self._append_log(f"条件改动：{note}")
             return
         self._steps[row] = new_step
+        if old.action == "read_data" and new_step.action == "read_data":
+            # 读取节点改名（产出变量 / 字段名）→ 别处的引用一起跟着改
+            for note in rename_field_refs(self._steps, old, new_step, skip=row):
+                self._append_log(f"变量改名：{note}")
         self._persist(select_row=row)
 
     def _delete_selected_step(self):

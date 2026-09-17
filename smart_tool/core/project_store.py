@@ -316,6 +316,77 @@ def _content_key(data: Dict[str, Any]) -> str:
 
 
 # ------------------------------
+# 「读取数据」节点改名 → 别处的引用一起改
+# ------------------------------
+def _field_map_of(step: Step) -> Dict[str, str]:
+    """读取节点的字段清单：{原始字段: 变量名}。"""
+    out: Dict[str, str] = {}
+    for m in (step.data_cfg or {}).get("field_map") or []:
+        if not isinstance(m, dict):
+            continue
+        field = (m.get("field") or "").strip()
+        var = (m.get("var") or "").strip()
+        if field and var:
+            out[field] = var
+    return out
+
+
+def _rename_in(obj: Any, mapping: Dict[str, str], hits: Dict[str, int]):
+    """递归把文本里的 {{旧名}} 换成 {{新名}}，并记下改了几处。"""
+    if isinstance(obj, dict):
+        for k, v in list(obj.items()):
+            if isinstance(v, str):
+                obj[k] = _REF_RE.sub(lambda m: _renamed(m, mapping, hits), v)
+            else:
+                _rename_in(v, mapping, hits)
+    elif isinstance(obj, list):
+        for v in obj:
+            _rename_in(v, mapping, hits)
+
+
+def _renamed(match: "re.Match", mapping: Dict[str, str],
+             hits: Dict[str, int]) -> str:
+    name = match.group(1).strip()
+    new = mapping.get(name)
+    if new is None:
+        return match.group(0)
+    hits[name] = hits.get(name, 0) + 1
+    return "{{" + new + "}}"
+
+
+def rename_field_refs(steps: List[Step], old_node: Step, new_node: Step,
+                      skip: int = -1) -> List[str]:
+    """读取节点改名后，把其它步骤里对它的引用一起改掉。
+
+    - 产出变量改名：{{旧变量}} → {{新变量}}（循环节点里那句也会跟着变）
+    - 字段改名：{{loop.item.旧字段}} → {{loop.item.新字段}}
+
+    只改精确的 {{...}} 占位符；返回改动说明（没有改动返回空列表）。
+    """
+    pairs: List[tuple] = []
+    old_var = (old_node.output_var or "").strip()
+    new_var = (new_node.output_var or "").strip()
+    if old_var and new_var and old_var != new_var:
+        pairs.append((old_var, new_var))
+    new_fields = _field_map_of(new_node)
+    for field, var in _field_map_of(old_node).items():
+        new = new_fields.get(field)
+        if new and new != var:
+            pairs.append((f"loop.item.{var}", f"loop.item.{new}"))
+    if not pairs:
+        return []
+    mapping = dict(pairs)
+    hits: Dict[str, int] = {}
+    for i, s in enumerate(steps):
+        if i == skip:
+            continue
+        # 直接改步骤对象自己的字段（url / value / cond_branches / data_cfg.path …）
+        _rename_in(s.__dict__, mapping, hits)
+    return [f"{{{{{old}}}}} → {{{{{new}}}}}（{hits.get(old, 0)} 处）"
+            for old, new in pairs if hits.get(old, 0)]
+
+
+# ------------------------------
 # 旧项目迁移：项目级「数据源」→ 一个「读取数据」节点
 # ------------------------------
 # 文件类数据源没挑过变量时，用这些短名字当变量名（不再出现 file.content 写法）

@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
-from smart_tool.core import blocks, step_executor
+from smart_tool.core import blocks, project_store, step_executor
 from smart_tool.core.project_store import ProjectStore, Step
 from smart_tool.ui.flow_canvas import ACTION_META, step_summary
 from smart_tool.ui.step_editor_dialog import StepEditDialog
@@ -392,7 +392,15 @@ class FlowEditorDialog(QDialog):
                 self.status_label.setText(f"已自动保存；{note}")
             return
         self._steps[idx] = new_step
+        notes: List[str] = []
+        if old.action == "read_data" and new_step.action == "read_data":
+            # 读取节点改名（产出变量 / 字段名）→ 别处的引用一起跟着改
+            notes = project_store.rename_field_refs(self._steps, old, new_step,
+                                                    skip=idx)
         self._commit(select_index=idx)
+        if notes:
+            self.status_label.setText(
+                self.status_label.text() + "；变量改名：" + "；".join(notes))
 
     def _delete_step(self):
         idx = self._selected_row()
