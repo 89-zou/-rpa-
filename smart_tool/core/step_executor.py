@@ -16,7 +16,7 @@ from playwright.sync_api import Page, sync_playwright
 from smart_tool.core import blocks, image_locator
 from smart_tool.core.blocks import Block
 from smart_tool.core.data_sources import (
-    DataSourceConfig, DataSourceError, load_rows,
+    DataSourceConfig, DataSourceError, list_columns, load_rows,
 )
 from smart_tool.core.project_store import Locator, Step
 
@@ -182,14 +182,31 @@ def check_variables(steps: List[Step], data_columns: Optional[List[str]] = None,
 
     problems: List[str] = []
     seen = set()
+
+    def add(step_id: int, name: str, reason: str):
+        key = (name, reason)
+        if key in seen:
+            return
+        seen.add(key)
+        problems.append(f"步骤 {step_id} 引用了 {{{{{name}}}}}：{reason}")
+
     for s in steps:
         for text in step_var_fields(s):
             for name in VAR_PATTERN.findall(text):
                 if name in LOOP_VARS:
                     continue
-                if name in data_cols:
-                    continue
                 is_data_var = name.startswith(DATA_VAR_PREFIXES)
+                if name in data_cols:
+                    # 数据源字段是「逐行注入」的：只有在「数据源」循环里才有值。
+                    # 如果这些步骤套在「索引范围 / 变量列表」循环里，运行时取不到，
+                    # 却既不报错也不提示，最后填进空值——所以这里要如实提示。
+                    if s.id in data_loop_ids or not (s.id in range_loop_ids
+                                                     or s.id in list_loop_ids):
+                        continue
+                    add(s.id, name,
+                        "这个循环不是「数据源」循环，取不到数据源的字段"
+                        "（要按行取数据请把循环方式改成「数据源」）")
+                    continue
                 if is_data_var and s.id in list_loop_ids:
                     continue        # 来自列表项，交给运行时
                 in_project = name in proj_vars
@@ -204,12 +221,22 @@ def check_variables(steps: List[Step], data_columns: Optional[List[str]] = None,
                     reason = "找不到这个变量的来源（可加到【项目管理…】的变量里）"
                 else:
                     continue
-                key = (name, reason)
-                if key not in seen:
-                    seen.add(key)
-                    problems.append(
-                        f"步骤 {s.id} 引用了 {{{{{name}}}}}：{reason}"
-                    )
+                add(s.id, name, reason)
+
+    # 循环的「索引范围 / 循环项」在循环开始之前就要算出结果，
+    # 那一刻数据源还没读、行变量还不存在（典型写法：索引范围填 {{file.total}}）。
+    for s in steps:
+        if s.action != blocks.LOOP_START:
+            continue
+        src = s.loop_source or "data"
+        if src == "data":
+            continue
+        text = s.loop_range if src == "range" else s.loop_items
+        for name in VAR_PATTERN.findall(text or ""):
+            if name in data_cols and s.id not in data_loop_ids:
+                add(s.id, name,
+                    "循环开始前还没有值（它由数据源按行产出）；"
+                    "要按文件逐个循环，请把循环方式改成「数据源」")
     return problems
 
 
@@ -486,8 +513,17 @@ class StepExecutor:
             return "num", int(term)
         name = m.group(1)
         if name not in self.variables:
+            # 说清楚"为什么没有"和"该怎么办"：数据源字段是逐行注入的，
+            # 循环还没开始当然取不到（典型写法：索引范围填 {{file.total}}）
+            hint = ""
+            cols = (list_columns(DataSourceConfig.from_dict(self.data_source))
+                    if self.data_source else [])
+            if name in cols:
+                hint = ("\n它是数据源按行产出的字段（每行一个文件），"
+                        "循环还没开始所以取不到。\n"
+                        "要按文件逐个循环，请把循环方式改成「数据源」。")
             raise ValueError(
-                f"索引范围「{raw}」引用了变量 {{{{{name}}}}}，但当前没有这个变量的值。"
+                f"索引范围「{raw}」引用了变量 {{{{{name}}}}}，但当前没有这个变量的值。{hint}"
             )
         value = self.variables[name]
         text = str(value).strip()
