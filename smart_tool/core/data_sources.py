@@ -6,9 +6,11 @@
 - excel  (.xlsx/.xls)：第一行作表头，每行产出 {"row.列名": 值, ...}
 - json   ：JSON 数组，每个对象产出 {"row.键": 值, ...}；单个对象产出 1 行
 - txt    ：单个文本文件，产出 1 行，含 file.name/file.stem/file.path/
-           file.parent_name/file.content
+           file.parent_name/file.content 等（见 FILE_FIELDS）
 - folder ：按通配符（默认递归 *.txt）遍历文件，每个文件产出同样一组 file.* 变量
            —— 对应「标题=父文件夹名、正文=正文.txt」的目录式数据结构。
+           另含两个计数：file.folder_count（该文件所在文件夹里的文件数，
+           算所有类型文件）、file.total（这个数据源一共匹配到几个文件＝几行）
 
 field_map 是「这个数据源要保存哪些变量」的清单（可改名），四种类型通用：
 [{"field": "content"（原始列名/文件字段）, "var": "row.正文"（变量名）}, ...]
@@ -33,6 +35,8 @@ FILE_FIELDS = [
     ("path", "完整路径"),
     ("suffix", "扩展名"),
     ("size", "文件大小（字节）"),
+    ("folder_count", "所在文件夹的文件数量（算所有类型文件）"),
+    ("total", "数据源的文件总数（共几行）"),
 ]
 
 
@@ -224,8 +228,12 @@ def load_json(cfg: DataSourceConfig) -> List[Dict[str, str]]:
 # ------------------------------
 # TXT 单文件 / 文件夹
 # ------------------------------
-def _file_vars(path: Path, encoding: str) -> Dict[str, str]:
-    """文件内置变量：内容/名称/路径/父文件夹/扩展名/大小。"""
+def _file_vars(path: Path, encoding: str, folder_count: str = "",
+               total: str = "") -> Dict[str, str]:
+    """文件内置变量：内容/名称/路径/父文件夹/扩展名/大小/所在文件夹文件数/总数。
+
+    folder_count、total 由调用方先算好传进来（同目录只数一次，避免重复遍历）。
+    """
     try:
         size = str(path.stat().st_size)
     except OSError:
@@ -238,7 +246,17 @@ def _file_vars(path: Path, encoding: str) -> Dict[str, str]:
         "file.content": read_text_file(path, encoding),
         "file.suffix": path.suffix.lstrip("."),
         "file.size": size,
+        "file.folder_count": folder_count,
+        "file.total": total,
     }
+
+
+def count_files_in(folder: Path) -> int:
+    """文件夹里的文件数量（算所有类型的文件，不受「文件通配」影响）。"""
+    try:
+        return sum(1 for p in folder.iterdir() if p.is_file())
+    except OSError:
+        return 0
 
 
 def resolve_src_key(cfg_type: str, fld: str) -> str:
@@ -277,7 +295,10 @@ def load_txt(cfg: DataSourceConfig) -> List[Dict[str, str]]:
     path = Path(cfg.path)
     if not path.is_file():
         raise DataSourceError(f"文本文件不存在：{path}")
-    return [_apply_field_map(_file_vars(path, cfg.encoding), cfg)]
+    return [_apply_field_map(
+        _file_vars(path, cfg.encoding, str(count_files_in(path.parent)), "1"),
+        cfg,
+    )]
 
 
 def load_folder(cfg: DataSourceConfig) -> List[Dict[str, str]]:
@@ -286,7 +307,17 @@ def load_folder(cfg: DataSourceConfig) -> List[Dict[str, str]]:
         raise DataSourceError(f"文件夹不存在：{folder}")
     walker = folder.rglob if cfg.recursive else folder.glob
     files = sorted(p for p in walker(cfg.pattern) if p.is_file())
-    return [_apply_field_map(_file_vars(p, cfg.encoding), cfg) for p in files]
+    total = str(len(files))
+    counts: Dict[Path, str] = {}        # 同一个文件夹只数一次
+    rows: List[Dict[str, str]] = []
+    for p in files:
+        parent = p.parent
+        if parent not in counts:
+            counts[parent] = str(count_files_in(parent))
+        rows.append(_apply_field_map(
+            _file_vars(p, cfg.encoding, counts[parent], total), cfg
+        ))
+    return rows
 
 
 # ------------------------------
