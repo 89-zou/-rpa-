@@ -9,24 +9,24 @@ from typing import List, Optional
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
-    QPushButton, QVBoxLayout,
+    QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMessageBox, QPushButton, QVBoxLayout,
 )
 
 from smart_tool import paths
 from smart_tool.core.project_store import (
-    ProjectStore, create_project, list_projects,
+    SCENE_DESKTOP, SCENE_WEB, ProjectStore, create_project, list_projects,
 )
 
 
 class NewProjectDialog(QDialog):
-    """新建项目：名称 +（选填）起始网址。建好后 created_store 即新项目。"""
+    """新建项目：选场景 + 名称 +（网页场景选填）起始网址。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("新建项目")
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(520)
         self.created_store: Optional[ProjectStore] = None
 
         root = QVBoxLayout(self)
@@ -34,10 +34,31 @@ class NewProjectDialog(QDialog):
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("如：WP官网发文")
         form.addRow("项目名称：", self.name_edit)
+
+        self.scene_combo = QComboBox()
+        self.scene_combo.addItem("网页自动化（浏览器，用 XPath / 元素捕获）", SCENE_WEB)
+        self.scene_combo.addItem("桌面应用（截图定位 + 鼠标键盘）", SCENE_DESKTOP)
+        self.scene_combo.setToolTip(
+            "场景决定这个项目能用哪些动作，建好之后不能改（要换场景就新建一个）。\n"
+            "· 网页：打开网页 / 点击 / 填入 / 下拉选择，靠 XPath 定位，\n"
+            "  可以用【捕获元素…】点一下抓元素；\n"
+            "· 桌面：激活窗口 / 点击(截图) / 输入文字 / 按键 / 等待，\n"
+            "  靠【截屏取模板…】框选图片定位，适合操作本机上的软件。"
+        )
+        self.scene_combo.currentIndexChanged.connect(self._on_scene_changed)
+        form.addRow("场景：", self.scene_combo)
+
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("选填，填了会自动生成第 1 步「打开网页」")
+        self.url_row = self.url_edit
         form.addRow("起始网址：", self.url_edit)
+        self.form = form
         root.addLayout(form)
+
+        self.scene_hint = QLabel("")
+        self.scene_hint.setWordWrap(True)
+        self.scene_hint.setStyleSheet("color: #0f766e;")
+        root.addWidget(self.scene_hint)
 
         tip = QLabel(f"项目会创建在：{paths.PROJECTS_DIR}")
         tip.setWordWrap(True)
@@ -52,12 +73,34 @@ class NewProjectDialog(QDialog):
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+        self._on_scene_changed()
         self.name_edit.setFocus()
+
+    @property
+    def scene(self) -> str:
+        return self.scene_combo.currentData()
+
+    def _on_scene_changed(self, _=None):
+        """桌面场景不需要网址；提示也换一套。"""
+        desktop = self.scene == SCENE_DESKTOP
+        self.url_edit.setVisible(not desktop)
+        label = self.form.labelForField(self.url_edit)
+        if label is not None:
+            label.setVisible(not desktop)
+        self.scene_hint.setText(
+            "桌面项目会先放一个【激活窗口】占位：填上目标程序的窗口标题\n"
+            "（标题里的一小段就行），运行时先把它切到最前面，再往下操作。"
+            if desktop else
+            "网页项目用浏览器的 XPath 定位；新增「点击 / 填入」时\n"
+            "可以直接点【捕获元素…】在页面上抓元素。"
+        )
 
     def _on_accept(self):
         try:
             self.created_store = create_project(
-                self.name_edit.text().strip(), initial_url=self.url_edit.text().strip()
+                self.name_edit.text().strip(),
+                initial_url=self.url_edit.text().strip(),
+                scene=self.scene,
             )
         except ValueError as e:
             QMessageBox.warning(self, "无法创建", str(e))

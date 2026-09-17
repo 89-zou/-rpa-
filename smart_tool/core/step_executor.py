@@ -15,7 +15,7 @@ from playwright.sync_api import (
     Page, TimeoutError as PlaywrightTimeout, sync_playwright,
 )
 
-from smart_tool.core import blocks, image_locator
+from smart_tool.core import blocks, desktop, image_locator
 from smart_tool.core import real_mouse as real_mouse_mod
 from smart_tool.core.blocks import Block
 from smart_tool.core.data_sources import DataSourceConfig, load_rows
@@ -32,6 +32,9 @@ ACTION_HINT = {
     "checkbox": "这是勾选框，请把动作改成「点击」。",
     "radio": "这是单选按钮，请把动作改成「点击」。",
 }
+
+# 桌面场景：屏幕上找图最多等多久（秒）
+DESKTOP_IMAGE_WAIT_S = 10.0
 
 # 暂停轮询间隔（秒）：兼顾响应速度与 CPU 占用
 PAUSE_POLL_INTERVAL = 0.5
@@ -150,7 +153,8 @@ def step_var_fields(step: Step) -> List[str]:
     """步骤里可能出现 {{变量}} 的文本字段。"""
     texts = [step.url, step.value, step.wait_target,
              step.resume_url, step.resume_element, step.prompt,
-             step.loop_expr, step.cond_expr]
+             step.loop_expr, step.cond_expr,
+             step.win_title, step.keys]
     # 「读取数据」的路径可以写日期变量，如 D:\输出数据\{{年}}\{{月}}
     path = (step.data_cfg or {}).get("path")
     if isinstance(path, str):
@@ -336,6 +340,7 @@ class StepExecutor:
         on_pause: Optional[Callable[[Step], Optional[PauseHandle]]] = None,
         on_resume: Optional[Callable[[str], None]] = None,
         real_mouse: bool = False,
+        scene: str = "web",
     ):
         """
         :param project_dir: 项目目录，用于解析 locator.value 中相对路径的截图
@@ -347,6 +352,7 @@ class StepExecutor:
                           auto（信号自动检测）/manual（人工继续）/abort（人工终止）。
         :param real_mouse: 用 OS 级真实鼠标点击（pyautogui）代替合成事件，
                            给 canvas / 拖拽类站点用。默认关。
+        :param scene: web（浏览器）/ desktop（桌面应用：全屏截图定位 + 系统鼠标键盘）。
         """
         self.steps = steps
         self.variables = variables or {}
@@ -356,6 +362,7 @@ class StepExecutor:
         self.on_pause = on_pause
         self.on_resume = on_resume
         self.real_mouse = bool(real_mouse) and not headless
+        self.desktop = scene == "desktop"
         self._real_mouse = None
         self._stop = False
         self._page: Optional[Page] = None
@@ -386,6 +393,9 @@ class StepExecutor:
     def run(self):
         """启动浏览器并按块树执行步骤（循环 / 条件可互相嵌套）。"""
         nodes = blocks.parse(self.steps)
+        if self.desktop:
+            self._run_desktop(nodes)
+            return
         if self.real_mouse:
             self.log(
                 "真实鼠标模式已开启：浏览器窗口要保持可见、在最前面，"
@@ -406,6 +416,23 @@ class StepExecutor:
                 self.log("执行结束，关闭浏览器。")
                 browser.close()
                 self._page = None
+
+    def _run_desktop(self, nodes: List[Any]):
+        """桌面场景：不开浏览器，全屏截图定位 + 系统级鼠标键盘。"""
+        if not desktop.available():
+            raise desktop.DesktopError(
+                "这个项目是「桌面应用」场景，但缺少依赖。\n    "
+                + desktop.missing_hint()
+            )
+        self.log(
+            "桌面场景：全屏截图定位 + 系统级鼠标键盘。\n"
+            "   运行时别动鼠标键盘（程序要用它们）；"
+            "紧急情况把鼠标猛地甩到屏幕左上角可急停。"
+        )
+        try:
+            self._run_nodes(nodes)
+        finally:
+            self.log("执行结束。")
 
     def _run_nodes(self, nodes: List[Any]):
         """顺序执行同一层里的节点（普通步骤或嵌套的块）。"""
@@ -566,14 +593,28 @@ class StepExecutor:
         self.log(f"[步骤 {step.id}] {step.action}")
         try:
             if step.action == "navigate":
+                self._require_web(step, "打开网页")
                 self._navigate(step)
             elif step.action == "read_data":
                 self._read_data(step)
+            elif step.action == "win_activate":
+                self._win_activate(step)
+            elif step.action == "hotkey":
+                self._hotkey(step)
+            elif step.action == "delay":
+                self._delay(step)
             elif step.action == "click":
-                self._click(step)
+                if self.desktop:
+                    self._desktop_click(step)
+                else:
+                    self._click(step)
             elif step.action == "fill":
-                self._fill(step)
+                if self.desktop:
+                    self._desktop_fill(step)
+                else:
+                    self._fill(step)
             elif step.action == "select":
+                self._require_web(step, "下拉选择")
                 self._select(step)
             elif step.action == "pause_for_human":
                 self._pause_for_human(step)
@@ -586,16 +627,40 @@ class StepExecutor:
             else:
                 self.log(f"  未知 action: {step.action}，跳过")
                 return
-            # pause_for_human 的恢复信号本身就是验证条件，不再重复 wait_after
-            if step.action != "pause_for_human":
+            # pause_for_human 的恢复信号本身就是验证条件，不再重复 wait_after；
+            # delay 自己就是等待，别再叠加一次「额外等待」
+            if step.action not in ("pause_for_human", "delay"):
                 self._wait_after(step)
             # 这个步骤自己设的额外等待（秒）：慢站点、点了没反应时加大它
-            if step.wait_seconds and step.wait_seconds > 0:
+            if step.action != "delay" and step.wait_seconds and step.wait_seconds > 0:
                 self.log(f"  再固定等 {step.wait_seconds:g}s")
                 time.sleep(float(step.wait_seconds))
         except Exception as e:
             self.log(f"  步骤出错: {e}")
             raise
+
+    # ------------------------------
+    # 场景检查：动作别用错场景
+    # ------------------------------
+    def _require_web(self, step: Step, name: str):
+        """桌面场景里出现网页动作 → 说清楚该怎么改。"""
+        if not self.desktop:
+            return
+        raise ValueError(
+            f"这一步是网页动作「{name}」，但当前项目是「桌面应用」场景"
+            "（靠截图定位 + 系统鼠标键盘）。\n"
+            "   请把它改成桌面动作（激活窗口 / 点击 / 输入文字 / 按键 / 等待），"
+            "或者新建一个「网页自动化」场景的项目。"
+        )
+
+    def _require_desktop(self, step: Step, name: str):
+        """网页场景里出现桌面动作 → 说清楚该怎么改。"""
+        if self.desktop:
+            return
+        raise ValueError(
+            f"这一步是桌面动作「{name}」，但当前项目是「网页自动化」场景。\n"
+            "   请新建一个「桌面应用」场景的项目，或把它换成网页动作。"
+        )
 
     # ------------------------------
     # 定位辅助
@@ -736,8 +801,70 @@ class StepExecutor:
         return out, logs
 
     # ------------------------------
-    # 动作
+    # 动作（桌面场景）
     # ------------------------------
+    def _desktop_locate(self, image: str) -> "desktop.DesktopMatch":
+        """在屏幕上找这张模板图（找不到会等一会儿再试）。"""
+        path = self._resolve_image_path(Locator(type="image", value=image))
+        return desktop.locate(path, wait_s=DESKTOP_IMAGE_WAIT_S, log=self.log)
+
+    def _desktop_click(self, step: Step):
+        """桌面点击：屏幕上找模板 → 按坐标点（可双击）。"""
+        self._require_desktop(step, "点击（截图）")
+        image = (step.locator.value if step.locator else "").strip()
+        if not image:
+            raise ValueError(
+                "桌面场景的「点击」必须选一张模板图。\n"
+                "   双击这一步，在「图片模板」那一行点【截屏取模板…】框一个控件。"
+            )
+        m = self._desktop_locate(image)
+        times = 2 if int(step.click_times or 1) >= 2 else 1
+        self.log(f"  在屏幕 ({m.x:.0f},{m.y:.0f}) "
+                 f"{'双击' if times == 2 else '单击'}（置信度 {m.confidence:.2f}）")
+        desktop.click(m.x, m.y, times)
+
+    def _desktop_fill(self, step: Step):
+        """桌面输入：先按模板图点一下输入位置，再输入文字。
+
+        模板图留空＝直接往当前焦点里输入（常配在「点击」之后）。
+        """
+        self._require_desktop(step, "输入文字")
+        text = self._resolve_value(step.value)
+        image = (step.locator.value if step.locator else "").strip()
+        if image:
+            m = self._desktop_locate(image)
+            self.log(f"  先点一下输入位置 ({m.x:.0f},{m.y:.0f})"
+                     f"（置信度 {m.confidence:.2f}）")
+            desktop.click(m.x, m.y)
+            time.sleep(0.2)
+        else:
+            self.log("  没配模板图 → 直接往当前焦点里输入")
+        desktop.clear_field(log=self.log)
+        desktop.type_text(text, log=self.log)
+        self.log(f"  已输入 {len(text)} 个字符")
+
+    def _win_activate(self, step: Step):
+        """把目标窗口切到最前面（桌面流程的第一步几乎都是它）。"""
+        self._require_desktop(step, "激活窗口")
+        keyword = self._resolve_value(step.win_title).strip()
+        desktop.activate_window(keyword, log=self.log)
+
+    def _hotkey(self, step: Step):
+        """按一个键或一组快捷键。"""
+        self._require_desktop(step, "按键")
+        keys = self._resolve_value(step.keys).strip()
+        self.log(f"  按键：{keys}")
+        desktop.hotkey(keys)
+
+    def _delay(self, step: Step):
+        """纯等待（等窗口画出来、等保存完）。"""
+        secs = float(step.wait_seconds or 0)
+        if secs <= 0:
+            self.log("  「等待」没填秒数，跳过")
+            return
+        self.log(f"  等 {secs:g}s")
+        time.sleep(secs)
+
     def _read_data(self, step: Step):
         """「读取数据」节点：读文件 / 文件夹，把结果放进 output_var。
 
@@ -1029,6 +1156,8 @@ class StepExecutor:
         """
         msg = step.prompt or "请人工操作（如验证码），完成后程序将自动继续"
         cond = step.resume_condition or "manual"
+        if self.desktop:
+            cond = "manual"      # 桌面没有 URL / DOM，只能人工点「继续」
         timeout = max(1, int(step.resume_timeout or 300))
         self.log(f"  [暂停] {msg}")
         self.log(
@@ -1172,6 +1301,9 @@ class StepExecutor:
         if not step.wait_after:
             return
         target = (step.wait_target or "").strip()
+        if self.desktop:
+            self._wait_after_desktop(step.wait_after, target)
+            return
         if step.wait_after == "element_present":
             if not target:
                 return
@@ -1193,6 +1325,29 @@ class StepExecutor:
                 self.log(f"  等待网络空闲超时（继续执行）：{e}")
         elif step.wait_after == "manual":
             pass
+
+    def _wait_after_desktop(self, mode: str, target: str):
+        """桌面场景的「步骤后等待」：等图片出现 / 等图片消失。
+
+        桌面没有 URL、也没有 DOM，所以网页那些等待方式在这里不适用。
+        """
+        if mode == "manual":
+            return
+        if not target:
+            self.log("  桌面场景的「步骤后等待」要填一张图片模板，这一步跳过等待")
+            return
+        path = self._resolve_image_path(Locator(type="image", value=target))
+        if mode == "element_present":
+            self.log(f"  等待图片出现：{Path(target).name}")
+            desktop.locate(path, wait_s=WAIT_ELEMENT_TIMEOUT_MS / 1000,
+                           log=self.log)
+            return
+        if mode == "image_gone":
+            self.log(f"  等待图片消失：{Path(target).name}")
+            desktop.wait_gone(path, wait_s=WAIT_ELEMENT_TIMEOUT_MS / 1000,
+                              log=self.log)
+            return
+        self.log(f"  桌面场景不支持「{mode}」这种等待，已跳过（可改用「等待图片出现」）")
 
     def _wait_element(self, target: str, timeout_ms: int):
         """等元素可见，能扛住跳转/刷新。

@@ -144,6 +144,32 @@ def _try_match_in_viewport(
     )
 
 
+def best_match(
+    screen_bgr: np.ndarray,
+    template_bgr: np.ndarray,
+    threshold: float = DEFAULT_THRESHOLD,
+    scales: Tuple[float, ...] = DEFAULT_SCALES,
+) -> Optional[Tuple[float, int, int, int, int, float]]:
+    """在一张图里找模板（不涉及浏览器，桌面端也用它）。
+
+    返回 (置信度, 左上角 x, 左上角 y, 宽, 高, 命中的缩放)；没到阈值返回 None。
+    坐标是这张图自己的像素坐标。
+    """
+    screen_gray = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2GRAY)
+    template_gray = cv2.cvtColor(template_bgr, cv2.COLOR_BGR2GRAY)
+    best = None      # (conf, x, y, w, h, scale)
+    for scale in scales:
+        r = _match_one_scale(screen_gray, template_gray, scale)
+        if r is None:
+            continue
+        conf, x, y, w, h = r
+        if best is None or conf > best[0]:
+            best = (conf, x, y, w, h, scale)
+    if best is None or best[0] < threshold:
+        return None
+    return (best[0], best[1], best[2], best[3], best[4], best[5])
+
+
 def locate_on_page(
     page: Page,
     template_path: Path,

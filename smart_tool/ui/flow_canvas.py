@@ -87,6 +87,10 @@ ACTION_META = {
     "condition_end": ("条件结束", "#2f6fb3"),
     "branch": ("分支", "#5b8fd0"),
     "script": ("自由代码", "#475569"),
+    # 桌面场景
+    "win_activate": ("激活窗口", "#7c3aed"),
+    "hotkey": ("按键", "#0d9488"),
+    "delay": ("等待", "#64748b"),
 }
 
 
@@ -115,12 +119,22 @@ def step_summary(s: Step, branch_text: str = "") -> List[str]:
                          + ("…" if len(fields) > 4 else ""))
         return lines[:3]
     if s.action == "click" and s.locator:
-        return [f"点击：{s.locator.value[:60]}"]
+        times = "双击" if int(s.click_times or 1) >= 2 else "单击"
+        head = (f"{times}：{s.locator.value[:56]}" if s.locator.type == "image"
+                else f"点击：{s.locator.value[:60]}")
+        return [head]
     if s.action in ("fill", "select"):
         lines = [f"值：{s.value or '（空）'}"]
         if s.locator:
             lines.append(f"定位：{s.locator.value[:50]}")
         return lines[:3]
+    if s.action == "win_activate":
+        return [f"窗口：{s.win_title[:50]}" if s.win_title
+                else "（未填窗口标题）"]
+    if s.action == "hotkey":
+        return [f"按键：{s.keys}" if s.keys else "（未填按键）"]
+    if s.action == "delay":
+        return [f"等 {float(s.wait_seconds or 0):g} 秒"]
     if s.action == "pause_for_human":
         cond = {
             "manual": "人工继续", "url_changed": "URL 变化",

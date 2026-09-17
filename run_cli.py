@@ -31,11 +31,13 @@ def main():
     steps = store.load_steps()
     variables = store.load_variables()
     real = store.load_real_mouse()
+    scene = store.load_scene()
     print(f"加载项目 [{name}]，共 {len(steps)} 步。"
+          + ("（桌面应用场景）" if scene == "desktop" else "（网页场景）")
           + ("（真实鼠标：开）" if real else ""))
     executor = StepExecutor(
         steps, variables, headless=False, project_dir=store.dir,
-        real_mouse=real,
+        real_mouse=real, scene=scene,
     )
     try:
         executor.run()

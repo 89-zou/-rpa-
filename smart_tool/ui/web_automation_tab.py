@@ -46,6 +46,7 @@ class ExecutorWorker(QThread):
         project_dir=None,
         headless: bool = False,
         real_mouse: bool = False,
+        scene: str = "web",
     ):
         super().__init__()
         self._pause_handle: Optional[PauseHandle] = None
@@ -58,6 +59,7 @@ class ExecutorWorker(QThread):
             on_pause=self._on_pause,
             on_resume=self.pause_resolved.emit,
             real_mouse=real_mouse,
+            scene=scene,
         )
 
     def _on_pause(self, step: Step) -> PauseHandle:
@@ -98,6 +100,7 @@ class WebAutomationTab(QWidget):
         self._worker: Optional[ExecutorWorker] = None
         self._current_store: Optional[ProjectStore] = None
         self._steps: List[Step] = []
+        self._scene: str = "web"        # 当前项目的场景：web / desktop
         self._init_ui()
         # 启动不自动载入项目：避免读盘/排版拖慢界面，由用户点【载入项目…】
         self._clear_project()
@@ -271,6 +274,10 @@ class WebAutomationTab(QWidget):
 
         self._current_store = store
         self._steps = store.load_steps()
+        self._scene = store.load_scene()
+        desktop = self._scene == "desktop"
+        # 桌面场景本身就是系统级鼠标键盘，「真实鼠标」那个开关没意义
+        self.chk_real_mouse.setVisible(not desktop)
         self.chk_real_mouse.blockSignals(True)
         self.chk_real_mouse.setChecked(store.load_real_mouse())
         self.chk_real_mouse.blockSignals(False)
@@ -287,8 +294,12 @@ class WebAutomationTab(QWidget):
         if need_layout:
             self.canvas.request_layout_when_ready()
         self.canvas.set_placeholder_text(DEFAULT_PLACEHOLDER)
-        self.project_label.setText(f"当前项目：{store.name}")
-        self._append_log(f"已载入项目【{store.name}】（{len(self._steps)} 步）")
+        self.project_label.setText(
+            f"当前项目：{store.name}"
+            + ("　【桌面应用】" if desktop else "　【网页】")
+        )
+        self._append_log(f"已载入项目【{store.name}】（{len(self._steps)} 步"
+                         + ("，桌面应用场景）" if desktop else "，网页场景）"))
         self._update_edit_buttons()
         return True
 
@@ -305,6 +316,8 @@ class WebAutomationTab(QWidget):
         """卸载当前项目（未载入状态）。"""
         self._current_store = None
         self._steps = []
+        self._scene = "web"
+        self.chk_real_mouse.setVisible(True)
         self.chk_real_mouse.blockSignals(True)
         self.chk_real_mouse.setChecked(False)
         self.chk_real_mouse.blockSignals(False)
@@ -414,6 +427,7 @@ class WebAutomationTab(QWidget):
         dlg = FlowEditorDialog(
             self._current_store.dir, self._steps, self,
             project_variables=self._current_store.load_variables(),
+            scene=self._scene,
         )
         dlg.exec()
         if dlg.changed:
@@ -437,6 +451,7 @@ class WebAutomationTab(QWidget):
             variable_names=self.available_variables(),
             default_url=next((s.url for s in self._steps
                               if s.action == "navigate" and s.url), ""),
+            scene=self._scene,
         )
 
     # ------------------------------
@@ -663,6 +678,7 @@ class WebAutomationTab(QWidget):
             project_dir=self._current_store.dir,
             headless=False,
             real_mouse=self.chk_real_mouse.isChecked(),
+            scene=self._scene,
         )
         self._worker.log_signal.connect(self._append_log)
         self._worker.finished.connect(self._on_finished)

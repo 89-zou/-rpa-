@@ -28,11 +28,19 @@ from PyQt6.QtWidgets import (
 from smart_tool.core.project_store import Locator, Step
 from smart_tool.ui.element_picker_dialog import ElementPickerDialog
 from smart_tool.ui.read_data_panel import ReadDataPanel
+from smart_tool.ui.screen_capture import ScreenCaptureDialog
 
-ACTIONS = [
+# 网页场景能用的动作
+WEB_ACTIONS = [
     "navigate", "read_data", "click", "fill", "select", "pause_for_human",
     "loop_start", "loop_end", "condition_start", "condition_end", "branch",
     "script",
+]
+# 桌面场景能用的动作（没有浏览器，也就没有 XPath / 下拉选择）
+DESKTOP_ACTIONS = [
+    "win_activate", "click", "fill", "hotkey", "delay", "read_data",
+    "pause_for_human", "loop_start", "loop_end", "condition_start",
+    "condition_end", "branch", "script",
 ]
 # 新建步骤时不出现在菜单里的动作：这些标记由系统配对生成
 NEW_STEP_HIDDEN = {"loop_end", "condition_end", "branch"}
@@ -49,6 +57,14 @@ ACTION_LABELS = {
     "condition_end": "条件结束（设置与「条件」共用，点哪个都是编辑这个条件）",
     "branch": "分支（匹配值在「条件」节点里改，点它会打开那个条件）",
     "script": "自由代码 script（Python / JavaScript）",
+    # 桌面场景
+    "win_activate": "激活窗口 win_activate（把目标程序的窗口切到最前面）",
+    "hotkey": "按键 hotkey（如 enter、ctrl+s、alt+f4）",
+    "delay": "等待 delay（纯等几秒，秒数填在下面）",
+}
+DESKTOP_LABEL_SUFFIX = {
+    "click": "点击 click（在屏幕上找这张图并点它，可双击）",
+    "fill": "输入文字 fill（先点一下输入位置，再打进去；中文走剪贴板）",
 }
 # 条件判断方式
 COND_MODES = [
@@ -83,14 +99,23 @@ WAIT_OPTIONS = [
     ("network_idle", "等待网络空闲"),
     ("manual", "手动（不自动等）"),
 ]
+# 桌面场景：没有 URL / DOM，只能等图片
+DESKTOP_WAIT_OPTIONS = [
+    ("", "不等待"),
+    ("element_present", "等待图片出现（推荐）"),
+    ("image_gone", "等待图片消失（转圈、加载提示这类）"),
+    ("manual", "手动（不自动等）"),
+]
 # 需要填「等待目标」的等待方式
-WAIT_NEEDS_TARGET = ("element_present", "url_changed")
+WAIT_NEEDS_TARGET = ("element_present", "url_changed", "image_gone")
 RESUME_OPTIONS = [
     ("manual", "仅人工继续"),
     ("url_changed", "URL 变化"),
     ("element_present", "元素出现"),
     ("url_and_element", "URL + 元素 双重确认（推荐）"),
 ]
+# 桌面场景只能人工点「继续」（没有 URL / DOM 可判断）
+DESKTOP_RESUME_OPTIONS = [("manual", "仅人工继续")]
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 
 
@@ -100,6 +125,11 @@ def _set_row_visible(form: QFormLayout, widget, visible: bool):
     label = form.labelForField(widget)
     if label is not None:
         label.setVisible(visible)
+
+
+def _is_project_image(text: str) -> bool:
+    """是不是项目 img/ 目录里的图片（桌面场景的模板都放这儿）。"""
+    return text.replace("\\", "/").startswith("img/")
 
 
 def _looks_like_xpath(text: str) -> bool:
@@ -122,7 +152,7 @@ class StepEditDialog(QDialog):
 
     def __init__(self, project_dir: Path, step: Optional[Step] = None,
                  parent=None, variable_names: Optional[List[str]] = None,
-                 default_url: str = ""):
+                 default_url: str = "", scene: str = "web"):
         super().__init__(parent)
         self.project_dir = Path(project_dir)
         self.img_dir = self.project_dir / "img"
@@ -132,7 +162,11 @@ class StepEditDialog(QDialog):
         self._var_names_list = list(variable_names or [])
         # 元素捕获时默认打开的地址（项目里第一个「打开网页」）
         self._default_url = (default_url or "").strip()
-        self.setWindowTitle("编辑步骤" if self._editing else "新建步骤")
+        # 场景决定能选哪些动作：网页（浏览器）/ 桌面（截图定位 + 鼠标键盘）
+        self.desktop = scene == "desktop"
+        self._actions = DESKTOP_ACTIONS if self.desktop else WEB_ACTIONS
+        self.setWindowTitle(("编辑步骤" if self._editing else "新建步骤")
+                            + ("（桌面应用）" if self.desktop else ""))
         self.setMinimumWidth(760)
         self._init_ui()
         if step:
@@ -150,10 +184,13 @@ class StepEditDialog(QDialog):
 
         # 动作
         self.action_combo = QComboBox()
-        for a in ACTIONS:
+        for a in self._actions:
             if not self._editing and a in NEW_STEP_HIDDEN:
                 continue        # 新建时不给「循环结束」，它由「循环」自动配对
-            self.action_combo.addItem(ACTION_LABELS[a], a)
+            label = ACTION_LABELS[a]
+            if self.desktop and a in DESKTOP_LABEL_SUFFIX:
+                label = DESKTOP_LABEL_SUFFIX[a]
+            self.action_combo.addItem(label, a)
         self.action_combo.currentIndexChanged.connect(self._on_action_changed)
         form.addRow("动作：", self.action_combo)
         self.title_edit = QLineEdit()
@@ -191,6 +228,26 @@ class StepEditDialog(QDialog):
         self.read_panel = ReadDataPanel()
         form.addRow("读什么：", self.read_panel)
 
+        # --- 桌面动作专用 ---
+        self.win_title_edit = QLineEdit()
+        self.win_title_edit.setPlaceholderText("窗口标题里的一小段，如 记事本、Excel")
+        self.win_title_edit.setToolTip(
+            "填得越少越宽松；匹配到多个就取第一个。\n"
+            "运行时找不到窗口，日志会把当前可见的窗口列出来给你参考。"
+        )
+        form.addRow("窗口标题：", self.win_title_edit)
+
+        self.keys_edit = QLineEdit()
+        self.keys_edit.setPlaceholderText(
+            "enter、tab、ctrl+s、alt+f4（也认「回车」这类中文）"
+        )
+        form.addRow("按哪些键：", self.keys_edit)
+
+        self.click_times_combo = QComboBox()
+        self.click_times_combo.addItem("单击", 1)
+        self.click_times_combo.addItem("双击", 2)
+        form.addRow("点击方式：", self.click_times_combo)
+
         # --- 定位组（click/fill/select）---
         self.locator_type = QComboBox()
         self.locator_type.addItem("XPath", "xpath")
@@ -203,6 +260,12 @@ class StepEditDialog(QDialog):
         loc_layout.setContentsMargins(0, 0, 0, 0)
         self.locator_value = QLineEdit()
         self.locator_value.setPlaceholderText("//input[@id='username']")
+        self.btn_shot = QPushButton("截屏取模板…")
+        self.btn_shot.setToolTip(
+            "桌面场景的定位方式：截一张全屏图，在图上拖框圈住控件，\n"
+            "存进项目 img/ 当模板（运行时靠它在这块屏幕上找位置）。"
+        )
+        self.btn_shot.clicked.connect(lambda: self._capture_screen("main"))
         self.btn_capture = QPushButton("捕获元素…")
         self.btn_capture.setToolTip(
             "打开浏览器窗口，在页面上点一下目标元素：\n"
@@ -212,8 +275,10 @@ class StepEditDialog(QDialog):
         self.btn_pick_image = QPushButton("选择截图…")
         self.btn_pick_image.clicked.connect(self._pick_image)
         loc_layout.addWidget(self.locator_value, 1)
+        loc_layout.addWidget(self.btn_shot)
         loc_layout.addWidget(self.btn_capture)
         loc_layout.addWidget(self.btn_pick_image)
+        self.loc_row = loc_row
         form.addRow("定位路径：", loc_row)
 
         self.capture_hint = QLabel("")
@@ -287,7 +352,7 @@ class StepEditDialog(QDialog):
 
         # --- 步骤后等待组 ---
         self.wait_combo = QComboBox()
-        for key, label in WAIT_OPTIONS:
+        for key, label in (DESKTOP_WAIT_OPTIONS if self.desktop else WAIT_OPTIONS):
             self.wait_combo.addItem(label, key)
         self.wait_combo.currentIndexChanged.connect(self._on_wait_changed)
         form.addRow("步骤后等待：", self.wait_combo)
@@ -295,7 +360,15 @@ class StepEditDialog(QDialog):
         self.wait_target.setPlaceholderText(
             "只填 XPath，如 //*[@id='wpadminbar']（说明文字请写到【备注】里）"
         )
-        form.addRow("等待目标：", self.wait_target)
+        self.btn_wait_shot = QPushButton("截屏取模板…")
+        self.btn_wait_shot.setToolTip("截屏框选一张图当等待目标（桌面场景用）")
+        self.btn_wait_shot.clicked.connect(lambda: self._capture_screen("wait"))
+        self.wait_target_row = QWidget()
+        wt_layout = QHBoxLayout(self.wait_target_row)
+        wt_layout.setContentsMargins(0, 0, 0, 0)
+        wt_layout.addWidget(self.wait_target, 1)
+        wt_layout.addWidget(self.btn_wait_shot)
+        form.addRow("等待目标：", self.wait_target_row)
         self.wait_seconds = QDoubleSpinBox()
         self.wait_seconds.setRange(0, 300)
         self.wait_seconds.setDecimals(1)
@@ -315,7 +388,8 @@ class StepEditDialog(QDialog):
         form.addRow("暂停提示：", self.prompt_edit)
 
         self.resume_combo = QComboBox()
-        for key, label in RESUME_OPTIONS:
+        for key, label in (DESKTOP_RESUME_OPTIONS if self.desktop
+                           else RESUME_OPTIONS):
             self.resume_combo.addItem(label, key)
         self.resume_combo.currentIndexChanged.connect(self._on_resume_changed)
         form.addRow("恢复条件：", self.resume_combo)
@@ -518,7 +592,7 @@ class StepEditDialog(QDialog):
         _set_row_visible(self._form, widget, visible)
 
     def _sync_visibility(self):
-        """按「动作 + 定位方式 + 等待方式 + 恢复条件」统一刷新所有行的显隐。
+        """按「场景 + 动作 + 定位方式 + 等待方式 + 恢复条件」统一刷新显隐。
 
         必须一次性处理全部字段：漏掉的那些会保留上一种动作的显示状态，
         切换动作后就冒出用不到的输入框。
@@ -532,7 +606,14 @@ class StepEditDialog(QDialog):
         is_image = is_locate and self.locator_type.currentData() == "image"
         is_pause = action == "pause_for_human"
         is_script = action == "script"
+        is_win = action == "win_activate"
+        is_keys = action == "hotkey"
+        is_delay = action == "delay"
         cond = self.resume_combo.currentData()
+        # 桌面场景：定位一律是「图片模板」，没有 XPath / 兜底截图这些概念
+        is_xpath = is_locate and not self.desktop \
+            and self.locator_type.currentData() == "xpath"
+        need_target = self.wait_combo.currentData() in WAIT_NEEDS_TARGET
 
         for w in self._navigate_widgets:
             self._show(w, action == "navigate")
@@ -540,9 +621,13 @@ class StepEditDialog(QDialog):
             self._show(w, is_read)
         for w in self._locator_widgets:
             self._show(w, is_locate)
-        is_xpath = is_locate and self.locator_type.currentData() == "xpath"
-        self.btn_pick_image.setVisible(is_image)
+        self._show(self.win_title_edit, is_win)
+        self._show(self.keys_edit, is_keys)
+        self._show(self.click_times_combo,
+                   self.desktop and action == "click")
+        self.btn_pick_image.setVisible(is_image or (is_locate and self.desktop))
         self.btn_capture.setVisible(is_xpath)
+        self.btn_shot.setVisible(is_locate and self.desktop)
         self._show(self.capture_hint, is_locate)
         for w in (self.fallback_row, self.fallback_hint):
             self._show(w, is_xpath)
@@ -552,8 +637,8 @@ class StepEditDialog(QDialog):
             self._show(w, is_fill)
         for w in self._wait_widgets:
             self._show(w, is_locate)
-        self._show(self.wait_target,
-                   is_locate and self.wait_combo.currentData() in WAIT_NEEDS_TARGET)
+        self._show(self.wait_target_row, is_locate and need_target)
+        self.btn_wait_shot.setVisible(self.desktop and is_locate)
         for w in self._pause_widgets:
             self._show(w, is_pause)
         self._show(self.resume_url,
@@ -567,10 +652,31 @@ class StepEditDialog(QDialog):
         for w in self._cond_widgets:
             self._show(w, is_cond)
 
-        self.locator_value.setPlaceholderText(
-            "选择截图后自动填入 img/xxx.png" if is_image
-            else "//input[@id='username']"
-        )
+        # 定位那一行的说法随场景变：网页填 XPath，桌面填图片模板
+        if self.desktop:
+            self.locator_value.setPlaceholderText(
+                "img/xxx.png（点【截屏取模板…】框一个控件）"
+            )
+            self.wait_target.setPlaceholderText(
+                "img/xxx.png（点【截屏取模板…】框一个图）"
+            )
+            self.btn_pick_image.setText("选择图片…")
+            self.btn_pick_image.setToolTip("从项目 img/ 里选一张已有图片")
+        else:
+            self.locator_value.setPlaceholderText(
+                "选择截图后自动填入 img/xxx.png" if is_image
+                else "//input[@id='username']"
+            )
+            self.wait_target.setPlaceholderText(
+                "只填 XPath，如 //*[@id='wpadminbar']（说明文字请写到【备注】里）"
+            )
+            self.btn_pick_image.setText("选择截图…")
+        label = self._form.labelForField(self.loc_row)
+        if label is not None:
+            label.setText("图片模板：" if self.desktop else "定位路径：")
+        sec_label = self._form.labelForField(self.wait_seconds)
+        if sec_label is not None:
+            sec_label.setText("等待秒数：" if is_delay else "额外等待：")
         self.adjustSize()
 
     def _on_action_changed(self):
@@ -820,6 +926,21 @@ class StepEditDialog(QDialog):
             self._show_preview(self.project_dir / image)
         self._sync_visibility()
 
+    def _capture_screen(self, target: str):
+        """截屏拖框取模板（桌面场景）：target=main 填定位，wait 填等待目标。"""
+        dlg = ScreenCaptureDialog(self.project_dir, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_path:
+            return
+        if target == "wait":
+            self.wait_target.setText(dlg.result_path)
+            self.capture_hint.setText(f"已取等待模板：{dlg.result_path}")
+        else:
+            self.locator_value.setText(dlg.result_path)
+            self.capture_hint.setText(
+                f"已取模板：{dlg.result_path}（只框控件本身，别带大片背景）"
+            )
+        self._sync_visibility()
+
     def _show_preview(self, path: Path):
         pix = QPixmap(str(path))
         if pix.isNull():
@@ -878,6 +999,10 @@ class StepEditDialog(QDialog):
         self.output_var_edit.setText(s.output_var or "")
         self.read_panel.load(s.data_cfg or {})
         self.loop_expr_edit.setText(s.loop_expr or "")
+        self.win_title_edit.setText(s.win_title or "")
+        self.keys_edit.setText(s.keys or "")
+        self.click_times_combo.setCurrentIndex(max(
+            0, self.click_times_combo.findData(int(s.click_times or 1))))
 
         mode_idx = self.cond_mode_combo.findData(s.cond_mode or "equal")
         self.cond_mode_combo.setCurrentIndex(max(0, mode_idx))
@@ -898,22 +1023,51 @@ class StepEditDialog(QDialog):
             if not self.url_edit.text().strip():
                 errors.append("navigate 必须填写网址 URL")
         elif action in ("click", "fill", "select"):
-            if not self.locator_value.text().strip():
-                kind = "XPath" if self.locator_type.currentData() == "xpath" else "截图"
-                errors.append(f"{action} 必须填写定位路径（{kind}）")
-            if (self.locator_type.currentData() == "image"
-                    and not self.locator_value.text().strip().startswith("img/")):
-                errors.append("截图请通过【选择截图】按钮选取，路径需位于 img/ 目录")
+            value = self.locator_value.text().strip()
+            if self.desktop:
+                if action == "click" and not value:
+                    errors.append(
+                        "桌面场景的「点击」要选一张图片模板"
+                        "（点【截屏取模板…】框住那个控件）"
+                    )
+                elif value and not _is_project_image(value):
+                    errors.append(
+                        "图片模板要用【截屏取模板…】或【选择图片…】来选，"
+                        "路径需位于项目 img/ 目录"
+                    )
+            else:
+                if not value:
+                    kind = ("XPath" if self.locator_type.currentData() == "xpath"
+                            else "截图")
+                    errors.append(f"{action} 必须填写定位路径（{kind}）")
+                if (self.locator_type.currentData() == "image"
+                        and not value.startswith("img/")):
+                    errors.append("截图请通过【选择截图】按钮选取，路径需位于 img/ 目录")
             wait_mode = self.wait_combo.currentData()
             target = self.wait_target.text().strip()
             if wait_mode in WAIT_NEEDS_TARGET and not target:
                 errors.append("设置了步骤后等待，就必须填写等待目标")
-            elif (wait_mode == "element_present"
+            elif self.desktop and target and not _is_project_image(target):
+                errors.append(
+                    "桌面场景的「等待目标」要选一张图片模板（点【截屏取模板…】）"
+                )
+            elif (not self.desktop and wait_mode == "element_present"
                     and not _looks_like_xpath(target)):
                 errors.append(
                     "「等待元素出现」的目标只能填 XPath（例如 //*[@id='wpadminbar']），"
                     "说明文字请写到【备注】里"
                 )
+        elif action == "win_activate":
+            if not self.win_title_edit.text().strip():
+                errors.append(
+                    "「激活窗口」要填窗口标题里的一小段（如 记事本、Excel）"
+                )
+        elif action == "hotkey":
+            if not self.keys_edit.text().strip():
+                errors.append("「按键」要填按什么键，如 enter、ctrl+s、alt+f4")
+        elif action == "delay":
+            if float(self.wait_seconds.value()) <= 0:
+                errors.append("「等待」要填大于 0 的秒数（填在「等待秒数」里）")
         elif action == "pause_for_human":
             cond = self.resume_combo.currentData()
             if cond in ("url_changed",) and not self.resume_url.text().strip():
@@ -998,14 +1152,23 @@ class StepEditDialog(QDialog):
             step.data_cfg = self.read_panel.config()
         elif action in ("click", "fill", "select"):
             step.locator = Locator(
-                type=self.locator_type.currentData(),
+                # 桌面场景一律是「图片模板」；网页场景看「定位方式」
+                type="image" if self.desktop else self.locator_type.currentData(),
                 value=self.locator_value.text().strip(),
-                image=self.fallback_edit.text().strip(),
+                image="" if self.desktop else self.fallback_edit.text().strip(),
             )
+            if self.desktop and action == "click":
+                step.click_times = int(self.click_times_combo.currentData() or 1)
             if action in ("fill", "select"):
                 step.value = self.value_edit.text().strip()
             step.wait_after = self.wait_combo.currentData()
             step.wait_target = self.wait_target.text().strip()
+            step.wait_seconds = float(self.wait_seconds.value())
+        elif action == "win_activate":
+            step.win_title = self.win_title_edit.text().strip()
+        elif action == "hotkey":
+            step.keys = self.keys_edit.text().strip()
+        elif action == "delay":
             step.wait_seconds = float(self.wait_seconds.value())
         elif action == "pause_for_human":
             step.prompt = self.prompt_edit.text().strip()

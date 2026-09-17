@@ -485,7 +485,11 @@ class ProjectManagerDialog(QDialog):
             self.img_status.clear()
             self._show_image_preview()
             return
-        self.header_label.setText(f"项目：{one.name}")
+        self.header_label.setText(
+            f"项目：{one.name}　｜　场景："
+            + ("桌面应用（截图定位 + 鼠标键盘）" if one.is_desktop
+               else "网页自动化（浏览器）")
+        )
         self._on_tab_changed(self.tabs.currentIndex())
 
     def _on_tab_changed(self, index: int):
