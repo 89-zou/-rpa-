@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QMenu, QMessageBox,
+    QDialog, QFileDialog, QHBoxLayout, QLabel, QMenu, QMessageBox,
     QPushButton, QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -130,6 +130,13 @@ class WebAutomationTab(QWidget):
         self.btn_data = QPushButton("数据源…")
         self.btn_data.clicked.connect(self._edit_data_source)
         edit_layout.addWidget(self.btn_data)
+        self.btn_pick_data = QPushButton("换数据文件夹…")
+        self.btn_pick_data.setToolTip(
+            "直接选一个文件夹当数据源（默认递归读里面的 *.txt）。\n"
+            "每天数据放在不同文件夹时，跑之前点一下就行，不用改项目。"
+        )
+        self.btn_pick_data.clicked.connect(self._pick_data_folder)
+        edit_layout.addWidget(self.btn_pick_data)
         edit_layout.addSpacing(12)
         self.btn_flow_edit = QPushButton("流程编辑…")
         self.btn_flow_edit.clicked.connect(self._open_flow_editor)
@@ -305,6 +312,38 @@ class WebAutomationTab(QWidget):
             self.canvas.load_steps(self._steps, self._data_source)
             self._append_log(f"数据源已设置：{self._data_source.get('path', '')}")
 
+    def _pick_data_folder(self):
+        """选一个文件夹当数据源（每天换目录时不用改项目设置）。
+
+        选完直接写进项目的【数据源】路径并保存：数据源只有这一份配置，
+        循环卡片的「数据源」标签、字段映射、运行时的取数都跟着变。
+        """
+        if not self._require_project():
+            return
+        if self._worker is not None:
+            QMessageBox.warning(self, "提示", "执行进行中，请先停止再改数据源。")
+            return
+        cur = (self._data_source or {}).get("path") or ""
+        start = cur if cur and Path(cur).is_dir() else str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, "选择数据文件夹", start)
+        if not folder:
+            return
+        ds = dict(self._data_source or {})
+        ds["type"] = "folder"
+        ds["path"] = folder.replace("\\", "/")
+        if not ds.get("pattern"):
+            ds["pattern"] = "*.txt"
+        if "recursive" not in ds:
+            ds["recursive"] = True
+        self._data_source = ds
+        self._current_store.save_data_source(ds)
+        # 循环卡片上的「数据源」标签要跟着换
+        self.canvas.load_steps(self._steps, self._data_source)
+        self._append_log(
+            f"数据文件夹已切换：{ds['path']}"
+            f"（{ds['pattern']}{'，含子文件夹' if ds['recursive'] else ''}）"
+        )
+
     # ------------------------------
     # 选择 / 按钮状态
     # ------------------------------
@@ -321,6 +360,7 @@ class WebAutomationTab(QWidget):
         """按项目/运行状态切换按钮。"""
         editable = self._worker is None and self._current_store is not None
         self.btn_data.setEnabled(editable)
+        self.btn_pick_data.setEnabled(editable)
         self.btn_flow_edit.setEnabled(editable)
         self.btn_layout.setEnabled(editable)
         self.btn_new.setEnabled(self._worker is None)
