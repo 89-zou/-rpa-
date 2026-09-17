@@ -197,9 +197,15 @@ class ReadDataPanel(QWidget):
         self.hint_label.clear()
 
     def _on_path_edited(self):
+        """手改了路径：只是换个文件夹，字段名留着（点【读取预览】核对一下就行）。
+
+        以前这里会把字段清空重选，结果每天换文件夹都要重新命名一遍，
+        步骤里 {{loop.item.标题}} 这类引用也跟着失效——所以现在只提示，不清空。
+        """
         if self.path_edit.text().strip() == (self._cfg.path or ""):
             return
-        self._clear_fields("路径已修改，请重新【读取预览】再勾选")
+        if self.var_table.rowCount():
+            self.summary_label.setText("路径已改，点【读取预览】核对字段（名字保留着）")
         self.changed.emit()
 
     def _browse(self):
@@ -221,8 +227,7 @@ class ReadDataPanel(QWidget):
         if not path or path == cur:
             return
         self.path_edit.setText(path)
-        self._clear_fields("路径已修改，请重新【读取预览】再勾选")
-        self.changed.emit()
+        self._on_path_edited()
 
     # ------------------------------
     # 字段表
