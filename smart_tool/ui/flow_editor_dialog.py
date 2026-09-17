@@ -3,12 +3,12 @@
 
 设计要点：
 - 列表从上到下就是执行顺序
-- 「循环开始 / 循环结束」是一对节点：新增「循环」时系统一起创建；
-  两者的设置合并成一份（配置存在循环开始节点上，点循环结束也是编辑它）
-- 循环体（两个节点之间的步骤）缩进显示，末尾有一行「＋ 点击创建新节点」，
-  点一下就能往这个循环里加步骤，不用先算插入位置
+- 「循环开始/结束」「条件/分支/条件结束」是成对出现的结构节点：新增时系统一起创建，
+  配置只存在「循环开始」「条件」这些节点上（点配对的另一端也是编辑同一份配置）
+- 块可以互相嵌套，按层级缩进显示（循环体、条件下的分支、分支里的循环……）
+- 每个「循环体」和「分支」的末尾都有一行「＋ 点击创建新节点」，点一下把步骤加进去
 - 每次改动（增/插/改/删/移）立即写盘，并重新编号（从 1 开始），无需手动保存
-- 循环标记没配对时照样保存（不丢改动），但状态栏给出提醒
+- 结构不合法时照样保存（不丢改动），但状态栏给出提醒
 """
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -20,39 +20,39 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
-from smart_tool.core.project_store import (
-    ProjectStore, Step, loop_block_at, loop_ranges, loop_start_index,
-)
-from smart_tool.core.step_executor import build_segments
+from smart_tool.core import blocks
+from smart_tool.core.project_store import ProjectStore, Step
 from smart_tool.ui.flow_canvas import ACTION_META, step_summary
 from smart_tool.ui.step_editor_dialog import StepEditDialog
 
 CARD_H = 56          # 卡片固定高度，避免列表项显示不全
 ADD_ROW_H = 30       # 「＋ 点击创建新节点」这一行的高度
-LOOP_INDENT = 22     # 循环体缩进像素
+LOOP_INDENT = 22     # 每层缩进像素
 SUMMARY_MAX = 78     # 摘要最大字符数（手动截断，不依赖字体度量）
 
 
-def _loop_flags(steps: List[Step]) -> List[int]:
-    """标出每个步骤是否位于循环体内（1=在循环体内，用于缩进）。"""
-    flags, depth = [], 0
-    for s in steps:
-        if s.action == "loop_start":
-            flags.append(0)
-            depth = 1
-        elif s.action == "loop_end":
-            depth = 0
-            flags.append(0)
-        else:
-            flags.append(depth)
-    return flags
+def _branch_text(steps: List[Step], index: int) -> str:
+    """分支标记的摘要：从所属条件的分支清单里取名字与匹配值。"""
+    for sp in blocks.spans(steps):
+        if sp.kind != "condition" or not sp.contains(index):
+            continue
+        order = [k for k in range(sp.inner_lo, sp.inner_hi)
+                 if steps[k].action == "branch"]
+        if index not in order:
+            return ""
+        bi = order.index(index)
+        cond = steps[sp.start]
+        name = blocks.condition_branch_name(cond, bi)
+        values = "、".join(blocks.condition_branch_values(cond, bi))
+        return f"{name}：{values}" if values else name
+    return ""
 
 
 class _StepCard(QWidget):
     """列表里的一行节点卡片：色条 + 中文动作名 + 摘要。"""
 
     def __init__(self, step: Step, data_source: dict, indent: int = 0,
-                 parent=None):
+                 branch_text: str = "", parent=None):
         super().__init__(parent)
         self.setFixedHeight(CARD_H)
         name, color = ACTION_META.get(step.action, (step.action, "#888888"))
@@ -72,10 +72,12 @@ class _StepCard(QWidget):
         text_box.addStretch()
 
         prefix = ""
-        if step.action == "loop_start":
+        if step.action in ("loop_start", "condition_start"):
             prefix = "⤵ "
-        elif step.action == "loop_end":
+        elif step.action in ("loop_end", "condition_end"):
             prefix = "⤴ "
+        elif step.action == "branch":
+            prefix = "⑂ "
         title = QLabel(f"{prefix}{step.id}. {name}")
         title_font = QFont()
         title_font.setBold(True)
@@ -83,7 +85,9 @@ class _StepCard(QWidget):
         title.setStyleSheet(f"color:{color};")
         text_box.addWidget(title)
 
-        summary = " ｜ ".join(x for x in step_summary(step, data_source) if x)
+        summary = " ｜ ".join(
+            x for x in step_summary(step, data_source, branch_text) if x
+        )
         if not summary:
             summary = "（无参数）"
         if len(summary) > SUMMARY_MAX:
@@ -134,8 +138,11 @@ class FlowEditorDialog(QDialog):
         self._steps: List[Step] = [
             Step.from_dict(s.to_dict()) for s in steps
         ]
-        # 列表里的行 → ("step", 步骤下标) 或 ("add", 循环开始下标)
+        # 分支清单条数跟分支标记对齐（老项目 / 手改过文件的兜底）
+        blocks.normalize_branch_lists(self._steps)
+        # 列表里的行 → ("step", 步骤下标) 或 ("add", 块起始下标)
         self._rows: List[Tuple[str, int]] = []
+        self._spans: list = []
         self._changed = False
         self._init_ui()
         self._reload()
@@ -148,9 +155,9 @@ class FlowEditorDialog(QDialog):
 
         tip = QLabel(
             "列表从上到下就是执行顺序；双击某行可编辑。\n"
-            "「循环开始 / 循环结束」是系统一起创建的一对节点，设置只存一份"
-            "（点循环结束也是编辑这个循环的配置）；循环体缩进显示。\n"
-            "循环体末尾有「＋ 点击创建新节点」，点一下就往该循环里加步骤；所有改动立即保存。"
+            "「循环开始/结束」「条件/分支/条件结束」都是系统一起创建的结构节点，"
+            "设置只有一份（点配对的另一端也是编辑同一个块）；块可以嵌套，按缩进分层。\n"
+            "每个循环体 / 分支末尾都有「＋ 点击创建新节点」；所有改动立即保存。"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#777777;")
@@ -212,12 +219,15 @@ class FlowEditorDialog(QDialog):
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
         self._rows = []
-        flags = _loop_flags(self._steps)
-        add_before = {b: a for a, b in loop_ranges(self._steps)}
+        self._spans = blocks.spans(self._steps)
+        depths = blocks.depths(self._steps)
+        # 「＋ 点击创建新节点」放在每个循环体 / 分支的末尾
+        add_at = {sp.insert_pos: sp for sp in self._spans
+                  if sp.kind in ("loop", "branch")}
         for i, s in enumerate(self._steps):
-            if i in add_before:
-                self._append_add_row(add_before[i])
-            self._append_step_row(i, flags[i])
+            if i in add_at:
+                self._append_add_row(add_at[i], depths[i])
+            self._append_step_row(i, depths[i])
         self.list_widget.blockSignals(False)
 
         if select_index is not None:
@@ -227,29 +237,29 @@ class FlowEditorDialog(QDialog):
                     break
         self._update_buttons()
 
-    def _append_step_row(self, idx: int, indent: int):
+    def _append_step_row(self, idx: int, depth: int):
         item = QListWidgetItem()
         item.setSizeHint(QSize(0, CARD_H))          # 必须显式设置，否则卡片会被压扁
         self.list_widget.addItem(item)
         self.list_widget.setItemWidget(
             item, _StepCard(self._steps[idx], self.data_source,
-                            LOOP_INDENT * indent)
+                            LOOP_INDENT * depth,
+                            branch_text=_branch_text(self._steps, idx))
         )
         self._rows.append(("step", idx))
 
-    def _append_add_row(self, start_idx: int):
-        """在「循环结束」之前插一行「＋ 点击创建新节点」。"""
-        start_id = self._steps[start_idx].id
+    def _append_add_row(self, span, depth: int):
+        """在块（循环体 / 分支）末尾插一行「＋ 点击创建新节点」。"""
         item = QListWidgetItem()
         item.setSizeHint(QSize(0, ADD_ROW_H))
         # 只保留「可用」：这一行是按钮，不该被当成步骤选中
         item.setFlags(Qt.ItemFlag.ItemIsEnabled)
         self.list_widget.addItem(item)
         self.list_widget.setItemWidget(
-            item, _AddInLoopRow(lambda: self._create_in_loop(start_id),
-                                LOOP_INDENT)
+            item, _AddInLoopRow(lambda: self._create_in_block(span.start),
+                                LOOP_INDENT * (depth + 1))
         )
-        self._rows.append(("add", start_idx))
+        self._rows.append(("add", span.start))
 
     def _selected_row(self) -> int:
         """当前选中行 → self._steps 下标；没选中（或选的是「＋」行）返回 -1。"""
@@ -260,29 +270,20 @@ class FlowEditorDialog(QDialog):
                 return idx
         return -1
 
-    def _move_bounds(self, idx: int) -> Tuple[int, int]:
-        """该步骤允许上下移动到的下标范围。
+    def _span_of_marker(self, idx: int):
+        """idx 正好是某个块的起始/结束标记 → 返回那个块。"""
+        return blocks.span_by_marker(self._spans, idx)
 
-        循环体里的步骤只能在循环体内挪；循环外的步骤不许跨过循环块
-        （要整体挪循环，请选中「循环」那一行）。
-        """
-        block = loop_block_at(self._steps, idx)
-        if block and block[0] < idx:
-            return block[0] + 1, block[1] - 1
-        lo, hi = 0, len(self._steps) - 1
-        for a, b in loop_ranges(self._steps):
-            if b < idx:
-                lo = max(lo, b + 1)
-            elif a > idx:
-                hi = min(hi, a - 1)
-        return lo, hi
+    def _move_bounds(self, idx: int) -> Tuple[int, int]:
+        """该步骤允许上下移动到的下标范围（不许跨出自己所在的块）。"""
+        return blocks.move_bounds(self._steps, idx)
 
     def _update_buttons(self):
         idx = self._selected_row()
         has = idx >= 0
-        block = loop_block_at(self._steps, idx) if has else None
-        if block and idx in (block[0], block[1]):
-            lo, hi = block            # 选中循环的任一端：整块上下移动
+        block = self._span_of_marker(idx) if has else None
+        if block is not None:
+            lo, hi = block.start, block.end      # 选中块的标记：整块上下移动
         elif has:
             lo, hi = self._move_bounds(idx)
         else:
@@ -292,31 +293,32 @@ class FlowEditorDialog(QDialog):
         self.btn_delete.setEnabled(has)
         self.btn_up.setEnabled(has and idx > lo)
         self.btn_down.setEnabled(has and idx < hi)
-        loops = len(loop_ranges(self._steps))
-        self.count_label.setText(
-            f"共 {len(self._steps)} 个步骤"
-            + (f"，{loops} 个循环体" if loops else "")
-        )
+        loops = sum(1 for sp in self._spans if sp.kind == "loop")
+        conds = sum(1 for sp in self._spans if sp.kind == "condition")
+        extra = "".join([
+            f"，{loops} 个循环" if loops else "",
+            f"，{conds} 个条件" if conds else "",
+        ])
+        self.count_label.setText(f"共 {len(self._steps)} 个步骤" + extra)
 
     # ------------------------------
-    # 循环体里「＋ 点击创建新节点」
+    # 块里的「＋ 点击创建新节点」
     # ------------------------------
-    def _create_in_loop(self, start_id: int):
+    def _create_in_block(self, start_idx: int):
         """点「＋」那一行：延后一拍再弹新建对话框。
 
         必须延后：插入后会重建整个列表，正在处理点击事件的按钮会被销毁，
         直接在事件里重建会让 Qt 访问已析构的控件（表现为无提示闪退）。
         """
-        QTimer.singleShot(0, lambda: self._add_into_loop(start_id))
+        QTimer.singleShot(0, lambda: self._add_into_block(start_idx))
 
-    def _add_into_loop(self, start_id: int):
+    def _add_into_block(self, start_idx: int):
         step = self._new_step_via_dialog()
         if step is None:
             return
-        start_idx = next((i for i, s in enumerate(self._steps)
-                          if s.id == start_id), -1)
-        block = loop_block_at(self._steps, start_idx) if start_idx >= 0 else None
-        pos = block[1] if block else len(self._steps)   # 插到「循环结束」之前
+        sp = next((x for x in blocks.spans(self._steps) if x.start == start_idx),
+                  None)
+        pos = sp.insert_pos if sp else len(self._steps)
         self._insert_at(pos, step)
 
     # ------------------------------
@@ -351,45 +353,45 @@ class FlowEditorDialog(QDialog):
         self._insert_at(idx, step)
 
     def _insert_at(self, pos: int, step: Step):
-        """插入一个步骤；新增「循环」时自动补上配对的结束标记。"""
-        if step.action == "loop_start" and self._in_loop_body(pos):
-            QMessageBox.warning(
-                self, "不支持嵌套循环",
-                "「循环」里面不能再放「循环」。\n"
-                "如果想改成别的循环，请先选中原来那个「循环」把它删掉。"
-            )
-            return
+        """插入一个步骤；新增「循环」/「条件」时自动补上配套的结构节点。"""
         new_steps = [step]
         if step.action == "loop_start":
-            end = Step(id=0, action="loop_end")
-            new_steps.append(end)        # 结束标记自动生成，由画布排版给位置
+            new_steps.append(Step(id=0, action=blocks.LOOP_END))
+        elif step.action == "condition_start":
+            # 条件默认给两个分支，用户可在条件节点里增删
+            if not step.cond_branches:
+                step.cond_branches = [blocks.new_branch("分支 1"),
+                                      blocks.new_branch("分支 2")]
+            new_steps.append(Step(id=0, action=blocks.BRANCH))
+            new_steps.append(Step(id=0, action=blocks.BRANCH))
+            new_steps.append(Step(id=0, action=blocks.COND_END))
         self._steps[pos:pos] = new_steps
         self._commit(select_index=pos)
-
-    def _in_loop_body(self, pos: int) -> bool:
-        """在 pos 处插入，是否会落进某个循环体内。"""
-        return any(a < pos <= b for a, b in loop_ranges(self._steps))
 
     def _edit_step(self):
         idx = self._selected_row()
         if idx < 0:
             return
-        # 设置合并：点「循环结束」也是编辑同一个循环的配置（配置存在循环开始上）
-        if self._steps[idx].action == "loop_end":
-            start_idx = loop_start_index(self._steps, idx)
-            if start_idx >= 0:
-                idx = start_idx
+        # 设置合并：点「循环结束」「分支」「条件结束」都是编辑所属的那个块
+        idx = blocks.marker_owner_index(self._steps, idx)
         old = self._steps[idx]
         dlg = StepEditDialog(
             self.project_dir, old, self,
             data_source=self.data_source,
             project_variables=self.project_variables,
         )
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            new_step = dlg.get_step()
-            new_step.pos = old.pos        # 保留画布坐标
-            self._steps[idx] = new_step
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_step = dlg.get_step()
+        new_step.pos = old.pos        # 保留画布坐标
+        if old.action == "condition_start" and new_step.action == "condition_start":
+            note = blocks.apply_condition_edit(self._steps, idx, new_step)
             self._commit(select_index=idx)
+            if note:
+                self.status_label.setText(f"已自动保存；{note}")
+            return
+        self._steps[idx] = new_step
+        self._commit(select_index=idx)
 
     def _delete_step(self):
         idx = self._selected_row()
@@ -397,21 +399,20 @@ class FlowEditorDialog(QDialog):
             return
         s = self._steps[idx]
         name = ACTION_META.get(s.action, (s.action, ""))[0]
-        block = loop_block_at(self._steps, idx)
-        if block and idx in (block[0], block[1]):
-            # 只删除循环的「两端」才连循环体一起删；
-            # 循环体里的普通步骤就是删它自己
-            a, b = block
-            body = b - a - 1
+        block = self._span_of_marker(idx)
+        if block is not None:
+            # 只有选中块的「标记」才整块删；块里的普通步骤就删它自己
+            body = block.end - block.start - 1
             reply = QMessageBox.question(
-                self, "删除循环",
-                f"「循环」是一对配套节点，删除会连同里面的 {body} 个步骤一起去掉。\n"
-                f"确定删除这个循环吗？"
+                self, f"删除{blocks.ACTION_CN.get(s.action, name)}",
+                f"「{blocks.ACTION_CN.get(s.action, name)}」是配套的结构节点，"
+                f"删除会连同它里面的 {body} 个步骤一起去掉。\n确定删除吗？"
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
-            del self._steps[a:b + 1]
-            self._commit(select_index=min(a, len(self._steps) - 1))
+            blocks.drop_branch_entry(self._steps, block.start)
+            del self._steps[block.start:block.end + 1]
+            self._commit(select_index=min(block.start, len(self._steps) - 1))
             return
         reply = QMessageBox.question(
             self, "删除步骤", f"确定删除这个步骤（{name}）？"
@@ -425,10 +426,10 @@ class FlowEditorDialog(QDialog):
         idx = self._selected_row()
         if idx < 0:
             return
-        block = loop_block_at(self._steps, idx)
-        if block and idx in (block[0], block[1]):
-            # 选中循环的任一端：整块上下移动
-            a, b = block
+        block = self._span_of_marker(idx)
+        if block is not None:
+            # 选中块的标记：整块上下移动
+            a, b = block.start, block.end
             if delta < 0:
                 if a == 0:
                     return
@@ -458,7 +459,8 @@ class FlowEditorDialog(QDialog):
     # 自动保存（编号从 1 开始）
     # ------------------------------
     def _commit(self, select_index: Optional[int] = None):
-        """任何改动都走这里：重排编号 → 写盘 → 刷新列表。"""
+        """任何改动都走这里：补齐分支清单 → 重排编号 → 写盘 → 刷新列表。"""
+        blocks.normalize_branch_lists(self._steps)
         self._renumber()
         self._store.save(self._steps)
         self._changed = True
@@ -471,15 +473,14 @@ class FlowEditorDialog(QDialog):
             s.id = i
 
     def _set_saved_tip(self):
-        """状态栏提示：已保存 / 循环没配对。"""
-        try:
-            build_segments(self._steps)
-        except ValueError as e:
-            self.status_label.setText(f"已自动保存；但{e}")
+        """状态栏提示：已保存 / 结构有问题。"""
+        problem = blocks.validate(self._steps)
+        if problem:
+            self.status_label.setText(f"已自动保存；但{problem}")
             self.status_label.setStyleSheet("color:#c62828;")
             return
         self.status_label.setText(
-            f"已自动保存（{len(self._rows)} 个步骤，编号 1~{len(self._rows)}）"
+            f"已自动保存（{len(self._steps)} 个步骤，编号 1~{len(self._steps)}）"
         )
         self.status_label.setStyleSheet("color:#2e7d32;")
 

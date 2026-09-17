@@ -13,7 +13,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from playwright.sync_api import Page, sync_playwright
 
-from smart_tool.core import image_locator
+from smart_tool.core import blocks, image_locator
+from smart_tool.core.blocks import Block
 from smart_tool.core.data_sources import (
     DataSourceConfig, DataSourceError, load_rows,
 )
@@ -47,48 +48,12 @@ def _looks_invalid_selector(msg: str) -> bool:
     return any(h in low for h in INVALID_SELECTOR_HINTS)
 
 
-def build_segments(steps: List[Step]):
-    """把线性步骤拆成执行段。
-
-    形式：[("once", [步骤...]), ("loop", (循环开始步骤, [循环体...])), ...]
-
-    loop_start/loop_end 是纯结构标记（界面上只显示成一个「循环」节点），
-    不产生浏览器动作；不支持嵌套循环，标记不配对直接抛错。循环开始步骤带在
-    payload 里，因为「循环方式」配置就存在它身上。
-    """
-    segments = []
-    cur: List[Step] = []
-    inner: Optional[List[Step]] = None
-    start_step: Optional[Step] = None
-    for s in steps:
-        if s.action == "loop_start":
-            if inner is not None:
-                raise ValueError("不支持嵌套循环：一个循环里面不能再放循环")
-            if cur:
-                segments.append(("once", cur))
-                cur = []
-            inner = []
-            start_step = s
-        elif s.action == "loop_end":
-            if inner is None:
-                raise ValueError("存在多余的「循环结束」标记，请把那个循环删掉重加")
-            segments.append(("loop", (start_step, inner)))
-            inner = None
-            start_step = None
-        else:
-            (inner if inner is not None else cur).append(s)
-    if inner is not None:
-        raise ValueError("某个「循环」缺少配对的结束标记，请把它删掉重加")
-    if cur:
-        segments.append(("once", cur))
-    return segments
-
-
-def loop_inner_steps(payload) -> List[Step]:
-    """从 loop 段里取出循环体（兼容旧的「直接是列表」形式）。"""
-    if isinstance(payload, tuple):
-        return payload[1]
-    return payload
+def _literal(value: str) -> str:
+    """把变量值渲染成 Python 字面量：能当数字就当数字，否则当带引号的字符串。"""
+    text = (value or "").strip()
+    if re.fullmatch(r"-?\d+", text) or re.fullmatch(r"-?\d+\.\d+", text):
+        return text
+    return repr(text)
 
 
 def _to_text(value: Any) -> str:
@@ -161,7 +126,9 @@ def step_var_fields(step: Step) -> List[str]:
     """步骤里可能出现 {{变量}} 的文本字段。"""
     texts = [step.url, step.value, step.wait_target,
              step.resume_url, step.resume_element, step.prompt,
-             step.loop_items, step.loop_range]
+             step.loop_items, step.loop_range, step.cond_expr]
+    # 条件分支的匹配值也允许写 {{变量}}（运行时先渲染再比）
+    texts += [m.get("values", "") for m in (step.cond_branches or [])]
     return [t for t in texts if t]
 
 
@@ -191,24 +158,27 @@ def check_variables(steps: List[Step], data_columns: Optional[List[str]] = None,
     # 分清三种循环：数据源循环里 row./file. 由数据源产出；
     # 列表循环里 row.* 来自列表项（对象），静态看不出有哪些字段，不误报；
     # 索引范围循环根本没有行数据，引用了 row./file. 要如实提示。
+    # 条件块里的步骤跟随外层循环（缩进再深也一样）。
     data_loop_ids: set = set()
     list_loop_ids: set = set()
     range_loop_ids: set = set()
     try:
-        for kind, payload in build_segments(steps):
-            if kind != "loop":
+        tree = blocks.parse(steps)
+    except blocks.StructureError:
+        tree = []       # 结构问题由别处报错，这里不做重复提示
+
+    def walk(nodes: List[Any]):
+        for n in nodes:
+            if not isinstance(n, Block):
                 continue
-            start, inner = payload if isinstance(payload, tuple) else (None, payload)
-            src = getattr(start, "loop_source", "data") or "data"
-            if src == "list":
-                target = list_loop_ids
-            elif src == "range":
-                target = range_loop_ids
-            else:
-                target = data_loop_ids
-            target.update(s.id for s in inner)
-    except ValueError:
-        pass        # 结构问题由别处报错，这里不做重复提示
+            if n.kind == "loop":
+                src = n.start.loop_source or "data"
+                target = {"list": list_loop_ids,
+                          "range": range_loop_ids}.get(src, data_loop_ids)
+                target.update(s.id for s in n.steps)
+            walk(n.nodes)
+
+    walk(tree)
 
     problems: List[str] = []
     seen = set()
@@ -300,35 +270,81 @@ class StepExecutor:
         self.log("收到停止请求，将在当前步骤完成后退出。")
 
     def run(self):
-        """启动浏览器并依次执行步骤（含循环分段）。"""
-        segments = build_segments(self.steps)
+        """启动浏览器并按块树执行步骤（循环 / 条件可互相嵌套）。"""
+        nodes = blocks.parse(self.steps)
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=self.headless)
             context = browser.new_context()
             self._page = context.new_page()
             try:
-                for kind, payload in segments:
-                    if self._stop:
-                        break
-                    if kind == "loop":
-                        start, inner = payload
-                        self._run_loop(start, inner)
-                    else:
-                        self._run_steps(payload)
+                self._run_nodes(nodes)
             finally:
                 self.log("执行结束，关闭浏览器。")
                 browser.close()
                 self._page = None
 
-    def _run_steps(self, steps: List[Step]):
-        """顺序执行一段普通步骤。"""
-        for step in steps:
+    def _run_nodes(self, nodes: List[Any]):
+        """顺序执行同一层里的节点（普通步骤或嵌套的块）。"""
+        for node in nodes:
             if self._stop:
                 self.log("已停止。")
-                break
-            self._execute_step(step)
+                return
+            if isinstance(node, Block):
+                self._run_block(node)
+            else:
+                self._execute_step(node)
 
-    def _run_loop(self, start_step: Step, inner: List[Step]):
+    def _run_block(self, block: Block):
+        if block.kind == "loop":
+            self._run_loop(block)
+        elif block.kind == "condition":
+            self._run_condition(block)
+        else:
+            self._run_nodes(block.nodes)      # 分支（正常只出现在条件里）
+
+    def _run_condition(self, block: Block):
+        """条件节点：先算出结果，再走第一个匹配的分支；都不匹配就整块跳过。"""
+        step = block.start
+        result, is_bool = self._condition_result(step)
+        mode = "表达式" if (step.cond_mode or "equal") == "expr" else "变量"
+        self.log(f"[条件] {mode} {step.cond_expr} → 结果「{result}」")
+        for i, br in enumerate(block.branches):
+            if self._branch_hit(step, i, result, is_bool):
+                self.log(f"  走分支「{blocks.condition_branch_name(step, i)}」")
+                self._run_nodes(br.nodes)
+                return
+        self.log("  没有分支匹配，跳过条件体。")
+
+    def _condition_result(self, step: Step):
+        """算出条件的结果，返回 (文本, 是否布尔值)；布尔值 None 表示按值匹配分支。"""
+        raw = (step.cond_expr or "").strip()
+        if not raw:
+            raise ValueError("条件节点还没填判断内容，请点开条件节点填写")
+        if (step.cond_mode or "equal") != "expr":
+            return self._resolve_value(raw).strip(), None
+        code = VAR_PATTERN.sub(
+            lambda m: _literal(self.variables.get(m.group(1), "")), raw
+        )
+        scope = {"vars": self.variables, "log": self.log}
+        try:
+            value = eval(compile(code, "<条件>", "eval"), scope)   # noqa: S307
+        except Exception as e:
+            raise ValueError(f"条件表达式「{raw}」算不出来：{e}")
+        if isinstance(value, bool):
+            return ("是" if value else "否"), value
+        return str(value).strip(), None
+
+    def _branch_hit(self, step: Step, index: int, result: str,
+                    is_bool: Optional[bool]) -> bool:
+        """第 index 个分支是否命中。"""
+        if is_bool is not None:
+            # 表达式结果是真/假：真走第 1 个分支，假走第 2 个
+            return index == (0 if is_bool else 1)
+        values = [self._resolve_value(v).strip()
+                  for v in blocks.condition_branch_values(step, index)]
+        return result in values
+
+    def _run_loop(self, block: Block):
         """按「循环方式」逐项执行循环体。
 
         来源三种：
@@ -338,6 +354,7 @@ class StepExecutor:
         三者都会注入 loop.index（1 起）与 loop.zero_index；
         项变量只覆盖本次循环，静态变量（如项目变量里的手工测试值）作兜底。
         """
+        start_step = block.start
         records, source_label = self._loop_records(start_step)
         if records is None:
             return
@@ -355,7 +372,7 @@ class StepExecutor:
                 "loop.index": str(i),
                 "loop.zero_index": str(i - 1),
             }
-            self._run_steps(inner)
+            self._run_nodes(block.nodes)
         self.log(f"[循环结束] 完成 {total} 项")
         # 恢复循环外的变量；但保留脚本在循环里新造的变量（累加器之类）
         row_keys = set()
@@ -501,8 +518,9 @@ class StepExecutor:
                 self._pause_for_human(step)
             elif step.action == "script":
                 self._run_script(step)
-            elif step.action in ("loop_start", "loop_end"):
-                # 结构标记，正常路径在 build_segments 阶段已被剥离
+            elif step.action in ("loop_start", "loop_end", "condition_start",
+                                 "condition_end", "branch"):
+                # 结构标记，正常路径在 blocks.parse 阶段已被剥离
                 self.log(f"  {step.action} 为结构标记，跳过")
             else:
                 self.log(f"  未知 action: {step.action}，跳过")
