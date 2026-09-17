@@ -11,7 +11,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import (
+    Page, TimeoutError as PlaywrightTimeout, sync_playwright,
+)
 
 from smart_tool.core import blocks, image_locator
 from smart_tool.core.blocks import Block
@@ -38,6 +40,8 @@ PAUSE_POLL_INTERVAL = 0.5
 PAUSE_LOG_INTERVAL = 10
 # Playwright 页面默认超时（毫秒）。脚本节点会临时改小，用完恢复到这个值。
 DEFAULT_PAGE_TIMEOUT_MS = 30000
+# 点击元素的等待上限（毫秒）
+CLICK_TIMEOUT_MS = 20000
 # 填入前「点击获取焦点」的等待上限：点不到就退回直接 fill，不长时间卡住
 FOCUS_CLICK_TIMEOUT_MS = 5000
 # 步骤后等待：元素 / URL / 页面加载的上限（毫秒）
@@ -308,6 +312,21 @@ class StepExecutor:
         self._stop = True
         self.log("收到停止请求，将在当前步骤完成后退出。")
 
+    def _on_dialog(self, dialog):
+        """页面弹出 confirm/alert/离开确认时一律点「确定」。
+
+        Playwright 默认会把弹窗「取消」掉：站点在提交表单前问一句
+        「确定要发布吗」，被取消后就什么都没发生——日志上完全看不出来。
+        这里统一点确定，并把弹窗内容写进日志备查。
+        """
+        try:
+            kind = dialog.type
+            msg = (dialog.message or "").replace("\n", " ")[:80]
+            self.log(f"  页面弹窗（{kind}）：{msg or '（无文字）'} → 已点「确定」")
+            dialog.accept()
+        except Exception as e:
+            self.log(f"  处理页面弹窗失败：{str(e).splitlines()[0][:100]}")
+
     def run(self):
         """启动浏览器并按块树执行步骤（循环 / 条件可互相嵌套）。"""
         nodes = blocks.parse(self.steps)
@@ -315,6 +334,9 @@ class StepExecutor:
             browser = p.chromium.launch(headless=self.headless)
             context = browser.new_context()
             self._page = context.new_page()
+            # 页面弹窗一律「确定」：Playwright 默认是「取消」，
+            # 于是「确定要发布/离开吗」被点成了取消，操作会静默失败
+            self._page.on("dialog", self._on_dialog)
             try:
                 self._run_nodes(nodes)
             finally:
@@ -727,8 +749,16 @@ class StepExecutor:
         if step.locator.type == "image":
             m = self._locate_by_image(step.locator)
             self._page.mouse.click(m.x, m.y)
-        else:
-            self._resolve_xpath(step.locator).click(timeout=20000)
+            return
+        loc = self._resolve_xpath(step.locator)
+        try:
+            loc.click(timeout=CLICK_TIMEOUT_MS)
+        except PlaywrightTimeout as e:
+            raise TimeoutError(
+                f"等不到可点击的元素（{CLICK_TIMEOUT_MS // 1000}s）：{step.locator.value}\n"
+                f"   当前页面：{self._current_url() or '（正在跳转中）'}\n"
+                "   多半是上一步之后没跳到你以为的页面，或这个 XPath 属于另一个页面。"
+            ) from e
 
     def _fill(self, step: Step):
         if not step.locator:
