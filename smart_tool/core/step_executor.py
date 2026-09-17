@@ -237,7 +237,7 @@ def check_variables(steps: List[Step], data_columns: Optional[List[str]] = None,
                     reason = ("循环方式是「索引范围」，没有行数据"
                               "（要按行取数据请把循环方式改成「数据源」或「变量 / 手动列表」）")
                 elif is_data_var and s.id in data_loop_ids:
-                    reason = "数据源没有产出这个变量（可在【数据源…】里配置字段映射）"
+                    reason = "数据源没有产出这个变量（可在【项目管理…】→【数据源与字段】里配置字段映射）"
                 elif is_data_var:
                     reason = "数据源没有产出这个变量"
                 elif not in_project:
@@ -478,7 +478,7 @@ class StepExecutor:
             raise DataSourceError(
                 "存在「循环」节点，但既没配置数据源，也没填循环项。\n"
                 "请在循环节点里把循环方式改成「变量 / 手动列表」或「索引范围」，"
-                "或点【数据源】配置文件路径"
+                "或点【项目管理…】→【数据源与字段】配置文件路径"
             )
         rows = load_rows(cfg)
         if not rows:

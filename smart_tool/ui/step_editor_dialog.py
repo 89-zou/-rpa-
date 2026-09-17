@@ -84,7 +84,7 @@ WAIT_OPTIONS = [
 WAIT_NEEDS_TARGET = ("element_present", "url_changed")
 # 循环方式
 LOOP_SOURCES = [
-    ("data", "数据源（在【数据源…】里配置，每一行一次）"),
+    ("data", "数据源（在【项目管理…】→ 数据源与字段里配置，每一行一次）"),
     ("list", "变量 / 手动列表（每行一项，可写 {{变量}}）"),
     ("range", "索引范围（写 10 就跑 10 次，或写 0-10）"),
 ]
@@ -636,8 +636,8 @@ class StepEditDialog(QDialog):
             )
         else:
             self.value_hint.setText(
-                "暂无可用变量：可先在主界面点【数据源…】配置文件，"
-                "或在【项目管理…】里手工添加变量。"
+                "暂无可用变量：可先在主界面点【项目管理…】→【数据源与字段】配置，"
+                "或在【变量清单】里手工添加变量。"
             )
 
     def _insert_variable(self, index: int):
@@ -919,7 +919,7 @@ class StepEditDialog(QDialog):
                         errors.append("只写一个数时它表示跑多少次，要填大于 0 的整数")
             elif not self._data_source_ready():
                 errors.append(
-                    "还没配置数据源：请点主界面【数据源…】配置文件路径，"
+                    "还没配置数据源：请点主界面【项目管理…】→【数据源与字段】配置文件路径，"
                     "或把「循环方式」改成「索引范围」/「变量 / 手动列表」"
                 )
         elif action == "condition_start":
