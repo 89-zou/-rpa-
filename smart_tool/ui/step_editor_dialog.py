@@ -16,7 +16,8 @@ from typing import Optional
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QPixmap
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+    QFileDialog,
     QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
     QPlainTextEdit, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
@@ -231,6 +232,18 @@ class StepEditDialog(QDialog):
             "只填 XPath，如 //*[@id='wpadminbar']（说明文字请写到【备注】里）"
         )
         form.addRow("等待目标：", self.wait_target)
+        self.wait_seconds = QDoubleSpinBox()
+        self.wait_seconds.setRange(0, 300)
+        self.wait_seconds.setDecimals(1)
+        self.wait_seconds.setSingleStep(0.5)
+        self.wait_seconds.setSuffix(" 秒")
+        self.wait_seconds.setSpecialValueText("不等")
+        self.wait_seconds.setToolTip(
+            "这个步骤做完后再固定等几秒（0＝不等）。\n"
+            "站点慢、点了没反应（比如点了发布但页面没动）时，\n"
+            "给这一步加 2~3 秒往往就好了。"
+        )
+        form.addRow("额外等待：", self.wait_seconds)
 
         # --- 人工暂停组 ---
         self.prompt_edit = QLineEdit()
@@ -451,7 +464,7 @@ class StepEditDialog(QDialog):
         self._locator_widgets = [self.locator_type, loc_row]
         self._image_widgets = [self.image_hint, self.preview]
         self._value_widgets = [value_row, self.value_hint]
-        self._wait_widgets = [self.wait_combo]
+        self._wait_widgets = [self.wait_combo, self.wait_seconds]
         self._pause_widgets = [self.prompt_edit, self.resume_combo,
                                self.resume_timeout]
         self._loop_widgets = [self.loop_source_combo]
@@ -785,6 +798,7 @@ class StepEditDialog(QDialog):
         wait_idx = self.wait_combo.findData(s.wait_after)
         self.wait_combo.setCurrentIndex(wait_idx if wait_idx >= 0 else 0)
         self.wait_target.setText(s.wait_target)
+        self.wait_seconds.setValue(float(s.wait_seconds or 0))
 
         self.prompt_edit.setText(s.prompt)
         self.resume_combo.setCurrentIndex(
@@ -938,6 +952,7 @@ class StepEditDialog(QDialog):
                 step.value = self.value_edit.text().strip()
             step.wait_after = self.wait_combo.currentData()
             step.wait_target = self.wait_target.text().strip()
+            step.wait_seconds = float(self.wait_seconds.value())
         elif action == "pause_for_human":
             step.prompt = self.prompt_edit.text().strip()
             step.resume_condition = self.resume_combo.currentData()

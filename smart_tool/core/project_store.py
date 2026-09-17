@@ -33,6 +33,7 @@ class Step:
     value: str = ""                        # fill 用（可含 {{变量}}）
     wait_after: str = ""                   # element_present/url_changed/network_idle/manual
     wait_target: str = ""                 # 等待目标（XPath 或 URL 片段）
+    wait_seconds: float = 0.0             # 执行完这个步骤后再固定等 N 秒（0=不等）
     prompt: str = ""                      # pause_for_human 的提示
     note: str = ""                        # 用户备注
     # ---- pause_for_human 专用：人工暂停后的恢复信号 ----
@@ -79,6 +80,8 @@ class Step:
             d["wait_after"] = self.wait_after
             if self.wait_target:
                 d["wait_target"] = self.wait_target
+        if self.wait_seconds:
+            d["wait_seconds"] = self.wait_seconds
         if self.prompt:
             d["prompt"] = self.prompt
         if self.note:
@@ -128,6 +131,7 @@ class Step:
             value=d.get("value", ""),
             wait_after=d.get("wait_after", ""),
             wait_target=d.get("wait_target", ""),
+            wait_seconds=float(d.get("wait_seconds", 0) or 0),
             prompt=d.get("prompt", ""),
             note=d.get("note", ""),
             resume_condition=d.get("resume_condition", "manual"),

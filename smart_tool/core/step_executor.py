@@ -42,6 +42,9 @@ PAUSE_LOG_INTERVAL = 10
 DEFAULT_PAGE_TIMEOUT_MS = 30000
 # 点击元素的等待上限（毫秒）
 CLICK_TIMEOUT_MS = 20000
+# 每个步骤之间的最小缓冲（秒）。站点慢的时候连点太密会丢事件
+# （典型：点了发布，但页面正好在自己刷新，这一下点击就被吃掉了）
+STEP_GAP_SECONDS = 1.0
 # 填入前「点击获取焦点」的等待上限：点不到就退回直接 fill，不长时间卡住
 FOCUS_CLICK_TIMEOUT_MS = 5000
 # 步骤后等待：元素 / URL / 页面加载的上限（毫秒）
@@ -354,6 +357,10 @@ class StepExecutor:
                 self._run_block(node)
             else:
                 self._execute_step(node)
+            # 步骤之间的最小缓冲：站点慢的时候连续操作太密，容易丢事件
+            # （典型：点了发布但页面正在自己刷新，这一下点击就被吃掉了）
+            if STEP_GAP_SECONDS > 0:
+                time.sleep(STEP_GAP_SECONDS)
 
     def _run_block(self, block: Block):
         if block.kind == "loop":
@@ -598,6 +605,10 @@ class StepExecutor:
             # pause_for_human 的恢复信号本身就是验证条件，不再重复 wait_after
             if step.action != "pause_for_human":
                 self._wait_after(step)
+            # 这个步骤自己设的额外等待（秒）：慢站点、点了没反应时加大它
+            if step.wait_seconds and step.wait_seconds > 0:
+                self.log(f"  再固定等 {step.wait_seconds:g}s")
+                time.sleep(float(step.wait_seconds))
         except Exception as e:
             self.log(f"  步骤出错: {e}")
             raise
