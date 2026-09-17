@@ -76,6 +76,7 @@ CARD_RADIUS = 3.5
 ACTION_META = {
     # action: (中文名, 主题色)
     "navigate": ("打开网页", "#2f6fed"),
+    "read_data": ("读取数据", "#0f766e"),
     "click": ("点击", "#e8890c"),
     "fill": ("填入", "#1a9d6b"),
     "select": ("下拉选择", "#1192a8"),
@@ -89,33 +90,30 @@ ACTION_META = {
 }
 
 
-def node_height_for(step: Step, data_source: dict) -> float:
+def node_height_for(step: Step) -> float:
     """卡片高度（排版与绘制共用同一算法，避免对不齐）。"""
-    lines = max(1, len(step_summary(step, data_source)))
+    lines = max(1, len(step_summary(step)))
     # 标题行 + 类型行 + 正文行
     return HEADER_H + TYPE_LINE_H + lines * BODY_LINE_H + BODY_PAD * 2
 
 
-def _range_summary(text: str) -> str:
-    """索引范围的卡片摘要：字面量算出次数，含变量时原样显示。"""
-    t = (text or "").strip()
-    if not t:
-        return "索引范围（未填写）"
-    parts = [x.strip() for x in t.split("-")]
-    if len(parts) == 2 and all(x.isdigit() for x in parts):
-        a, b = int(parts[0]), int(parts[1])
-        return f"索引 {a}–{b}（{max(0, b - a + 1)} 次）"
-    if t.isdigit():
-        n = int(t)
-        return f"索引 0–{n - 1}（{n} 次）" if n > 0 else "索引范围（0 次）"
-    return f"索引范围：{t}"
-
-
-def step_summary(s: Step, data_source: dict,
-                 branch_text: str = "") -> List[str]:
+def step_summary(s: Step, branch_text: str = "") -> List[str]:
     """卡片正文最多 3 行摘要（branch_text 是分支标记从所属条件里取的匹配值）。"""
     if s.action == "navigate":
         return [s.url or "（未填网址）"]
+    if s.action == "read_data":
+        cfg = s.data_cfg or {}
+        path = cfg.get("path") or ""
+        fields = [(m.get("var") or "").strip()
+                  for m in (cfg.get("field_map") or []) if isinstance(m, dict)]
+        fields = [f for f in fields if f]
+        lines = [f"读：{Path(path).name}" if path else "（未选文件 / 文件夹）"]
+        lines.append(f"产出 {{{{{s.output_var}}}}}"
+                     if s.output_var else "（未填产出变量名）")
+        if fields:
+            lines.append("字段：" + "、".join(fields[:4])
+                         + ("…" if len(fields) > 4 else ""))
+        return lines[:3]
     if s.action == "click" and s.locator:
         return [f"点击：{s.locator.value[:60]}"]
     if s.action in ("fill", "select"):
@@ -130,17 +128,12 @@ def step_summary(s: Step, data_source: dict,
         }.get(s.resume_condition, s.resume_condition)
         return [s.prompt[:50] or "（无提示）", f"恢复：{cond}（{s.resume_timeout}s）"]
     if s.action == "loop_start":
-        if (s.loop_source or "data") == "range":
-            return [_range_summary(s.loop_range)]
-        if (s.loop_source or "data") == "list":
-            items = [x.strip() for x in (s.loop_items or "").splitlines()
-                     if x.strip()]
-            if not items:
-                return ["遍历列表（未填写循环项）"]
-            more = f"，共 {len(items)} 项" if len(items) > 1 else ""
-            return [f"遍历列表：{items[0]}{more}"]
-        p = (data_source or {}).get("path", "")
-        return [f"数据源：{Path(p).name}" if p else "未配置数据源（点【项目管理…】→ 数据源与字段）"]
+        expr = (s.loop_expr or "").strip()
+        if not expr:
+            return ["循环内容（未填写）"]
+        if expr.isdigit():
+            return [f"循环 {expr} 次（{{{{loop.item}}}} 是序号，0 起）"]
+        return [f"循环：{expr[:60]}"]
     if s.action == "loop_end":
         return ["循环体到此结束"]
     if s.action == "condition_start":
@@ -208,7 +201,7 @@ class _ConnectHandle(QGraphicsItem):
 class NodeItem(QGraphicsItem):
     """步骤卡片。"""
 
-    def __init__(self, step: Step, data_source: dict, canvas: "FlowCanvas",
+    def __init__(self, step: Step, canvas: "FlowCanvas",
                  branch_text: str = ""):
         super().__init__()
         self.step = step
@@ -216,8 +209,8 @@ class NodeItem(QGraphicsItem):
         self._canvas = canvas
         self._name, color = ACTION_META.get(step.action, (step.action, "#888888"))
         self._color = QColor(color)
-        self._lines = step_summary(step, data_source, branch_text)
-        self._h = node_height_for(step, data_source)
+        self._lines = step_summary(step, branch_text)
+        self._h = node_height_for(step)
 
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
@@ -649,7 +642,6 @@ class FlowCanvas(QWidget):
         layout.addWidget(self._view)
 
         self._steps: List[Step] = []
-        self._data_source: dict = {}
         self._nodes: Dict[int, NodeItem] = {}
         self._edges: List[EdgeItem] = []
         self._edge_pairs: List[Tuple[EdgeItem, object, object]] = []
@@ -752,7 +744,7 @@ class FlowCanvas(QWidget):
         if not visible:
             return
         per_row = max(1, per_row or self.compute_per_row())
-        heights = [node_height_for(s, self._data_source) for s in visible]
+        heights = [node_height_for(s) for s in visible]
         # 块框会往外扩（层级越深越大），行距跟着放大，免得框压到上一行
         max_depth = max((sp.depth for sp in blocks.spans(steps)), default=0)
         gap_y = GAP_Y + 13.0 * (max_depth + 1)
@@ -788,7 +780,7 @@ class FlowCanvas(QWidget):
     # ------------------------------
     # 数据装载
     # ------------------------------
-    def load_steps(self, steps: List[Step], data_source: Optional[dict] = None,
+    def load_steps(self, steps: List[Step],
                    select_id: Optional[int] = None,
                    auto_layout: Optional[bool] = None,
                    keep_view: Optional[bool] = None):
@@ -798,8 +790,6 @@ class FlowCanvas(QWidget):
         :param keep_view: 是否保持当前视野。默认：重排/换项目→回到流程开头，
                           仅改内容→保持视野（避免编辑后视图乱跳）
         """
-        if data_source is not None:
-            self._data_source = data_source
         self._steps = steps
 
         if auto_layout is None:
@@ -843,7 +833,7 @@ class FlowCanvas(QWidget):
         for s in self._steps:
             if s.action in HIDDEN_ACTIONS:
                 continue        # 成对标记的结束端不画卡片（流程编辑里能看到）
-            node = NodeItem(s, self._data_source, self,
+            node = NodeItem(s, self,
                             branch_text=self._branch_text_of(s))
             # 块内的节点才给「连线小箭头」：最外层是自动连好的，不用手动连
             node.set_connectable(self._inside_block(s))
@@ -1244,15 +1234,12 @@ class FlowCanvas(QWidget):
                         if self._steps[k].action == "branch")
             return f"↳ 条件（{mode}：{step.cond_expr or '未填'}，{count} 个分支）"
         step = self._steps[sp.start]
-        src = (step.loop_source or "data") if step else "data"
-        if src == "range":
-            return f"↳ 循环体（{_range_summary(step.loop_range)}）"
-        if src == "list":
-            return "↳ 循环体（循环项列表，每一项重复）"
-        p = (self._data_source or {}).get("path", "")
-        if p:
-            return f"↳ 循环体（数据源：{Path(p).name}，对每一行重复）"
-        return "↳ 循环体（未配置数据源）"
+        expr = (step.loop_expr or "").strip()
+        if not expr:
+            return "↳ 循环体（还没填循环内容）"
+        if expr.isdigit():
+            return f"↳ 循环体（跑 {expr} 次）"
+        return f"↳ 循环体（{expr}，每一项重复）"
 
     # ------------------------------
     # 运行期刷新

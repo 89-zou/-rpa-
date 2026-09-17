@@ -175,6 +175,29 @@ def produced_variables(steps: List[Step]) -> Dict[str, Step]:
     return out
 
 
+def available_variables(steps: List[Step],
+                        project_variables: Optional[dict] = None) -> List[str]:
+    """步骤里可以插入的变量名（变量下拉 / 提示用）。
+
+    顺序：自定义变量 → 读取节点产出的列表变量 → 运行时变量
+    （{{loop.index}} 与各读取节点的 {{loop.item.字段}}）。
+    """
+    names: List[str] = list(project_variables or {})
+    produced = produced_variables(steps)
+    names.extend(produced)
+    names.extend(LOOP_VARS)
+    for node in produced.values():
+        for item in (node.data_cfg or {}).get("field_map") or []:
+            var = (item.get("var") or "").strip() if isinstance(item, dict) else ""
+            if var:
+                names.append(f"loop.item.{var}")
+    out: List[str] = []
+    for n in names:
+        if n and n not in out:
+            out.append(n)
+    return out
+
+
 def loop_fields(steps: List[Step], start: Step) -> List[str]:
     """这个循环遍历的数据有哪些字段（供 {{loop.item.字段}} 使用）。
 
