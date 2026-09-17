@@ -36,6 +36,8 @@ from smart_tool.core.desktop_uia import UiControl
 
 # 鼠标位置轮询间隔（毫秒）；太快会一直查 UIA，太慢会拖影
 POLL_MS = 40
+# 「让开屏幕」时给不能 hide() 的窗口用的坐标（挪到虚拟桌面外面）
+PARK_XY = -32000
 # 拖动超过这么多物理像素才算「手动框选」（否则当成点击）
 DRAG_MIN = 12
 # 框选最小尺寸
@@ -275,12 +277,13 @@ class DesktopPickerDialog(QDialog):
         self._left_down = False     # 左键按住中（由钩子事件维护）
         self._captured = False
         self._loop: Optional[QEventLoop] = None
-        self._hidden: list = []     # 捕获期间临时藏起来的自家窗口
+        self._hidden: list = []     # 捕获期间藏起来的自家窗口
+        self._parked: list = []     # 挪走的自家窗口：[(窗口, 原几何, 原窗口状态)]
         self._error = ""            # 上一轮出错的原因（显示在遮罩上）
 
         self.overlay = _Overlay(self)
         self.hook = InputHook(self._pending.append)
-        self._hooked = self.hook.install()
+        self._hooked = False        # 钩子在 run() 里才装（中途退出也要保证能卸掉）
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
 
@@ -306,36 +309,75 @@ class DesktopPickerDialog(QDialog):
             )
             return False
 
-        for w in QApplication.topLevelWidgets():
-            if w is self.overlay or w is self or not w.isVisible():
-                continue
-            try:
-                crash_guard.note("桌面捕获：临时隐藏本工具窗口")
-                w.hide()
-                self._hidden.append(w)
-            except Exception:
-                pass
-        crash_guard.note("桌面捕获：显示遮罩")
-        self.overlay.show()
-        self.overlay.raise_()
-        self.timer.start(POLL_MS)
-        self._loop = QEventLoop()
+        self._hooked = self.hook.install()
         try:
+            self._clear_screen()
+            crash_guard.note("桌面捕获：显示遮罩")
+            self.overlay.show()
+            self.overlay.raise_()
+            self.timer.start(POLL_MS)
+            self._loop = QEventLoop()
             self._loop.exec()
         finally:
             self._loop = None
             self.timer.stop()
-            self.hook.uninstall()
+            self.hook.uninstall()       # 漏卸的话它会一直吃掉鼠标点击
             self.overlay.hide()
-            for w in self._hidden:
-                try:
-                    w.show()
-                    w.raise_()
-                    w.activateWindow()
-                except Exception:
-                    pass
-            self._hidden = []
+            self._restore_screen()
         return bool(self.result_path)
+
+    # ------------------------------
+    # 让开屏幕 / 还原
+    # ------------------------------
+    def _clear_screen(self):
+        """捕获期间把本工具自己的窗口让开，好看清目标程序。
+
+        普通窗口直接 `hide()`；但**正在 exec() 的模态对话框绝对不能 hide()**：
+        Qt 的嵌套事件循环会当场返回 0（不是 Accepted），之后点【保存】就再也没
+        反应了，而且 Qt 的模态列表里会留下一个僵尸条目，反复几次整个界面就会
+        闪退。这类窗口改成「挪到虚拟桌面外面」——可见性没变，模态状态不受影响。
+        """
+        for w in QApplication.topLevelWidgets():
+            if w is self.overlay or w is self or not w.isVisible():
+                continue
+            try:
+                if w.isModal():
+                    self._park(w)
+                else:
+                    crash_guard.note("桌面捕获：临时隐藏本工具窗口")
+                    w.hide()
+                    self._hidden.append(w)
+            except Exception:
+                pass
+
+    def _park(self, w: QWidget):
+        """把窗口挪到屏幕外（原几何与窗口状态记下来，事后还原）。"""
+        state = w.windowState()
+        self._parked.append((w, w.geometry(), state))
+        if state & Qt.WindowState.WindowMaximized:
+            w.setWindowState(Qt.WindowState.WindowNoState)
+        w.move(PARK_XY, PARK_XY)
+
+    def _restore_screen(self):
+        for w in self._hidden:
+            try:
+                w.show()
+                w.raise_()
+                w.activateWindow()
+            except Exception:
+                pass
+        self._hidden = []
+        for w, geo, state in self._parked:
+            try:
+                w.setWindowState(Qt.WindowState.WindowNoState)
+                w.setGeometry(geo)
+                if state:
+                    w.setWindowState(state)
+                w.raise_()
+                w.activateWindow()
+            except Exception:
+                pass
+        self._parked = []
 
     # ------------------------------
     # 主循环
