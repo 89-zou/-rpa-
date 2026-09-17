@@ -822,14 +822,30 @@ class FlowCanvas(QWidget):
         return next((sp for sp in self._spans if sp.start == index), None)
 
     def _endpoint(self, ref):
-        """连线单元 → 端点对象（步骤卡片或块虚线框）；拿不到返回 None。"""
+        """连线单元 → 端点对象（步骤卡片或块框）。
+
+        - loop box → 块框（顶层外部连接用，loop 真的是整体黑盒）
+        - condition / branch box → **start 卡本身**（不连到框上，
+          箭头指向有业务含义的"条件判断"/"分支"卡片而不是视觉边界）
+        """
         if isinstance(ref, tuple):
-            sp = self._span_by_start(ref[1])
-            return _LoopBoxPort(self._span_rect(sp)) if sp else None
+            idx = ref[1]
+            sp = self._span_by_start(idx)
+            if sp is None:
+                return None
+            if sp.kind == "loop":
+                return _LoopBoxPort(self._span_rect(sp))
+            # condition / branch → start 卡本身
+            return self._nodes.get(self._steps[idx].id)
         return self._nodes.get(ref)
 
     def _units_in(self, lo: int, hi: int) -> List[object]:
-        """把 [lo, hi) 里的步骤按「单元」切开：块整块算一个单元。"""
+        """把 [lo, hi) 里的步骤按「单元」切开：块整块算一个单元。
+
+        但块的端点**不全是框**（见 _endpoint）：
+        - loop 的端点是框（顶层外部连接用）
+        - condition / branch 的端点是 start 卡本身（让箭头指向有业务含义的卡片，不连到框上）
+        """
         units: List[object] = []
         i = lo
         while i < hi:
@@ -899,12 +915,11 @@ class FlowCanvas(QWidget):
                 sp = self._span_by_start(u[1])
                 if sp is None:
                     continue
-                # 块入口/出口箭头（loop_start→循环体首、循环体末→循环框；
-                # 分支卡→分支体首、分支体末→条件框汇聚；条件卡→各分支由扇出处理）
                 self._build_block_io_edges(sp)
                 # 递归进入块内部：
                 #   loop/branch 内部步骤是顺序执行的 → draw=True
-                #   condition 内部是并行分支 → draw=False（只靠扇出 + 分支内部自己画）
+                #   condition 内部是并行分支 → draw=False（分支间没有顺序，
+                #   只有蓝扇出 + 各 branch 内部自己递归 draw=True）
                 self._collect_edges(
                     sp.inner_lo, sp.inner_hi,
                     draw=(sp.kind in ("loop", "branch")),
