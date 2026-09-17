@@ -737,8 +737,10 @@ class FlowCanvas(QWidget):
             self._scene.addItem(node)
             self._nodes[s.id] = node
 
-        self._build_edges()
+        # 先建框（让 _region_spans 有值），再建边——这样画边时 _span_rect 能拿到
+        # 完整的嵌套区域信息（入口/出口箭头要算块框坐标）
         self._build_regions()
+        self._build_edges()
 
         if not self._steps:
             self._placeholder = self._scene.addText(self._placeholder_text)
@@ -847,9 +849,11 @@ class FlowCanvas(QWidget):
 
         - 同一层里的相邻单元依次连线；
         - 循环块/条件块整块算一个单元，外部箭头直接接到框上；
-        - 循环体内部不画箭头；
-        - 条件框内部从「条件」节点扇出箭头指向各个「分支」（一眼看出会走哪几个分支）；
-        - 分支内部的步骤是顺序执行的，照常连线。
+        - 循环体内部：loop_start 卡 → 各步骤 → 循环框（顺序箭头）；
+        - 条件框内部：「条件」节点扇出蓝色箭头指向各个「分支」；
+          各分支内部画顺序箭头，分支末尾汇聚到条件框；
+        - 分支内部的步骤是顺序执行的，照常连线；
+        - 嵌套的循环/条件在块内部递归画箭头。
         """
         self._collect_edges(0, len(self._steps), draw=True)
         self._build_branch_fanout()
@@ -892,20 +896,90 @@ class FlowCanvas(QWidget):
                 sp = self._span_by_start(u[1])
                 if sp is None:
                     continue
-                # 分支里的步骤是顺序执行的 → 继续连线；循环体/条件内部不连
-                self._collect_edges(sp.inner_lo, sp.inner_hi,
-                                    draw=(sp.kind == "branch"))
+                # 块入口/出口箭头（loop_start→循环体首、循环体末→循环框；
+                # 分支卡→分支体首、分支体末→条件框汇聚；条件卡→各分支由扇出处理）
+                self._build_block_io_edges(sp)
+                # 递归进入块内部：
+                #   loop/branch 内部步骤是顺序执行的 → draw=True
+                #   condition 内部是并行分支 → draw=False（只靠扇出 + 分支内部自己画）
+                self._collect_edges(
+                    sp.inner_lo, sp.inner_hi,
+                    draw=(sp.kind in ("loop", "branch")),
+                )
+
+    def _build_block_io_edges(self, sp):
+        """画块的入口/出口箭头。
+
+        - loop：loop_start 卡 → 循环体第一单元；循环体最后单元 → 循环框
+        - branch：分支卡 → 分支体第一单元；分支体最后单元 → 条件框（汇聚）
+        - condition：入口由 _build_branch_fanout 处理（条件卡→各分支卡），
+          出口由各分支的出口箭头统一汇聚到条件框，这里不用画
+        """
+        if sp.kind == "condition":
+            return  # 条件块自己不画入口/出口，由分支的出口箭头汇聚
+        # 内部可见单元（不含开始标记本身）
+        # branch 的 inner_hi 是 end+1（右闭），其他块 inner_hi 是 end（不含结束标记）
+        inner_hi = sp.inner_hi if sp.kind == "branch" else sp.end
+        inner_units = self._units_in(sp.inner_lo, inner_hi)
+        if not inner_units:
+            return
+
+        # ---- 入口：开始标记卡 → 内部第一单元 ----
+        start_node = self._nodes.get(self._steps[sp.start].id)
+        first_ep = self._endpoint(inner_units[0])
+        if start_node and first_ep:
+            edge = EdgeItem(color="#9aa4b2")
+            self._scene.addItem(edge)
+            edge.connect_nodes(start_node, first_ep)
+            self._edges.append(edge)
+            self._edge_pairs.append((edge, start_node.step.id, inner_units[0]))
+
+        # ---- 出口：内部最后单元 → 块框 ----
+        last_ep = self._endpoint(inner_units[-1])
+        if sp.kind == "loop":
+            box_port = _LoopBoxPort(self._span_rect(sp))
+        elif sp.kind == "branch":
+            # 分支出口汇聚到所属条件框
+            cond = next(
+                (p for p in self._spans if p.kind == "condition"
+                 and p.start <= sp.start and p.end >= sp.end),
+                None,
+            )
+            if cond is None:
+                return
+            box_port = _LoopBoxPort(self._span_rect(cond))
+        else:
+            return
+        if last_ep and box_port:
+            edge = EdgeItem(color="#9aa4b2")
+            self._scene.addItem(edge)
+            edge.connect_nodes(last_ep, box_port)
+            self._edges.append(edge)
+            self._edge_pairs.append((edge, inner_units[-1], ("box", sp.start)))
 
     def _build_regions(self):
-        """循环 / 条件各画一个虚线框（嵌套时框也嵌套）；分支不画框。"""
+        """循环 / 条件各画一个虚线框（嵌套时框也嵌套）；分支不画框。
+
+        注意：先把所有 LoopRegion 对象都建好（此时 _span_rect 还不准，
+        因为子 region 可能还没注册到 _region_spans），然后按 depth 从大到小
+        重算 rect——内层先准确，外层 union 子层时才能拿到正确的框范围。
+        """
+        # 第一轮：创建所有 region 对象，先占位注册到列表里
+        pending: List[Tuple[LoopRegion, blocks.Span]] = []
         for sp in self._spans:
             if sp.kind not in REGION_COLORS:
                 continue        # 分支不套框：靠卡片与「条件→分支」箭头区分
             region = LoopRegion(REGION_COLORS[sp.kind], self, sp)
-            region.update_rect(self._span_rect(sp), self._region_label(sp))
             self._scene.addItem(region)
             self._regions.append(region)
             self._region_spans.append(sp)
+            pending.append((region, sp))
+
+        # 第二轮：按 depth 从大到小算 rect（内层先算）
+        # _direct_child_regions 会查 _region_spans，此时所有 span 都已注册
+        pending.sort(key=lambda r: r[1].depth, reverse=True)
+        for region, sp in pending:
+            region.update_rect(self._span_rect(sp), self._region_label(sp))
 
     # ------------------------------
     # 拖框 = 整块移动
@@ -931,9 +1005,12 @@ class FlowCanvas(QWidget):
         self.positions_changed.emit()
 
     def _span_rect(self, sp) -> QRectF:
-        """块框的矩形：把块里所有卡片圈起来，再按层级留白。"""
+        """块框的矩形：把块里所有卡片 + 所有直接子块的框（含它们自己的嵌套）
+        圈起来，再按层级留白。——这样外层框就不会被内层框超越。"""
         rect = QRectF()
-        for k in range(sp.start, max(sp.end, sp.inner_hi - 1) + 1):
+        # 1. 块自身覆盖范围内的所有卡片（含开始/结束标记卡，虽然结束标记已隐藏）
+        card_end = max(sp.end, sp.inner_hi - 1)
+        for k in range(sp.start, card_end + 1):
             if k >= len(self._steps):
                 break
             node = self._nodes.get(self._steps[k].id)
@@ -941,8 +1018,28 @@ class FlowCanvas(QWidget):
                 continue
             r = QRectF(node.pos().x(), node.pos().y(), NODE_W, node.node_height)
             rect = r if rect.isNull() else rect.united(r)
+        # 2. 所有被包含的子框（loop/condition）的矩形递归 union
+        #    不管中间隔了多少层（branch 不画框所以可能直接跳几层），
+        #    _build_regions 已按 depth 从大到小算过 rect，子框矩形此时准确
+        for child_sp in self._all_contained_regions(sp):
+            cr = self._span_rect(child_sp)
+            rect = cr if rect.isNull() else rect.united(cr)
         x1, y1, x2, y2 = _region_pad(sp.depth)
         return rect.adjusted(x1, y1, x2, y2)
+
+    def _all_contained_regions(self, parent_sp):
+        """parent_sp 内部所有被包含的子框（loop/condition），不管隔了多少层。
+
+        中间可能隔着 branch（不画框），所以不能只找 depth+1 的直接子。
+        _build_regions 已按 depth 从大到小算过 rect，所以内层的 rect 此时已经准确。
+        """
+        children = []
+        for sp in self._region_spans:
+            if sp is parent_sp:
+                continue
+            if sp.start >= parent_sp.start and sp.end <= parent_sp.end:
+                children.append(sp)
+        return children
 
     def _region_label(self, sp) -> str:
         """块框左上角的说明文字。"""
