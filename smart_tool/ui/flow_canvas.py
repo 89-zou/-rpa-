@@ -5,14 +5,12 @@
 - 默认【横向蛇形排版】：从左到右排列，超出宽度自动换行，
   下一行反向（右→左），使连线始终最短；可随时点【自动排版】重排
 - 「循环开始/结束」「条件/分支/条件结束」这类配套节点用虚线框圈在一起：
-  **结束端（循环结束 / 条件结束）在画布上不画卡片**（只在【流程编辑】里显示），
-  所有 block（loop / condition）在其父层都被折叠成黑盒——**框本身就是端点**，
-  父层只看到"黑盒进、黑盒出"，不关心 block 内部结构；block 自己内部的箭头由递归画：
-    - loop 内部：loop_start 卡 → 循环体第一单元（入口卡→卡）；
-      循环体最后单元 → loop 框（回路指向 loop 框底，框本身闭合回路）；
-      loop 体内再嵌套的 block 继续递归
-    - condition 内部：条件卡 → 各分支卡（蓝色扇出），每个分支卡 → 分支体步骤（顺序）
-    - branch 不画出口箭头（执行完自然走到条件结束）
+  **结束端（循环结束 / 条件结束）在画布上不画卡片**（只在【流程编辑】里显示）
+- 块的内部连线一律是「扇出」风格，不把块里的节点串成一串：
+    - **循环体**：从「循环开始」卡分别连线到循环体的每个顶层单元，
+      **单元之间不连线**（循环的重复由紫色虚线框表达）
+    - **条件**：条件卡 → 各分支卡（蓝色扇出），分支之间不连线
+    - **分支体**：分支卡 → 分支体第一单元，之后照常顺序连线（分支体是顺序执行的）
 - 虚线框只有循环（紫）和条件（蓝）两种：**分支不套框**（靠分支卡片与扇出箭头区分）
 - **拖虚线框＝整块移动**（块里嵌套的块与所有卡片一起走）；拖单个卡片仍是单独移动
 - 块可以嵌套（分支里放循环等），框按层级一层层套
@@ -826,15 +824,19 @@ class FlowCanvas(QWidget):
     def _endpoint(self, ref):
         """连线单元 → 端点对象（步骤卡片或块框）。
 
-        所有 block（loop / condition / branch）在其父层都被折叠成 box，
-        端点一律返回框（_LoopBoxPort）——这样父层只看到"黑盒进、黑盒出"，
-        不关心 block 内部结构，避免跨 block 的顺序箭头穿越大片空白。
-        block 自己内部的箭头（入口、回路、分支扇出等）由 _build_block_io_edges
-        和递归 _collect_edges 在内部画。
+        - loop box → 块框（顶层外部连接用，loop 真的是整体黑盒）
+        - condition / branch box → **start 卡本身**（不连到框上，
+          箭头指向有业务含义的"条件判断"/"分支"卡片而不是视觉边界）
         """
         if isinstance(ref, tuple):
-            sp = self._span_by_start(ref[1])
-            return _LoopBoxPort(self._span_rect(sp)) if sp else None
+            idx = ref[1]
+            sp = self._span_by_start(idx)
+            if sp is None:
+                return None
+            if sp.kind == "loop":
+                return _LoopBoxPort(self._span_rect(sp))
+            # condition / branch → start 卡本身
+            return self._nodes.get(self._steps[idx].id)
         return self._nodes.get(ref)
 
     def _units_in(self, lo: int, hi: int) -> List[object]:
@@ -864,15 +866,15 @@ class FlowCanvas(QWidget):
     def _build_edges(self):
         """分层连线。
 
-        - 同一层里的相邻单元依次连线；
-        - 循环块/条件块整块算一个单元，外部箭头直接接到框上；
-        - 循环体内部：loop_start 卡 → 各步骤 → 循环框（顺序箭头）；
-        - 条件框内部：「条件」节点扇出蓝色箭头指向各个「分支」；
-          各分支内部画顺序箭头，分支末尾汇聚到条件框；
-        - 分支内部的步骤是顺序执行的，照常连线；
-        - 嵌套的循环/条件在块内部递归画箭头。
+        - 顶层：相邻单元依次连线；循环 / 条件整块算一个单元；
+        - **循环体内部：从「循环开始」卡分别连线到循环体的每个顶层单元，
+          单元之间不连线**——和「条件 → 各分支」的展示风格一致，
+          循环的重复由紫色虚线框表达，不用箭头串成一串；
+        - 条件内部：「条件」卡扇出蓝色箭头指向各个「分支」，分支之间不连线；
+        - 分支内部：分支卡 → 分支体第一单元，之后照常顺序连线；
+        - 嵌套的块在内部递归处理（分支里放循环、循环里放条件都支持）。
         """
-        self._collect_edges(0, len(self._steps), draw=True)
+        self._collect_edges(0, len(self._steps), mode="seq")
         self._build_branch_fanout()
 
     def _build_branch_fanout(self):
@@ -896,78 +898,59 @@ class FlowCanvas(QWidget):
                 self._edges.append(edge)
                 self._edge_pairs.append((edge, cond_node.step.id, br_node.step.id))
 
-    def _collect_edges(self, lo: int, hi: int, draw: bool):
-        units = self._units_in(lo, hi)
-        if draw:
-            for k in range(len(units) - 1):
-                a, b = self._endpoint(units[k]), self._endpoint(units[k + 1])
-                if a is None or b is None:
-                    continue
-                edge = EdgeItem(color="#9aa4b2")
-                self._scene.addItem(edge)
-                edge.connect_nodes(a, b)
-                self._edges.append(edge)
-                self._edge_pairs.append((edge, units[k], units[k + 1]))
-        for u in units:
-            if isinstance(u, tuple):
-                sp = self._span_by_start(u[1])
-                if sp is None:
-                    continue
-                self._build_block_io_edges(sp)
-                # 递归进入块内部：
-                #   loop/branch 内部步骤是顺序执行的 → draw=True
-                #   condition 内部是并行分支 → draw=False（分支间没有顺序，
-                #   只有蓝扇出 + 各 branch 内部自己递归 draw=True）
-                self._collect_edges(
-                    sp.inner_lo, sp.inner_hi,
-                    draw=(sp.kind in ("loop", "branch")),
-                )
+    def _collect_edges(self, lo: int, hi: int, mode: str = "seq", hub=None):
+        """给 [lo, hi) 里的顶层单元连线，并递归处理里面嵌套的块。
 
-    def _build_block_io_edges(self, sp):
-        """画块的入口/出口箭头。
-
-        - loop：loop_start 卡 → 循环体第一单元（入口）；循环体最后单元 → loop 框（回路，
-          让 loop 框本身承担回路的终点，形成视觉闭环，不再连 loop_start 卡）
-        - branch：分支卡 → 分支体第一单元；**没有出口箭头**
-          （分支执行完自然走到条件结束，不需要额外箭头标示）
-        - condition：入口由 _build_branch_fanout 处理（条件卡→各分支卡），
-          不需要画出口
+        :param mode: "seq"    相邻单元依次连线（顶层与分支体内部用）
+                     "fanout" 从 hub 卡分别连到每个单元，**单元之间不连线**
+                              （循环体内部用，和「条件 → 各分支」风格一致）
+                     "none"   本层不连线（条件的直接内部由蓝扇出表达）
+        :param hub:  fanout 模式的起点卡片（循环的「循环开始」卡）
         """
-        if sp.kind == "condition":
+        units = self._units_in(lo, hi)
+        if mode == "seq":
+            for k in range(len(units) - 1):
+                self._add_edge(units[k], units[k + 1])
+        elif mode == "fanout" and hub is not None:
+            for u in units:
+                self._add_edge(hub.step.id, u)
+
+        for u in units:
+            if not isinstance(u, tuple):
+                continue
+            sp = self._span_by_start(u[1])
+            if sp is None:
+                continue
+            if sp.kind == "loop":
+                # 循环体：从「循环开始」卡扇出到每个顶层单元
+                start_node = self._nodes.get(self._steps[sp.start].id)
+                self._collect_edges(sp.inner_lo, sp.inner_hi,
+                                    mode="fanout", hub=start_node)
+            elif sp.kind == "branch":
+                # 分支：分支卡 → 分支体第一单元，分支体内部顺序连线
+                self._add_branch_entry(sp)
+                self._collect_edges(sp.inner_lo, sp.inner_hi, mode="seq")
+            else:
+                # 条件：内部只有「条件 → 各分支」的蓝扇出，分支之间没有顺序
+                self._collect_edges(sp.inner_lo, sp.inner_hi, mode="none")
+
+    def _add_edge(self, ref_a, ref_b) -> None:
+        """连一条灰色箭头（任一端拿不到就跳过）。"""
+        a, b = self._endpoint(ref_a), self._endpoint(ref_b)
+        if a is None or b is None:
             return
-        # 内部可见单元（不含开始标记本身）
-        # branch 的 inner_hi 是 end+1（右闭），其他块 inner_hi 是 end（不含结束标记）
-        inner_hi = sp.inner_hi if sp.kind == "branch" else sp.end
-        inner_units = self._units_in(sp.inner_lo, inner_hi)
+        edge = EdgeItem(color="#9aa4b2")
+        self._scene.addItem(edge)
+        edge.connect_nodes(a, b)
+        self._edges.append(edge)
+        self._edge_pairs.append((edge, ref_a, ref_b))
+
+    def _add_branch_entry(self, sp) -> None:
+        """分支卡 → 分支体第一单元（分支没有出口箭头：执行完自然走到条件结束）。"""
+        inner_units = self._units_in(sp.inner_lo, sp.inner_hi)
         if not inner_units:
             return
-
-        start_node = self._nodes.get(self._steps[sp.start].id)
-        first_ep = self._endpoint(inner_units[0])
-
-        # ---- 入口：开始标记卡 → 内部第一单元（loop 与 branch 都画） ----
-        if start_node and first_ep:
-            edge = EdgeItem(color="#9aa4b2")
-            self._scene.addItem(edge)
-            edge.connect_nodes(start_node, first_ep)
-            self._edges.append(edge)
-            self._edge_pairs.append((edge, start_node.step.id, inner_units[0]))
-
-        # ---- 出口：只给 loop 画 → **loop 框**形成回路（不连 loop_start 卡） ----
-        # 让 loop 框本身成为回路的视觉终点，合并"从条件回来"的长路径
-        # branch 不画出口，condition 也不画（扇出已经表达了并行结构）
-        if sp.kind != "loop":
-            return
-        last_ep = self._endpoint(inner_units[-1])
-        box_port = _LoopBoxPort(self._span_rect(sp))
-        if last_ep and box_port:
-            edge = EdgeItem(color="#9aa4b2")
-            self._scene.addItem(edge)
-            edge.connect_nodes(last_ep, box_port)
-            self._edges.append(edge)
-            # ref 存 ("box", sp.start)，这样 scene_refresh_overlays 刷新时
-            # _endpoint 会返回 loop 框，回路始终指向框底
-            self._edge_pairs.append((edge, inner_units[-1], ("box", sp.start)))
+        self._add_edge(self._steps[sp.start].id, inner_units[0])
 
     def _build_regions(self):
         """循环 / 条件各画一个虚线框（嵌套时框也嵌套）；分支不画框。
