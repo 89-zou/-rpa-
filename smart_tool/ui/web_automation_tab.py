@@ -17,7 +17,6 @@ from smart_tool.core.project_store import ProjectStore, Step, list_projects
 from smart_tool.core.step_executor import (
     PauseHandle, StepExecutor, check_variables,
 )
-from smart_tool.ui.data_source_dialog import DataSourceDialog
 from smart_tool.ui.flow_canvas import (
     DEFAULT_PLACEHOLDER, LAYOUT_VERSION, NO_PROJECT_PLACEHOLDER, FlowCanvas,
 )
@@ -123,18 +122,16 @@ class WebAutomationTab(QWidget):
         self.btn_load.setToolTip("从项目文件夹中选择要运行的项目")
         self.btn_load.clicked.connect(self._open_project_picker)
         proj_layout.addWidget(self.btn_load)
-        self.btn_manage = QPushButton("变量管理…")
-        self.btn_manage.setToolTip("管理当前项目的变量、批量删除项目")
+        self.btn_manage = QPushButton("项目管理…")
+        self.btn_manage.setToolTip(
+            "项目列表、数据源与字段、变量都在这里管（原来的【数据源…】已并入）"
+        )
         self.btn_manage.clicked.connect(self._open_project_manager)
         proj_layout.addWidget(self.btn_manage)
         layout.addLayout(proj_layout)
 
         # 编辑按钮条
         edit_layout = QHBoxLayout()
-        self.btn_data = QPushButton("数据源…")
-        self.btn_data.clicked.connect(self._edit_data_source)
-        edit_layout.addWidget(self.btn_data)
-        edit_layout.addSpacing(12)
         self.btn_flow_edit = QPushButton("流程编辑…")
         self.btn_flow_edit.clicked.connect(self._open_flow_editor)
         edit_layout.addWidget(self.btn_flow_edit)
@@ -289,7 +286,7 @@ class WebAutomationTab(QWidget):
                                      layout_version=LAYOUT_VERSION)
 
     def _open_project_manager(self):
-        """打开变量管理弹窗（变量增删改 + 批量删除项目）。"""
+        """打开【项目管理】：项目列表 + 数据源与字段 + 变量清单。"""
         if self._worker is not None:
             QMessageBox.warning(self, "提示", "执行进行中，请先停止再管理项目。")
             return
@@ -303,25 +300,11 @@ class WebAutomationTab(QWidget):
             self._append_log("当前项目已被删除，请重新载入项目。")
             self._clear_project()
         elif self._current_store:
-            # 变量可能在弹窗里被改过，刷新画布上的数据源标签与变量下拉
+            # 数据源/变量可能在弹窗里改过，刷新画布上的数据源标签与变量下拉
             self._data_source = self._current_store.load_data_source()
             self.canvas.load_steps(self._steps, self._data_source)
 
-    # ------------------------------
-    # 数据源
-    # ------------------------------
-    def _edit_data_source(self):
-        if not self._require_project():
-            return
-        dlg = DataSourceDialog(self._data_source, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._data_source = dlg.get_config()
-            self._current_store.save_data_source(self._data_source)
-            # 刷新循环区域标签
-            self.canvas.load_steps(self._steps, self._data_source)
-            self._append_log(f"数据源已设置：{self._data_source.get('path', '')}")
-
-    # 说明：换数据文件夹已并入【变量管理…】（那边能看到数据源实际匹配到几行）
+    # 说明：数据源与变量的设置都并入【项目管理…】了
 
     # ------------------------------
     # 选择 / 按钮状态
@@ -338,7 +321,6 @@ class WebAutomationTab(QWidget):
     def _update_edit_buttons(self):
         """按项目/运行状态切换按钮。"""
         editable = self._worker is None and self._current_store is not None
-        self.btn_data.setEnabled(editable)
         self.btn_flow_edit.setEnabled(editable)
         self.btn_layout.setEnabled(editable)
         self.btn_new.setEnabled(self._worker is None)
@@ -392,7 +374,7 @@ class WebAutomationTab(QWidget):
             "检测到以下变量当前没有来源，运行时会被替换成空值或占位文字：\n\n"
             + "\n".join(f"· {p}" for p in problems[:8])
             + ("\n…" if len(problems) > 8 else "")
-            + "\n\n建议先在【数据源…】里配置字段映射，或忽略本次提示继续运行。\n"
+            + "\n\n建议先在【项目管理…】→【数据源与字段】里配置字段映射，或忽略本次提示继续运行。\n"
               "仍要继续吗？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,

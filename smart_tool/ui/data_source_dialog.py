@@ -1,23 +1,28 @@
 # -*- coding: utf-8 -*-
-"""数据源配置对话框：选择本地文件（xlsx/xls/json/txt）或文件夹，
-读取预览后可勾选「要保存哪些变量」并自由改名。
+"""数据源面板：选文件/文件夹 → 读取预览 → 勾选要保存哪些变量。
+
+原来是一个独立的【数据源设置】弹窗；现在并入【项目管理】的第一个页签
+「数据源与字段」——数据源设置本来就是「初步确定变量从哪来」的那一步。
+
+面板直接读写传进来的 ProjectStore，改动**立即落盘**（和变量清单一致，
+不需要点保存）；父窗口收到 changed 信号后刷新另一个页签。
 
 配置存到 steps.json 的 data_source 节；循环方式选「数据源」的循环节点，
 其循环体会对读到的每一行重复执行，行内字段以 {{变量名}} 引用。
 """
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
-    QTextEdit, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from smart_tool.core import data_sources
 from smart_tool.core.data_sources import DataSourceConfig
+from smart_tool.core.project_store import ProjectStore
 
 TYPE_OPTIONS = [
     ("excel", "Excel 表格（.xlsx/.xls，按表头列名循环）"),
@@ -39,28 +44,35 @@ def set_row_visible(form: QFormLayout, widget: QWidget, visible: bool):
         label.setVisible(visible)
 
 
-class DataSourceDialog(QDialog):
-    """配置并预览数据源。"""
+class DataSourcePanel(QWidget):
+    """数据源 + 字段勾选（嵌在【项目管理】的页签里）。"""
 
-    def __init__(self, current: Optional[dict] = None, parent=None):
+    changed = pyqtSignal()          # 配置已落盘，父窗口可刷新变量清单
+
+    def __init__(self, store: ProjectStore, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("数据源设置")
-        self.setMinimumSize(760, 620)
-        self._cfg = DataSourceConfig.from_dict(current)
+        self._store = store
+        self._cfg = DataSourceConfig.from_dict(store.load_data_source())
         # 之前是否已经挑过变量：挑过的话，预览时「新发现的变量」默认不勾选，
         # 免得点一次【读取预览】就把用户之前不要的变量又加回来
         self._picked_before = bool(self._cfg.vars_picked)
+        # 「挑过变量」这个状态要单独记住：清空字段后表格是空的，
+        # 但不能退回「没挑过 → 产出全部变量」
+        self._vars_picked = bool(self._cfg.vars_picked)
+        self._loading = False
+        self._var_table_type = None
         self._init_ui()
         self._load_cfg()
-        self._on_type_changed()
+        self._on_type_changed(save=False)
 
     # ------------------------------
     # UI
     # ------------------------------
     def _init_ui(self):
         root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
 
-        box = QGroupBox("数据源")
+        box = QGroupBox("数据源（这里决定变量从哪个文件/文件夹来）")
         self.form = QFormLayout(box)
 
         self.type_combo = QComboBox()
@@ -73,7 +85,8 @@ class DataSourceDialog(QDialog):
         pl = QHBoxLayout(path_row)
         pl.setContentsMargins(0, 0, 0, 0)
         self.path_edit = QLineEdit()
-        self.path_edit.setPlaceholderText("预设路径，例如 D:\\政策数据提取\\输出数据")
+        self.path_edit.setPlaceholderText(r"预设路径，例如 D:\政策数据提取\输出数据")
+        self.path_edit.editingFinished.connect(self._on_path_edited)
         pl.addWidget(self.path_edit, 1)
         self.btn_browse = QPushButton("浏览…")
         self.btn_browse.clicked.connect(self._browse)
@@ -83,46 +96,39 @@ class DataSourceDialog(QDialog):
         # Excel 专用
         self.sheet_edit = QLineEdit()
         self.sheet_edit.setPlaceholderText("留空取第一个工作表")
+        self.sheet_edit.editingFinished.connect(self._save)
         self.form.addRow("工作表：", self.sheet_edit)
         self.header_check = QCheckBox("首行是表头（变量名为列名，如 {{row.标题}}）")
         self.header_check.setChecked(True)
+        self.header_check.stateChanged.connect(self._save)
         self.form.addRow("", self.header_check)
 
         # 文本类专用（txt / folder / json 都要用编码）
         self.encoding_combo = QComboBox()
         self.encoding_combo.addItems(ENCODING_OPTIONS)
+        self.encoding_combo.currentTextChanged.connect(self._save)
         self.form.addRow("文本编码：", self.encoding_combo)
         self.pattern_edit = QLineEdit("*.txt")
         self.pattern_edit.setPlaceholderText("*.txt（也可 *.md 等）")
+        self.pattern_edit.editingFinished.connect(self._save)
         self.form.addRow("文件通配：", self.pattern_edit)
         self.recursive_check = QCheckBox("递归子文件夹（如 输出数据/标题/正文.txt 结构）")
         self.recursive_check.setChecked(True)
+        self.recursive_check.stateChanged.connect(self._save)
         self.form.addRow("", self.recursive_check)
 
         root.addWidget(box)
         root.addWidget(self._build_var_box(), 1)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("保存")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
-
-    # ------------------------------
-    # 变量（勾选 + 改名）
-    # ------------------------------
     def _build_var_box(self) -> QGroupBox:
-        box = QGroupBox("变量（勾选要保存的变量，可自由改名）")
+        box = QGroupBox("字段（勾选要保存的变量，可自由改名）")
         lay = QVBoxLayout(box)
 
         tip = QLabel(
-            "点【读取预览】列出这个数据源能读到的全部变量，然后：\n"
-            "· 勾选「保存」＝ 这个变量会保存到项目里，步骤中可用 {{变量名}} 引用\n"
-            "· 「变量名」可直接双击修改，例如把 文件内容 改名为 row.正文\n"
-            "· 没勾选的变量不会保存，也不会出现在变量下拉里"
+            "点【读取预览】列出这个数据源能读到的全部字段，然后：\n"
+            "· 勾选「保存」＝ 这个字段变成一个项目变量，步骤里用 {{变量名}} 引用\n"
+            "· 「变量名」可直接双击改，例如把 文件内容 改名为 内容\n"
+            "· 换了路径或类型，这里的清单会清空，需要重新读取预览再勾一次"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color: #777;")
@@ -140,7 +146,7 @@ class DataSourceDialog(QDialog):
         row.addWidget(self.btn_none)
         self.btn_rename = QPushButton("常用命名：标题 / 正文")
         self.btn_rename.setToolTip(
-            "把 父文件夹名 → row.标题、文件内容 → row.正文（仅文件类数据源）"
+            "把 父文件夹名 → 标题、文件内容 → 内容（仅文件类数据源）"
         )
         self.btn_rename.clicked.connect(self._apply_common_names)
         row.addWidget(self.btn_rename)
@@ -159,6 +165,7 @@ class DataSourceDialog(QDialog):
         self.var_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
+        self.var_table.itemChanged.connect(self._on_var_item_changed)
         lay.addWidget(self.var_table, 1)
 
         self.var_hint = QTextEdit()
@@ -168,6 +175,9 @@ class DataSourceDialog(QDialog):
         lay.addWidget(self.var_hint)
         return box
 
+    # ------------------------------
+    # 变量表：增行 / 收集
+    # ------------------------------
     def _add_var_row(self, src_key: str, var: str = "", checked: bool = True,
                      sample: str = ""):
         """插入一行变量：勾选 + 变量名（可改）+ 来源 + 取值。"""
@@ -200,15 +210,19 @@ class DataSourceDialog(QDialog):
 
     def _check_all(self, checked: bool):
         state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        self._loading = True
         for r in range(self.var_table.rowCount()):
             item = self.var_table.item(r, COL_KEEP)
             if item is not None:
                 item.setCheckState(state)
+        self._loading = False
+        self._save()
 
     def _apply_common_names(self):
-        """一键把文件类数据源改成常用的 row.标题 / row.正文。"""
-        common = {"file.parent_name": "row.标题", "file.content": "row.正文"}
+        """一键把文件类数据源改成常用的 标题 / 内容。"""
+        common = {"file.parent_name": "标题", "file.content": "内容"}
         hit = 0
+        self._loading = True
         for r in range(self.var_table.rowCount()):
             keep = self.var_table.item(r, COL_KEEP)
             name = self.var_table.item(r, COL_NAME)
@@ -219,12 +233,15 @@ class DataSourceDialog(QDialog):
                 name.setText(var)
                 keep.setCheckState(Qt.CheckState.Checked)
                 hit += 1
+        self._loading = False
         if not hit:
             QMessageBox.information(
                 self, "提示",
                 "当前表格里没有「父文件夹名 / 文件内容」这两个来源，"
                 "请先点【读取预览】。",
             )
+            return
+        self._save()
 
     def _collect_field_map(self) -> List[Dict[str, str]]:
         """收集勾选的变量 → field_map（未勾选的不保存）。"""
@@ -245,7 +262,7 @@ class DataSourceDialog(QDialog):
     # ------------------------------
     # 联动：只显示当前类型用得上的选项
     # ------------------------------
-    def _on_type_changed(self):
+    def _on_type_changed(self, _=None, save: bool = True):
         t = self.type_combo.currentData()
         is_file = t in ("txt", "folder")
 
@@ -255,12 +272,9 @@ class DataSourceDialog(QDialog):
         set_row_visible(self.form, self.pattern_edit, t == "folder")
         set_row_visible(self.form, self.recursive_check, t == "folder")
 
-        # 已填的变量与类型不匹配时（换类型），清空重来
-        keep_type = getattr(self, "_var_table_type", None)
-        if keep_type is not None and keep_type != t:
-            self.var_table.setRowCount(0)
-            self.summary_label.setText("尚未读取")
-            self.var_hint.clear()
+        # 类型变了：已勾的字段与类型不匹配，清空重来
+        if self._var_table_type is not None and self._var_table_type != t:
+            self._clear_fields("类型已修改，请重新【读取预览】再勾选")
         self._var_table_type = t
 
         if t == "excel":
@@ -272,28 +286,76 @@ class DataSourceDialog(QDialog):
         else:
             self.path_edit.setPlaceholderText(r"D:\政策数据提取\输出数据")
         self.btn_rename.setVisible(is_file)
+        if save:
+            self._save()
+
+    def _clear_fields(self, hint: str):
+        """清空字段清单（换路径 / 换类型时用：等于「清空重选」）。
+
+        注意把「挑过变量」的状态留住：否则配置文件里会退回
+        「没挑过 → 产出全部原始变量」，那就跟用户的意思正好相反了。
+        """
+        self._vars_picked = True
+        self._loading = True
+        self.var_table.setRowCount(0)
+        self._loading = False
+        self.summary_label.setText(hint)
+        self.var_hint.clear()
+
+    def _on_path_edited(self):
+        """手改了路径：旧字段作废，清空重选。"""
+        if self.path_edit.text().strip() == (self._cfg.path or ""):
+            return
+        self._clear_fields("路径已修改，请重新【读取预览】再勾选")
+        self._save()
 
     def _browse(self):
+        """换地址：按类型选文件夹 / 文件；选完清空字段重来。"""
+        if not self.pick_path():
+            return
+        self._save()
+
+    def pick_path(self) -> bool:
+        """弹出选择框换路径；真的换了返回 True（字段清单同时清空）。"""
         t = self.type_combo.currentData()
+        cur = self.path_edit.text().strip()
         if t == "folder":
-            path = QFileDialog.getExistingDirectory(self, "选择数据文件夹")
+            path = QFileDialog.getExistingDirectory(
+                self, "选择数据文件夹",
+                cur if cur and Path(cur).is_dir() else str(Path.home()),
+            )
         else:
             filt = {
                 "excel": "Excel (*.xlsx *.xls)",
                 "json": "JSON (*.json)",
                 "txt": "文本 (*.txt *.md *.csv *.log);;所有文件 (*.*)",
             }.get(t, "所有文件 (*.*)")
-            path, _ = QFileDialog.getOpenFileName(self, "选择数据文件", "", filt)
-        if path:
-            self.path_edit.setText(path)
-            # 路径换了，旧预览作废
-            self.summary_label.setText("路径已修改，请重新【读取预览】")
+            start_dir = str(Path(cur).parent) if cur else str(Path.home())
+            path, _ = QFileDialog.getOpenFileName(
+                self, "选择数据文件", start_dir, filt
+            )
+        if not path or path == cur:
+            return False
+        self.path_edit.setText(path)
+        self._clear_fields("路径已修改，请重新【读取预览】再勾选")
+        self._save()
+        return True
 
     # ------------------------------
-    # 数据
+    # 数据：读 / 存
     # ------------------------------
+    def load(self, store: ProjectStore):
+        """切换项目时重新载入。"""
+        self._store = store
+        self._cfg = DataSourceConfig.from_dict(store.load_data_source())
+        self._picked_before = bool(self._cfg.vars_picked)
+        self._vars_picked = bool(self._cfg.vars_picked)
+        self._load_cfg()
+        self._on_type_changed(save=False)
+
     def _load_cfg(self):
         c = self._cfg
+        self._loading = True
         if c.type:
             self.type_combo.setCurrentIndex(max(0, self.type_combo.findData(c.type)))
         self.path_edit.setText(c.path)
@@ -302,6 +364,7 @@ class DataSourceDialog(QDialog):
         self.encoding_combo.setCurrentText(c.encoding if c.encoding else "auto")
         self.pattern_edit.setText(c.pattern or "*.txt")
         self.recursive_check.setChecked(c.recursive)
+        self._var_table_type = self.type_combo.currentData()
         # 已挑选的变量：直接列出（取值待读取预览后补上）
         self.var_table.setRowCount(0)
         for m in c.field_map:
@@ -309,8 +372,15 @@ class DataSourceDialog(QDialog):
             src = data_sources.resolve_src_key(c.type, m.get("field", ""))
             if src:
                 self._add_var_row(src, m.get("var", ""), checked=True)
+        self._loading = False
+        if self.var_table.rowCount():
+            self.summary_label.setText(
+                f"已保存 {self.var_table.rowCount()} 个变量（点【读取预览】可复核取值）"
+            )
+        else:
+            self.summary_label.setText("尚未读取")
 
-    def _collect(self) -> DataSourceConfig:
+    def config(self) -> DataSourceConfig:
         return DataSourceConfig(
             type=self.type_combo.currentData(),
             path=self.path_edit.text().strip(),
@@ -320,12 +390,25 @@ class DataSourceDialog(QDialog):
             pattern=self.pattern_edit.text().strip() or "*.txt",
             recursive=self.recursive_check.isChecked(),
             field_map=self._collect_field_map(),
-            # 表格里有行＝这次挑过变量；一行都没有＝保持「全部原始变量」
-            vars_picked=self.var_table.rowCount() > 0,
+            # 挑过变量（表格里有行，或者刚被清空过）＝ 只产出清单里的；
+            # 从没挑过才保持「产出全部原始变量」（兼容旧项目）
+            vars_picked=self._vars_picked or self.var_table.rowCount() > 0,
         )
 
+    def _save(self):
+        """收集当前设置并落盘（改哪一项都会走到这里）。"""
+        if self._loading:
+            return
+        self._cfg = self.config()
+        self._store.save_data_source(self._cfg.to_dict())
+        self.changed.emit()
+
+    def _on_var_item_changed(self, item: QTableWidgetItem):
+        if item.column() in (COL_KEEP, COL_NAME):
+            self._save()
+
     def _preview(self):
-        cfg = self._collect()
+        cfg = self.config()
         if not cfg.path:
             QMessageBox.warning(self, "提示", "请先填写或选择路径。")
             return
@@ -347,14 +430,17 @@ class DataSourceDialog(QDialog):
                                  name.text())
 
         first = rows[0] if rows else {}
+        self._loading = True
         self.var_table.setRowCount(0)
         for key in columns:
             # 已挑过的配置：新出现的列默认不勾（尊重之前的挑选结果）
             checked, name = previous.get(key, (not self._picked_before, key))
             self._add_var_row(key, name, checked=checked, sample=first.get(key, ""))
+        self._loading = False
 
-        self.summary_label.setText(f"共 {total} 行，发现 {len(columns)} 个变量")
+        self.summary_label.setText(f"共 {total} 行，发现 {len(columns)} 个字段")
         self._refresh_hint(first, total)
+        self._save()
 
     def _refresh_hint(self, first: Dict[str, str], total: int):
         """底部说明：引用写法 + 各变量取到多少内容（含空值警告）。"""
@@ -385,37 +471,10 @@ class DataSourceDialog(QDialog):
                 )
         self.var_hint.setPlainText("\n".join(lines))
 
-    def _on_accept(self):
-        cfg = self._collect()
-        p = Path(cfg.path) if cfg.path else None
-        if not cfg.path:
-            QMessageBox.warning(self, "提示", "请填写数据路径。")
-            return
-        if cfg.type == "folder" and p and not p.is_dir():
-            QMessageBox.warning(self, "提示", "文件夹路径不存在，请检查。")
-            return
-        if cfg.type != "folder" and p and not p.is_file():
-            QMessageBox.warning(self, "提示", "文件不存在，请检查路径。")
-            return
-        if not cfg.field_map and self.var_table.rowCount():
-            QMessageBox.warning(
-                self, "提示",
-                "当前一个变量都没勾选，运行时会取不到数据。\n"
-                "请至少勾选「文件内容」这类要用的变量。",
-            )
-            return
-        self._cfg = cfg
-        self.accept()
-
-    def get_config(self) -> dict:
-        return self._cfg.to_dict()
-
 
 def _short(text: str) -> str:
     """表格里显示用的短文本（长内容截断并标注总字数）。"""
     if not text:
         return ""
     one = " ".join(text.split())
-    if len(one) > 60:
-        return f"{one[:60]}…（共 {len(text)} 字）"
-    return one
+    return one if len(one) <= 60 else one[:60] + f"…（共 {len(one)} 字）"

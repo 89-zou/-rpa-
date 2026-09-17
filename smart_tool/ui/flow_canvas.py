@@ -140,7 +140,7 @@ def step_summary(s: Step, data_source: dict,
             more = f"，共 {len(items)} 项" if len(items) > 1 else ""
             return [f"遍历列表：{items[0]}{more}"]
         p = (data_source or {}).get("path", "")
-        return [f"数据源：{Path(p).name}" if p else "未配置数据源（请点【数据源…】）"]
+        return [f"数据源：{Path(p).name}" if p else "未配置数据源（点【项目管理…】→ 数据源与字段）"]
     if s.action == "loop_end":
         return ["循环体到此结束"]
     if s.action == "condition_start":

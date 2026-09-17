@@ -420,7 +420,7 @@ def without_variable(cfg: DataSourceConfig,
     """返回「去掉某个变量」后的新配置；失败返回 None。
 
     没挑过变量时，先按当前数据源物化出全部变量清单，再删掉目标——
-    这样在【变量管理】里删掉一个数据源变量，就真的不再产出它。
+    这样在【项目管理…】里删掉一个数据源变量，就真的不再产出它。
     """
     items = [dict(m) for m in cfg.field_map]
     if not cfg.vars_picked:
