@@ -330,10 +330,16 @@ class FlowEditorDialog(QDialog):
             self.project_dir, None, self,
             variable_names=step_executor.available_variables(
                 self._steps, self.project_variables),
+            default_url=self._default_url(),
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             return dlg.get_step()
         return None
+
+    def _default_url(self) -> str:
+        """元素捕获默认打开的地址：项目里第一个「打开网页」。"""
+        return next((s.url for s in self._steps
+                     if s.action == "navigate" and s.url), "")
 
     def _add_step(self):
         """新增：插到选中行之后（在循环里就留在循环里）；没选中则追加到末尾。"""
@@ -380,6 +386,7 @@ class FlowEditorDialog(QDialog):
             self.project_dir, old, self,
             variable_names=step_executor.available_variables(
                 self._steps, self.project_variables),
+            default_url=self._default_url(),
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return

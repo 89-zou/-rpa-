@@ -69,6 +69,12 @@ def _looks_invalid_selector(msg: str) -> bool:
     return any(h in low for h in INVALID_SELECTOR_HINTS)
 
 
+def _first_line(err: Exception, limit: int = 120) -> str:
+    """异常信息的第一行（Playwright 的报错动辄几十行，日志里只留第一行）。"""
+    text = str(err).strip()
+    return text.splitlines()[0][:limit] if text else type(err).__name__
+
+
 def _literal(value: str) -> str:
     """把变量值渲染成 Python 字面量：能当数字就当数字，否则当带引号的字符串。"""
     text = (value or "").strip()
@@ -782,33 +788,83 @@ class StepExecutor:
         loc = self._resolve_xpath(step.locator)
         try:
             loc.click(timeout=CLICK_TIMEOUT_MS)
-        except PlaywrightTimeout as e:
+        except Exception as e:
+            if self._retry_by_image(step, f"点击没成功（{_first_line(e)}）"):
+                return
             raise TimeoutError(
                 f"等不到可点击的元素（{CLICK_TIMEOUT_MS // 1000}s）：{step.locator.value}\n"
                 f"   当前页面：{self._current_url() or '（正在跳转中）'}\n"
                 "   多半是上一步之后没跳到你以为的页面，或这个 XPath 属于另一个页面。"
             ) from e
 
+    # ------------------------------
+    # 兜底：XPath 不行就改用元素截图定位
+    # ------------------------------
+    @staticmethod
+    def _fallback_image(step: Step) -> str:
+        """这个步骤配的兜底截图（没配返回空串）。"""
+        loc = step.locator
+        if loc is None or loc.type != "xpath":
+            return ""
+        return (loc.image or "").strip()
+
+    def _retry_by_image(self, step: Step, why: str) -> bool:
+        """XPath 动作失败时，若配了兜底截图就改用截图定位点一下。
+
+        返回是否成功；没配截图或截图也没匹配上返回 False，
+        交给调用方抛它原来那个错误（报错信息更准确）。
+        """
+        image = self._fallback_image(step)
+        if not image:
+            return False
+        self.log(f"  {why} → 改用兜底截图定位：{Path(image).name}")
+        try:
+            m = self._locate_by_image(Locator(type="image", value=image))
+        except Exception as e:
+            self.log(f"  兜底截图也没匹配上：{_first_line(e)}")
+            return False
+        self._page.mouse.click(m.x, m.y)
+        self.log(f"  已按截图坐标点击（置信度 {m.confidence:.2f}）")
+        return True
+
+    def _fill_by_image(self, locator: Locator, text: str):
+        """截图定位没有 DOM 句柄：点击聚焦 → 全选清空 → 插入文本。
+
+        insertText 直接走输入法通道，中文等非 ASCII 字符也能可靠写入。
+        """
+        m = self._locate_by_image(locator)
+        self._page.mouse.click(m.x, m.y)
+        self._page.keyboard.press("Control+A")
+        self._page.keyboard.press("Delete")
+        self._page.keyboard.insert_text(text)
+        self.log(f"  已按截图坐标填入 {len(text)} 个字符（置信度 {m.confidence:.2f}）")
+
     def _fill(self, step: Step):
         if not step.locator:
             raise ValueError("fill 步骤缺少 locator")
         text = self._resolve_value(step.value)
         if step.locator.type == "image":
-            # 截图定位没有 DOM 句柄：点击聚焦 → 全选清空 → 插入文本。
-            # insertText 直接走输入法通道，中文等非 ASCII 字符也能可靠写入。
-            m = self._locate_by_image(step.locator)
-            self._page.mouse.click(m.x, m.y)
-            self._page.keyboard.press("Control+A")
-            self._page.keyboard.press("Delete")
-            self._page.keyboard.insert_text(text)
-        else:
-            loc = self._resolve_xpath(step.locator)
+            self._fill_by_image(step.locator, text)
+            return
+        loc = self._resolve_xpath(step.locator)
+        try:
             self._ensure_fillable(loc)
             # 先点一下元素中心拿焦点，再填入：
             # 富文本框、需要激活才可写的框，直接 fill 会填不进去。
             self._focus_by_click(loc)
             loc.fill(text, timeout=20000)
-            self._verify_filled(loc, text)
+        except Exception as e:
+            image = self._fallback_image(step)
+            if not image:
+                raise
+            self.log(f"  填入失败（{_first_line(e)}）→ 改用兜底截图定位")
+            try:
+                self._fill_by_image(Locator(type="image", value=image), text)
+                return
+            except Exception as e2:
+                self.log(f"  兜底截图也没成功：{_first_line(e2)}")
+                raise e
+        self._verify_filled(loc, text)
 
     def _ensure_fillable(self, loc) -> None:
         """填入前确认目标是「fill 真能填的元素」，否则给一句看得懂的中文提示。
@@ -888,8 +944,7 @@ class StepExecutor:
             self.log("  已点击元素中心获取焦点")
             return True
         except Exception as e:
-            first = str(e).strip().splitlines()[0][:120] if str(e).strip() else e
-            self.log(f"  点击获取焦点没成功（改为直接填入）：{first}")
+            self.log(f"  点击获取焦点没成功（改为直接填入）：{_first_line(e)}")
             return False
 
     def _select(self, step: Step):

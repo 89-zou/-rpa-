@@ -395,6 +395,8 @@ class WebAutomationTab(QWidget):
         return StepEditDialog(
             self._current_store.dir, step, self,
             variable_names=self.available_variables(),
+            default_url=next((s.url for s in self._steps
+                              if s.action == "navigate" and s.url), ""),
         )
 
     # ------------------------------

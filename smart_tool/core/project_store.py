@@ -32,6 +32,10 @@ class Locator:
     """元素定位：XPath 或 截图。"""
     type: str = "xpath"        # "xpath" | "image"
     value: str = ""
+    # type=xpath 时的兜底：XPath 等不到元素/点不动时，
+    # 改用这张截图做模板匹配（OpenCV）再试一次。
+    # 路径相对项目目录，如 img/cap_20260917_203512_1.png（捕获元素时自动生成）
+    image: str = ""
 
 
 @dataclass
@@ -93,7 +97,10 @@ class Step:
         if self.url:
             d["url"] = self.url
         if self.locator:
-            d["locator"] = asdict(self.locator)
+            loc = asdict(self.locator)
+            if not loc.get("image"):
+                loc.pop("image", None)      # 没配兜底截图就别往文件里塞空字段
+            d["locator"] = loc
         if self.value:
             d["value"] = self.value
         if self.action == "navigate":
