@@ -1,16 +1,14 @@
 # -*- coding: utf-8 -*-
-"""项目管理对话框：项目列表 + 数据源与字段 + 变量清单。
+"""项目管理对话框：项目列表 + 变量清单。
 
-左边选项目，右边编辑这个项目：
+左边选项目，右边看这个项目的变量从哪来：
 
-- 页签【数据源与字段】：选文件/文件夹 → 读取预览 → 勾选要保存的变量。
-  这一步就是「变量从哪来」的初步确定（原来的【数据源设置】）。
-- 页签【变量清单】：一张表看全部变量，来源写得清清楚楚——
-  来自文件的显示文件地址（点一下可以重新选地址＝清空重选）；
-  运行时变量显示它依托哪个循环产生；手写的显示「自定义创建」。
-  除运行时变量外都能增删改，改动立即保存，没有「保存」按钮。
-
-（原来独立的【数据源设置】弹窗已并入这里，主界面只留一个【项目管理…】）
+- 变量有两个来源——「读取数据」节点产出的列表变量（读文件/文件夹），
+  以及手工加的自定义变量（账号密码之类）；
+- 循环里的 {{loop.item}} / {{loop.index}} 是运行时自动有的，不在这里列，
+  也不用手工配置（写错会在运行前检查里提示）；
+- 自定义变量可以增删改，改动立即保存，没有「保存」按钮；
+  读取节点产出的变量要改名/换路径，请去画布上双击那个「读取数据」节点。
 """
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -18,40 +16,31 @@ from typing import Dict, List, Optional
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QAbstractItemView, QDialog, QHBoxLayout, QHeaderView, QLabel, QListWidget,
-    QListWidgetItem, QMessageBox, QPushButton, QTabWidget, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QListWidgetItem, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
-from smart_tool.core import data_sources
-from smart_tool.core.data_sources import DataSourceConfig, list_columns
-from smart_tool.core.project_store import ProjectStore, list_projects
-from smart_tool.ui.data_source_dialog import DataSourcePanel
+from smart_tool.core.data_sources import DataSourceConfig
+from smart_tool.core.project_store import ProjectStore, Step, list_projects
 
 # 变量行类型（存在「来源」列的 UserRole 里，用来区分增删改行为）
-KIND_DATA, KIND_LOOP, KIND_PROJECT = "data", "loop", "project"
+KIND_DATA, KIND_PROJECT = "data", "project"
 
 COL_NAME, COL_VALUE, COL_SRC = range(3)
-# 循环自动注入的变量（不需要配置，循环里天然就有值）
-LOOP_VARS = (
-    ("loop.index", "第几轮（从 1 开始）"),
-    ("loop.zero_index", "第几轮（从 0 开始）"),
-    ("loop.item", "当前这一项（数据源循环＝当前这行）"),
-)
-RUNNING_FILLED = "（运行时逐行填充）"
+PLACEHOLDER = "（运行时按项填充）"
 
 
 class ProjectManagerDialog(QDialog):
-    """项目管理：项目列表 + 数据源与字段 + 变量清单。"""
+    """项目管理：项目列表 + 变量清单。"""
 
     def __init__(self, current_name: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle("项目管理")
-        self.setMinimumSize(1040, 660)
+        self.setMinimumSize(940, 580)
         self._stores: List[ProjectStore] = []
         self._open_name: Optional[str] = None
         self._store: Optional[ProjectStore] = None
         self._loading = False
-        self.panel: Optional[DataSourcePanel] = None
         self._init_ui()
         self._reload(select_name=current_name)
 
@@ -80,24 +69,12 @@ class ProjectManagerDialog(QDialog):
         left.addLayout(row_btns)
         root.addLayout(left, 2)
 
-        # ---- 右：数据源与字段 / 变量清单 ----
+        # ---- 右：变量清单 ----
         right = QVBoxLayout()
-        self.header_label = QLabel("在左边选中一个项目，这里就能编辑它的数据源与变量")
+        self.header_label = QLabel("在左边选中一个项目，这里就是它的变量清单")
         self.header_label.setStyleSheet("color: #444; font-weight: bold;")
         right.addWidget(self.header_label)
-
-        self.tabs = QTabWidget()
-        self._tab1 = QWidget()
-        t1 = QVBoxLayout(self._tab1)
-        t1.setContentsMargins(0, 6, 0, 0)
-        self.tab1_hint = QLabel("先在左边选中一个项目。")
-        self.tab1_hint.setStyleSheet("color: #888;")
-        t1.addWidget(self.tab1_hint)
-        t1.addStretch()
-        self.tabs.addTab(self._tab1, "数据源与字段")
-        self.tabs.addTab(self._build_var_tab(), "变量清单")
-        self.tabs.currentChanged.connect(self._on_tab_changed)
-        right.addWidget(self.tabs, 1)
+        right.addWidget(self._build_var_page(), 1)
 
         bottom = QHBoxLayout()
         bottom.addStretch()
@@ -112,17 +89,18 @@ class ProjectManagerDialog(QDialog):
 
         root.addLayout(right, 5)
 
-    def _build_var_tab(self) -> QWidget:
+    def _build_var_page(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
         lay.setContentsMargins(0, 6, 0, 0)
 
         tip = QLabel(
-            "步骤里用 {{变量名}} 引用。来源说明：\n"
-            "· 文件地址 ＝ 这个变量从哪个文件/文件夹读出来（点它就能重新选地址）；\n"
-            "· 运行时   ＝ 循环里自动产生，不用配置，也不能改；\n"
-            "· 自定义创建 ＝ 手工加的变量（账号密码之类），来源不可改。\n"
-            "除运行时变量外都能改名；改完立即保存。"
+            "步骤里用 {{变量名}} 引用。变量只有两个来源：\n"
+            "· 读取节点 ＝「读取数据」节点从文件/文件夹读出来的变量"
+            "（换文件夹、改字段名请去画布上双击那个节点）；\n"
+            "· 自定义创建 ＝ 手工加的（账号密码之类），来源不可改。\n"
+            "循环里的 {{loop.item}} / {{loop.item.字段}} / {{loop.index}} 是运行时自动有的，"
+            "不用在这里配置。"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color: #777;")
@@ -130,7 +108,7 @@ class ProjectManagerDialog(QDialog):
 
         self.data_label = QLabel("")
         self.data_label.setWordWrap(True)
-        self.data_label.setStyleSheet("color: #2f6fb3;")
+        self.data_label.setStyleSheet("color: #0f766e;")
         lay.addWidget(self.data_label)
 
         self.var_table = QTableWidget(0, 3)
@@ -187,12 +165,14 @@ class ProjectManagerDialog(QDialog):
         single = len(stores) == 1
         self.btn_open.setEnabled(single)
         self.btn_delete.setEnabled(len(stores) > 0)
-        self.tabs.setEnabled(single)
+        self.var_table.setEnabled(single)
+        self.btn_var_add.setEnabled(single)
+        self.btn_var_del.setEnabled(single)
         one = stores[0] if single else None
         self._store = one
         if one is None:
             self.header_label.setText(
-                "在左边选中**一个**项目，这里就能编辑它的数据源与变量"
+                "在左边选中**一个**项目，这里就是它的变量清单"
             )
             self.data_label.setText("")
             self._loading = True
@@ -201,62 +181,75 @@ class ProjectManagerDialog(QDialog):
             self.status_label.clear()
             return
         self.header_label.setText(f"项目：{one.name}")
-        if self.panel is None:
-            self.panel = DataSourcePanel(one, self)
-            self.panel.changed.connect(self._load_var_list)
-            self.tab1_hint.hide()
-            self._tab1.layout().insertWidget(0, self.panel, 1)
-        else:
-            self.panel.load(one)
         self._load_var_list()
-
-    def _on_tab_changed(self, index: int):
-        """切页签时重新读一遍，保证两个页签看到的是同一份最新数据。"""
-        if self._store is None:
-            return
-        if index == 0 and self.panel is not None:
-            self.panel.load(self._store)
-        elif index == 1:
-            self._load_var_list()
 
     # ------------------------------
     # 变量清单
     # ------------------------------
     def _load_var_list(self):
-        """刷新变量清单：数据源变量 + 运行时变量 + 自定义变量。"""
+        """刷新变量清单：读取节点产出的变量 + 自定义变量。"""
         if self._store is None:
             return
-        ds = DataSourceConfig.from_dict(self._store.load_data_source())
-        cols = list_columns(ds) if ds.configured else []
+        steps = self._store.load_steps()
         variables = self._store.load_variables()
-        src_text = ds.path or "（未设置数据源）"
-        loop_from = self._loop_depends_on(ds)
 
         self._loading = True
-        self.data_label.setText(self._data_summary(ds))
         self.var_table.setRowCount(0)
-        for name in cols:
-            self._append_row(name, RUNNING_FILLED, src_text, KIND_DATA)
-        for name, meaning in LOOP_VARS:
-            self._append_row(name, meaning, loop_from, KIND_LOOP)
+        readers = [s for s in steps if s.action == "read_data"]
+        for s in readers:
+            self._append_data_node(s)
         for k, v in variables.items():
             self._append_row(k, v, "自定义创建", KIND_PROJECT)
         self._loading = False
+        self.data_label.setText(self._data_summary(readers))
         self._set_status(
-            f"{len(variables)} 个自定义变量、{len(cols)} 个数据源变量"
+            f"{len(readers)} 个读取节点、{len(variables)} 个自定义变量"
         )
+
+    def _append_data_node(self, node: Step):
+        """一个「读取数据」节点产出的变量（字段名写在来源里，不单列成运行时变量）。"""
+        cfg = DataSourceConfig.from_dict(node.data_cfg or {})
+        var = (node.output_var or "").strip()
+        where = Path(cfg.path).name if cfg.path else "（未选路径）"
+        fields = [m.get("var", "").strip()
+                  for m in cfg.field_map if (m.get("var") or "").strip()]
+        if fields:
+            detail = "字段：" + "、".join(fields) \
+                + "（循环里用 {{loop.item.字段名}} 取）"
+        else:
+            detail = "还没勾选字段"
+        self._append_row(
+            var or "（未填产出变量名）", PLACEHOLDER,
+            f"读取节点：{where}\n{detail}", KIND_DATA,
+        )
+
+    @staticmethod
+    def _data_summary(readers: List[Step]) -> str:
+        """读取节点概况：讲清「循环为什么跑 N 次」。"""
+        if not readers:
+            return ("这个项目还没有「读取数据」节点："
+                    "需要读文件/文件夹时，在【流程编辑…】里新增一个。")
+        lines = []
+        for s in readers:
+            cfg = DataSourceConfig.from_dict(s.data_cfg or {})
+            name = Path(cfg.path).name if cfg.path else "（未选路径）"
+            where = cfg.path or ""
+            if cfg.type == "folder":
+                where += f"（通配 {cfg.pattern}{'，含子文件夹' if cfg.recursive else ''}）"
+            lines.append(f"「{s.output_var or '未命名'}」← {name} {where}")
+        return "\n".join(lines) + "\n循环节点里填 {{变量名}}，就按它读到的项数跑那么多次。"
 
     def _append_row(self, name: str, value: str, source: str, kind: str):
         row = self.var_table.rowCount()
         self.var_table.insertRow(row)
 
         name_item = QTableWidgetItem(name)
-        if kind == KIND_LOOP:       # 运行时变量不让改
+        if kind == KIND_DATA:       # 读取节点产出的变量不让在这里改
             name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.var_table.setItem(row, COL_NAME, name_item)
 
         value_item = QTableWidgetItem(value)
-        if kind != KIND_PROJECT:    # 数据源的值是运行时填的，不给改
+        if kind != KIND_PROJECT:    # 读取节点的值是运行时填的，不给改
             value_item.setFlags(value_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.var_table.setItem(row, COL_VALUE, value_item)
 
@@ -264,92 +257,30 @@ class ProjectManagerDialog(QDialog):
         src_item.setFlags(src_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         src_item.setData(Qt.ItemDataRole.UserRole, kind)
         src_item.setToolTip(source)
-        if kind == KIND_DATA:
-            src_item.setToolTip(
-                f"{source}\n点一下可以重新选数据文件/文件夹"
-                "（原来的变量会清空，需要重新读取预览勾选）"
-            )
         self.var_table.setItem(row, COL_SRC, src_item)
 
     def _row_kind(self, row: int) -> str:
         item = self.var_table.item(row, COL_SRC)
         return (item.data(Qt.ItemDataRole.UserRole) if item else "") or ""
 
-    @staticmethod
-    def _data_summary(ds: DataSourceConfig) -> str:
-        """数据源概况：讲清「循环为什么跑 N 次」。"""
-        if not ds.configured:
-            return "还没有配置数据源：切到【数据源与字段】页签选文件/文件夹。"
-        name = Path(ds.path).name or ds.path
-        head = f"数据源：{name}"
-        if ds.type == "folder":
-            head += (f"（文件夹，通配 {ds.pattern}"
-                     f"{'，含子文件夹' if ds.recursive else ''}）")
-        elif ds.type == "txt":
-            head += "（单个文本文件）"
-        try:
-            _rows, total, _cols = data_sources.preview(ds, 1)
-        except Exception as e:
-            return f"{head}\n读不出来：{str(e).splitlines()[0]}"
-        unit = "个文件（每个文件一行）" if ds.type == "folder" else "行数据"
-        return (f"{head}\n匹配到 {total} {unit}"
-                f" → 循环方式选「数据源」时就跑 {total} 次")
-
-    def _loop_depends_on(self, ds: DataSourceConfig) -> str:
-        """运行时变量依托什么产生（给「来源」列写清楚）。"""
-        loops = [s for s in self._store.load_steps() if s.action == "loop_start"]
-        if len(loops) == 1:
-            src = loops[0].loop_source or "data"
-            if src == "range":
-                name = f"索引范围 {loops[0].loop_range or '（未填）'}"
-            elif src == "list":
-                name = "变量 / 手动列表"
-            else:
-                name = (f"数据源 {Path(ds.path).name}" if ds.configured
-                        else "数据源（未配置）")
-            return f"运行时：跟随「{name}」逐行产生"
-        if not loops:
-            return "运行时：循环里自动有值（当前项目还没有循环）"
-        return "运行时：循环里自动有值（本项目有多个循环）"
-
     def _on_var_changed(self, item: QTableWidgetItem):
-        """改名 / 改值 → 立即保存。"""
+        """改名 / 改值 → 立即保存（只对自定义变量生效）。"""
         if self._loading or item.column() not in (COL_NAME, COL_VALUE):
             return
-        row, kind = item.row(), self._row_kind(item.row())
-        if kind == KIND_LOOP:
-            return                      # 运行时变量不让改
-        if kind == KIND_DATA:
-            self._rename_data_var(row, item.text().strip())
+        if self._row_kind(item.row()) != KIND_PROJECT:
             return
         self._save_variables()
 
-    def _rename_data_var(self, row: int, new_name: str):
-        """改数据源变量的名字 → 同步写回数据源的字段清单。"""
-        if not new_name:
-            self._load_var_list()
-            return
-        ds = DataSourceConfig.from_dict(self._store.load_data_source())
-        items = [dict(m) for m in ds.field_map]
-        # 第 row 行对应 field_map 的第 row 项（数据源行排在最前面）
-        if 0 <= row < len(items):
-            items[row]["var"] = new_name
-            ds.field_map = items
-            self._store.save_data_source(ds.to_dict())
-            if self.panel is not None:
-                self.panel.load(self._store)
-            self._set_status(f"已改名：{new_name}")
-
     def _on_var_clicked(self, row: int, col: int):
-        """点「来源」列：文件类的变量可以重新选地址（清空重选）。"""
+        """点「来源」列：告诉用户去哪里改这个变量。"""
         if col != COL_SRC or self._row_kind(row) != KIND_DATA:
             return
-        if self.panel is None:
-            return
-        self.tabs.setCurrentIndex(0)        # 换地址在「数据源与字段」页签做
-        if self.panel.pick_path():
-            self._set_status("地址已改，原数据源变量已清空，请【读取预览】再勾一次")
-        self._load_var_list()
+        QMessageBox.information(
+            self, "改这里",
+            "读取节点产出的变量在节点里改：\n"
+            "回到主界面，在画布上双击那个「读取数据」节点，\n"
+            "就能换文件夹 / 改字段名（改完回到这里刷新即可）。",
+        )
 
     def _add_var_row(self):
         if self._store is None:
@@ -378,23 +309,20 @@ class ProjectManagerDialog(QDialog):
         self._set_status(f"已保存 {len(variables)} 个自定义变量")
 
     def _del_var_rows(self):
-        """删除选中变量：自定义的删掉；数据源的＝不再保存这个字段；运行时的不让删。"""
+        """删除选中变量：自定义的删掉；读取节点产出的不让删。"""
         if self._store is None:
             return
         rows = sorted({i.row() for i in self.var_table.selectedIndexes()},
                       reverse=True)
         if not rows:
             return
-        loop_rows = [r for r in rows if self._row_kind(r) == KIND_LOOP]
-        if loop_rows:
+        if any(self._row_kind(r) == KIND_DATA for r in rows):
             QMessageBox.information(
                 self, "提示",
-                "「运行时」变量是循环自动产生的，删不掉、也不用删。",
+                "「读取节点」产出的变量不在这里删：\n"
+                "请双击那个「读取数据」节点，把对应字段的勾去掉。",
             )
-        data_rows = [r for r in rows if self._row_kind(r) == KIND_DATA]
         project_rows = [r for r in rows if self._row_kind(r) == KIND_PROJECT]
-        if data_rows:
-            self._drop_data_vars(sorted(data_rows))
         if project_rows:
             self._loading = True
             for r in project_rows:
@@ -402,16 +330,6 @@ class ProjectManagerDialog(QDialog):
             self._loading = False
             self._save_variables()
         self._load_var_list()
-
-    def _drop_data_vars(self, rows: List[int]):
-        """把这几行数据源变量从字段清单里去掉（＝不再保存这个变量）。"""
-        ds = DataSourceConfig.from_dict(self._store.load_data_source())
-        items = [dict(m) for m in ds.field_map]
-        new_items = [m for i, m in enumerate(items) if i not in set(rows)]
-        ds.field_map = new_items
-        self._store.save_data_source(ds.to_dict())
-        if self.panel is not None:
-            self.panel.load(self._store)
 
     def _set_status(self, text: str):
         self.status_label.setText(text)

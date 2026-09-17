@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""浏览器自动化标签页：项目管理 + 画布编排 + 数据源 + 运行/停止 + 日志。"""
+"""浏览器自动化标签页：项目管理 + 画布编排 + 运行/停止 + 日志。"""
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -12,10 +12,9 @@ from PyQt6.QtWidgets import (
 )
 
 from smart_tool.core import blocks
-from smart_tool.core.data_sources import DataSourceConfig, list_columns
 from smart_tool.core.project_store import ProjectStore, Step, list_projects
 from smart_tool.core.step_executor import (
-    PauseHandle, StepExecutor, check_variables,
+    PauseHandle, StepExecutor, available_variables, check_variables,
 )
 from smart_tool.ui.flow_canvas import (
     DEFAULT_PLACEHOLDER, LAYOUT_VERSION, NO_PROJECT_PLACEHOLDER, FlowCanvas,
@@ -44,7 +43,6 @@ class ExecutorWorker(QThread):
         variables: dict,
         project_dir=None,
         headless: bool = False,
-        data_source: Optional[dict] = None,
     ):
         super().__init__()
         self._pause_handle: Optional[PauseHandle] = None
@@ -56,7 +54,6 @@ class ExecutorWorker(QThread):
             log=self.log_signal.emit,
             on_pause=self._on_pause,
             on_resume=self.pause_resolved.emit,
-            data_source=data_source,
         )
 
     def _on_pause(self, step: Step) -> PauseHandle:
@@ -97,7 +94,6 @@ class WebAutomationTab(QWidget):
         self._worker: Optional[ExecutorWorker] = None
         self._current_store: Optional[ProjectStore] = None
         self._steps: List[Step] = []
-        self._data_source: dict = {}
         self._init_ui()
         # 启动不自动载入项目：避免读盘/排版拖慢界面，由用户点【载入项目…】
         self._clear_project()
@@ -124,7 +120,7 @@ class WebAutomationTab(QWidget):
         proj_layout.addWidget(self.btn_load)
         self.btn_manage = QPushButton("项目管理…")
         self.btn_manage.setToolTip(
-            "项目列表、数据源与字段、变量都在这里管（原来的【数据源…】已并入）"
+            "项目列表与变量清单都在这里管（「读取数据」节点负责变量从哪来）"
         )
         self.btn_manage.clicked.connect(self._open_project_manager)
         proj_layout.addWidget(self.btn_manage)
@@ -240,14 +236,13 @@ class WebAutomationTab(QWidget):
 
         self._current_store = store
         self._steps = store.load_steps()
-        self._data_source = store.load_data_source()
         # 旧版纵向排版、或新项目还没排过版 → 请求横向蛇形排版。
         # 画布尚未显示时它会挂起，等拿到真实宽度再排（避免列数过窄）。
         need_layout = (
             store.load_layout_version() != LAYOUT_VERSION
             or any(s.pos is None for s in self._steps)
         )
-        self.canvas.load_steps(self._steps, self._data_source,
+        self.canvas.load_steps(self._steps,
                                auto_layout=False, keep_view=False)
         # 画布上手动连的箭头（纯展示，随项目保存）
         self.canvas.set_manual_edges(store.load_canvas_edges())
@@ -272,10 +267,9 @@ class WebAutomationTab(QWidget):
         """卸载当前项目（未载入状态）。"""
         self._current_store = None
         self._steps = []
-        self._data_source = {}
         self.canvas.set_manual_edges([])
         self.canvas.set_placeholder_text(NO_PROJECT_PLACEHOLDER)
-        self.canvas.load_steps([], {})
+        self.canvas.load_steps([])
         self.project_label.setText("当前项目：（未载入，请点【载入项目…】）")
         self._update_edit_buttons()
 
@@ -286,7 +280,7 @@ class WebAutomationTab(QWidget):
                                      layout_version=LAYOUT_VERSION)
 
     def _open_project_manager(self):
-        """打开【项目管理】：项目列表 + 数据源与字段 + 变量清单。"""
+        """打开【项目管理】：项目列表 + 变量清单。"""
         if self._worker is not None:
             QMessageBox.warning(self, "提示", "执行进行中，请先停止再管理项目。")
             return
@@ -299,12 +293,6 @@ class WebAutomationTab(QWidget):
             # 当前项目刚被删掉了
             self._append_log("当前项目已被删除，请重新载入项目。")
             self._clear_project()
-        elif self._current_store:
-            # 数据源/变量可能在弹窗里改过，刷新画布上的数据源标签与变量下拉
-            self._data_source = self._current_store.load_data_source()
-            self.canvas.load_steps(self._steps, self._data_source)
-
-    # 说明：数据源与变量的设置都并入【项目管理…】了
 
     # ------------------------------
     # 选择 / 按钮状态
@@ -338,30 +326,16 @@ class WebAutomationTab(QWidget):
     # 变量来源检查
     # ------------------------------
     def available_variables(self) -> List[str]:
-        """当前项目可用的变量：数据源产出 + 项目变量 + 循环行号。"""
-        names: List[str] = []
-        if self._data_source:
-            try:
-                names.extend(list_columns(
-                    DataSourceConfig.from_dict(self._data_source)))
-            except Exception:
-                pass
-        if self._current_store:
-            names.extend(self._current_store.load_variables().keys())
-        names.extend(["loop.index", "loop.zero_index"])
-        out: List[str] = []
-        for n in names:
-            if n and n not in out:
-                out.append(n)
-        return out
+        """当前项目可用的变量：自定义变量 + 读取节点产出的 + 循环运行时。"""
+        return available_variables(
+            self._steps,
+            self._current_store.load_variables() if self._current_store else {},
+        )
 
     def _check_variables_before_run(self) -> bool:
         """运行前检查变量是否有来源，避免"跑起来才发现正文是空的"。"""
         problems = check_variables(
             self._steps,
-            data_columns=list_columns(
-                DataSourceConfig.from_dict(self._data_source))
-            if self._data_source else [],
             project_variables=(self._current_store.load_variables()
                                if self._current_store else {}),
         )
@@ -374,7 +348,8 @@ class WebAutomationTab(QWidget):
             "检测到以下变量当前没有来源，运行时会被替换成空值或占位文字：\n\n"
             + "\n".join(f"· {p}" for p in problems[:8])
             + ("\n…" if len(problems) > 8 else "")
-            + "\n\n建议先在【项目管理…】→【数据源与字段】里配置字段映射，或忽略本次提示继续运行。\n"
+            + "\n\n建议先双击相关节点补全配置（「读取数据」节点产出变量、"
+              "循环里才能用 {{loop.item.字段}}），或忽略本次提示继续运行。\n"
               "仍要继续吗？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -392,7 +367,7 @@ class WebAutomationTab(QWidget):
             QMessageBox.warning(self, "提示", "执行进行中，请先停止再编辑流程。")
             return
         dlg = FlowEditorDialog(
-            self._current_store.dir, self._steps, self._data_source, self,
+            self._current_store.dir, self._steps, self,
             project_variables=self._current_store.load_variables(),
         )
         dlg.exec()
@@ -411,11 +386,10 @@ class WebAutomationTab(QWidget):
         self._append_log("已按横向蛇形重新排版。")
 
     def _make_step_dialog(self, step: Optional[Step] = None) -> StepEditDialog:
-        """统一构造步骤编辑对话框，带上数据源与项目变量供变量下拉使用。"""
+        """统一构造步骤编辑对话框，带上可用变量供变量下拉使用。"""
         return StepEditDialog(
             self._current_store.dir, step, self,
-            data_source=self._data_source,
-            project_variables=self._current_store.load_variables(),
+            variable_names=self.available_variables(),
         )
 
     # ------------------------------
@@ -437,7 +411,7 @@ class WebAutomationTab(QWidget):
         select_id = None
         if select_row is not None and 0 <= select_row < len(self._steps):
             select_id = self._steps[select_row].id
-        self.canvas.load_steps(self._steps, self._data_source,
+        self.canvas.load_steps(self._steps,
                                select_id=select_id, auto_layout=auto_layout)
         self._update_edit_buttons()
 
@@ -637,7 +611,6 @@ class WebAutomationTab(QWidget):
             self._steps, variables,
             project_dir=self._current_store.dir,
             headless=False,
-            data_source=self._data_source,
         )
         self._worker.log_signal.connect(self._append_log)
         self._worker.finished.connect(self._on_finished)

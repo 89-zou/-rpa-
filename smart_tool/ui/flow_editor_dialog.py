@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
-from smart_tool.core import blocks
+from smart_tool.core import blocks, step_executor
 from smart_tool.core.project_store import ProjectStore, Step
 from smart_tool.ui.flow_canvas import ACTION_META, step_summary
 from smart_tool.ui.step_editor_dialog import StepEditDialog
@@ -51,7 +51,7 @@ def _branch_text(steps: List[Step], index: int) -> str:
 class _StepCard(QWidget):
     """列表里的一行节点卡片：色条 + 中文动作名 + 摘要。"""
 
-    def __init__(self, step: Step, data_source: dict, indent: int = 0,
+    def __init__(self, step: Step, indent: int = 0,
                  branch_text: str = "", parent=None):
         super().__init__(parent)
         self.setFixedHeight(CARD_H)
@@ -88,7 +88,7 @@ class _StepCard(QWidget):
         text_box.addWidget(title)
 
         summary = " ｜ ".join(
-            x for x in step_summary(step, data_source, branch_text) if x
+            x for x in step_summary(step, branch_text) if x
         )
         if not summary:
             summary = "（无参数）"
@@ -127,14 +127,13 @@ class FlowEditorDialog(QDialog):
     """流程编辑：列表式编排步骤。"""
 
     def __init__(self, project_dir, steps: List[Step],
-                 data_source: Optional[dict] = None, parent=None,
+                 parent=None,
                  project_variables: Optional[dict] = None):
         super().__init__(parent)
         self.setWindowTitle("流程编辑")
         self.setMinimumSize(720, 580)
         self.project_dir = Path(project_dir)
         self._store = ProjectStore(self.project_dir)
-        self.data_source = data_source or {}
         self.project_variables = project_variables or {}
         # 本地副本：改一次就立刻写盘一次，关掉弹窗也不会丢
         self._steps: List[Step] = [
@@ -244,7 +243,7 @@ class FlowEditorDialog(QDialog):
         item.setSizeHint(QSize(0, CARD_H))          # 必须显式设置，否则卡片会被压扁
         self.list_widget.addItem(item)
         self.list_widget.setItemWidget(
-            item, _StepCard(self._steps[idx], self.data_source,
+            item, _StepCard(self._steps[idx],
                             LOOP_INDENT * depth,
                             branch_text=_branch_text(self._steps, idx))
         )
@@ -329,8 +328,8 @@ class FlowEditorDialog(QDialog):
     def _new_step_via_dialog(self) -> Optional[Step]:
         dlg = StepEditDialog(
             self.project_dir, None, self,
-            data_source=self.data_source,
-            project_variables=self.project_variables,
+            variable_names=step_executor.available_variables(
+                self._steps, self.project_variables),
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             return dlg.get_step()
@@ -379,8 +378,8 @@ class FlowEditorDialog(QDialog):
         old = self._steps[idx]
         dlg = StepEditDialog(
             self.project_dir, old, self,
-            data_source=self.data_source,
-            project_variables=self.project_variables,
+            variable_names=step_executor.available_variables(
+                self._steps, self.project_variables),
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return

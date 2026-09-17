@@ -2,16 +2,18 @@
 """步骤编辑对话框：新建/编辑单个步骤。
 
 按 action 动态切换表单字段：
-- navigate           URL
+- navigate           URL + 打开超时
+- read_data          读取类型/路径/字段勾选 + 产出变量名
 - click              定位(XPath/截图) + 步骤后等待
 - fill / select      定位 + 输入值(支持 {{变量}}) + 步骤后等待
 - pause_for_human    提示语 + 恢复条件(URL/元素/双重) + 超时
+- loop_start         循环内容（一个输入框：数字＝跑几次 / {{变量}}＝按长度跑）
 所有动作都可填备注 note。
 """
 import re
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QPixmap
@@ -23,12 +25,11 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from smart_tool.core import blocks
-from smart_tool.core.data_sources import DataSourceConfig, list_columns
 from smart_tool.core.project_store import Locator, Step
+from smart_tool.ui.read_data_panel import ReadDataPanel
 
 ACTIONS = [
-    "navigate", "click", "fill", "select", "pause_for_human",
+    "navigate", "read_data", "click", "fill", "select", "pause_for_human",
     "loop_start", "loop_end", "condition_start", "condition_end", "branch",
     "script",
 ]
@@ -36,6 +37,7 @@ ACTIONS = [
 NEW_STEP_HIDDEN = {"loop_end", "condition_end", "branch"}
 ACTION_LABELS = {
     "navigate": "打开网页 navigate",
+    "read_data": "读取数据 read_data（读文件夹/文件 → 产出一个列表变量）",
     "click": "点击 click",
     "fill": "填入 fill",
     "select": "下拉选择 select",
@@ -50,7 +52,7 @@ ACTION_LABELS = {
 # 条件判断方式
 COND_MODES = [
     ("equal", "变量相等（变量值跟分支的匹配值比，一样就走那个分支）"),
-    ("expr", "表达式（写 Python 表达式，如 len({{row.正文}}) > 500）"),
+    ("expr", "表达式（写 Python 表达式，如 {{loop.item.内容}} 含某个词）"),
 ]
 SCRIPT_LANGS = [("python", "Python（本地执行）"),
                 ("javascript", "JavaScript（在网页里执行）")]
@@ -67,7 +69,7 @@ SCRIPT_HINT_PY = (
 )
 SCRIPT_HINT_JS = (
     "在网页里执行，可直接操作 DOM。可用对象：\n"
-    "  vars   —— 当前变量对象（如 vars[\"row.标题\"]，改完自动写回）\n"
+    "  vars   —— 当前变量对象（如 vars[\"标题\"]，改完自动写回）\n"
     "  log()  —— 输出一行日志到运行窗口\n"
     "  url    —— 当前网址\n"
     "例：vars[\"页数\"] = document.querySelectorAll(\".item\").length;"
@@ -82,18 +84,6 @@ WAIT_OPTIONS = [
 ]
 # 需要填「等待目标」的等待方式
 WAIT_NEEDS_TARGET = ("element_present", "url_changed")
-# 循环方式
-LOOP_SOURCES = [
-    ("data", "数据源（在【项目管理…】→ 数据源与字段里配置，每一行一次）"),
-    ("list", "变量 / 手动列表（每行一项，可写 {{变量}}）"),
-    ("range", "索引范围（写 10 就跑 10 次，或写 0-10）"),
-]
-# 索引范围：一个整数或 {{变量}}，可写成「起-止」（首尾都算）
-_LOOP_RANGE_TERM = r"(?:\d+|\{\{[^{}]+\}\})"
-_LOOP_RANGE_RE = re.compile(
-    rf"^\s*{_LOOP_RANGE_TERM}\s*(?:-\s*{_LOOP_RANGE_TERM})?\s*$"
-)
-_LOOP_RANGE_LITERAL_RE = re.compile(r"^\s*(\d+)\s*-\s*(\d+)\s*$")
 RESUME_OPTIONS = [
     ("manual", "仅人工继续"),
     ("url_changed", "URL 变化"),
@@ -130,17 +120,16 @@ class StepEditDialog(QDialog):
     """新建/编辑步骤。get_step() 在 accept 后取结果。"""
 
     def __init__(self, project_dir: Path, step: Optional[Step] = None,
-                 parent=None, data_source: Optional[dict] = None,
-                 project_variables: Optional[dict] = None):
+                 parent=None, variable_names: Optional[List[str]] = None):
         super().__init__(parent)
         self.project_dir = Path(project_dir)
         self.img_dir = self.project_dir / "img"
         self._editing = step is not None
         self._step_id = step.id if step else 0
-        self._data_source = data_source or {}
-        self._variables = project_variables or {}
+        # 可插入的变量名（自定义变量 + 读取节点产出的 + loop.*）
+        self._var_names_list = list(variable_names or [])
         self.setWindowTitle("编辑步骤" if self._editing else "新建步骤")
-        self.setMinimumWidth(680)
+        self.setMinimumWidth(760)
         self._init_ui()
         if step:
             self._load_from_step(step)
@@ -185,6 +174,18 @@ class StepEditDialog(QDialog):
             "页面是否稳定由下面的「步骤后等待」负责。"
         )
         form.addRow("打开超时：", self.nav_timeout)
+
+        # --- read_data 组：读文件 / 文件夹，产出一个「列表变量」---
+        self.output_var_edit = QLineEdit()
+        self.output_var_edit.setPlaceholderText("给读到的数据起个名字，如 文章列表")
+        self.output_var_edit.setToolTip(
+            "循环节点里写 {{这个名字}} 就能逐项遍历；\n"
+            "循环体里用 {{loop.item.字段}} 取当前这一项的字段。"
+        )
+        form.addRow("产出变量名：", self.output_var_edit)
+
+        self.read_panel = ReadDataPanel()
+        form.addRow("读什么：", self.read_panel)
 
         # --- 定位组（click/fill/select）---
         self.locator_type = QComboBox()
@@ -284,61 +285,30 @@ class StepEditDialog(QDialog):
         self.resume_timeout.setSuffix(" 秒")
         form.addRow("等待超时：", self.resume_timeout)
 
-        # --- 循环标记说明 ---
-        self.loop_source_combo = QComboBox()
-        for key, label in LOOP_SOURCES:
-            self.loop_source_combo.addItem(label, key)
-        self.loop_source_combo.currentIndexChanged.connect(
-            self._on_loop_source_changed
+        # --- 循环组：只填一个「循环内容」 ---
+        self.loop_expr_edit = QLineEdit()
+        self.loop_expr_edit.setPlaceholderText(
+            "10 = 跑 10 次；{{文章列表}} = 按这个变量的长度跑"
         )
-        form.addRow("循环方式：", self.loop_source_combo)
-
-        self.loop_items_edit = QPlainTextEdit()
-        self.loop_items_edit.setMinimumHeight(96)
-        self.loop_items_edit.setPlaceholderText(
-            "每行一项，例如：\n"
-            "通知甲/正文.txt\n"
-            "通知乙/正文.txt\n\n"
-            "也可以整框只写一个变量：{{文件列表}}\n"
-            "（变量的值是列表、JSON 数组或换行/逗号分隔的文本都行）"
-        )
-        form.addRow("循环项：", self.loop_items_edit)
-
-        # 索引范围：可像 fill 一样插入变量
-        self.loop_range_edit = QLineEdit()
-        self.loop_range_edit.setPlaceholderText(
-            "10 = 跑 10 次（索引 0~9）；0-10 = 索引 0~10；也可用变量，如 {{次数}}"
-        )
-        self.loop_range_var_combo = QComboBox()
-        self.loop_range_var_combo.setMinimumWidth(190)
-        self.loop_range_var_combo.setToolTip("选择后把变量插入到索引范围里")
-        self.loop_range_var_combo.activated.connect(self._insert_loop_range_var)
-        self.loop_range_row = QWidget()
-        range_layout = QHBoxLayout(self.loop_range_row)
-        range_layout.setContentsMargins(0, 0, 0, 0)
-        range_layout.addWidget(self.loop_range_edit, 1)
-        range_layout.addWidget(self.loop_range_var_combo)
-        form.addRow("索引范围：", self.loop_range_row)
-
-        self.loop_range_hint = QLabel(
-            "只写一个数 = 跑那么多次，索引从 0 开始（10 → 0,1,…,9）；\n"
-            "写 起-止 = 从起跑到止，首尾都算（5-10 → 5,6,…,10）；\n"
-            "只写一个变量 = 按变量的长度跑（列表 3 项 → 0~2；值为数字 5 → 0~4）；\n"
-            "写 起-变量 = 从起跑到变量的末位（0-{{列表}} → 0 到列表最后一项）。"
-        )
-        self.loop_range_hint.setWordWrap(True)
-        self.loop_range_hint.setStyleSheet("color: #888;")
-        form.addRow("", self.loop_range_hint)
+        self.loop_expr_var_combo = QComboBox()
+        self.loop_expr_var_combo.setMinimumWidth(190)
+        self.loop_expr_var_combo.setToolTip("选择后把变量插入到循环内容里")
+        self.loop_expr_var_combo.activated.connect(self._insert_loop_expr_var)
+        self.loop_expr_row = QWidget()
+        loop_layout = QHBoxLayout(self.loop_expr_row)
+        loop_layout.setContentsMargins(0, 0, 0, 0)
+        loop_layout.addWidget(self.loop_expr_edit, 1)
+        loop_layout.addWidget(self.loop_expr_var_combo)
+        form.addRow("循环内容：", self.loop_expr_row)
 
         self.loop_hint = QLabel(
             "「循环开始 / 循环结束」是一对节点：新增循环时系统一起创建，\n"
-            "夹在中间的那些步骤（列表里缩进显示）会按「循环方式」重复执行。\n"
+            "夹在中间的那些步骤（列表里缩进显示）会重复执行。\n"
             "设置只有这一份：点「循环结束」也是打开这里。\n"
-            "循环体里用 {{loop.item}} 取当前项 / 当前索引，{{loop.index}} 取第几轮（从 1 开始）。\n"
-            "· 循环方式选「数据源」：每行一次，字段用 {{row.列名}} / {{file.content}} 引用；\n"
-            "· 选「变量 / 手动列表」：每行一项；整框只写 {{变量名}} 时按该变量展开，\n"
-            "  列表项是对象（如 JSON 数组）时，它的键同样可以用 {{row.键}} 引用；\n"
-            "· 选「索引范围」：按次数或索引区间重复，{{loop.item}} 就是当前索引。"
+            "· 只想跑固定次数 → 填数字，如 10（{{loop.item}} 是当前序号，0 起）；\n"
+            "· 想按「读取数据」读到的内容挨个处理 → 填 {{变量名}}（如 {{文章列表}}），\n"
+            "  循环体里用 {{loop.item.字段}} 取当前这一项，{{loop.index}} 是第几轮（1 起）；\n"
+            "· 变量是别的东西也行：值是列表 / 多行文本就逐项遍历，是数字就跑那么多次。"
         )
         self.loop_hint.setWordWrap(True)
         self.loop_hint.setStyleSheet("color: #7a4fb5;")
@@ -478,13 +448,14 @@ class StepEditDialog(QDialog):
 
         # 各字段的 label buddy 不便单独拿，统一用 widget 列表控制显隐
         self._navigate_widgets = [self.url_edit, self.nav_timeout]
+        self._read_widgets = [self.output_var_edit, self.read_panel]
         self._locator_widgets = [self.locator_type, loc_row]
         self._image_widgets = [self.image_hint, self.preview]
         self._value_widgets = [value_row, self.value_hint]
         self._wait_widgets = [self.wait_combo, self.wait_seconds]
         self._pause_widgets = [self.prompt_edit, self.resume_combo,
                                self.resume_timeout]
-        self._loop_widgets = [self.loop_source_combo]
+        self._loop_widgets = [self.loop_expr_row, self.loop_hint]
         self._script_widgets = [
             self.script_lang_combo, self.script_code, self.script_hint,
             script_row, self.script_timeout,
@@ -509,6 +480,7 @@ class StepEditDialog(QDialog):
         action = self._current_action()
         is_loop = action in ("loop_start", "loop_end")
         is_cond = action == "condition_start"
+        is_read = action == "read_data"
         is_locate = action in ("click", "fill", "select")
         is_fill = action in ("fill", "select")
         is_image = is_locate and self.locator_type.currentData() == "image"
@@ -518,6 +490,8 @@ class StepEditDialog(QDialog):
 
         for w in self._navigate_widgets:
             self._show(w, action == "navigate")
+        for w in self._read_widgets:
+            self._show(w, is_read)
         for w in self._locator_widgets:
             self._show(w, is_locate)
         self.btn_pick_image.setVisible(is_image)
@@ -537,13 +511,8 @@ class StepEditDialog(QDialog):
                    is_pause and cond in ("element_present", "url_and_element"))
         for w in self._script_widgets:
             self._show(w, is_script)
-        self._show(self.loop_hint, is_loop)
         for w in self._loop_widgets:
             self._show(w, is_loop)
-        loop_src = self.loop_source_combo.currentData()
-        self._show(self.loop_items_edit, is_loop and loop_src == "list")
-        for w in (self.loop_range_row, self.loop_range_hint):
-            self._show(w, is_loop and loop_src == "range")
         for w in self._cond_widgets:
             self._show(w, is_cond)
 
@@ -574,44 +543,14 @@ class StepEditDialog(QDialog):
         """恢复 URL / 恢复元素按恢复条件分别出现。"""
         self._sync_visibility()
 
-    def _on_loop_source_changed(self):
-        """「循环项」/「循环范围」按遍历来源分别出现。"""
-        self._sync_visibility()
-
     # ------------------------------
-    # 变量下拉（直接关联数据源/项目变量）
+    # 变量下拉
     # ------------------------------
-    def _data_source_ready(self) -> bool:
-        """当前项目的数据源是否已配好路径（循环来源选「数据源」时需要）。"""
-        if not self._data_source:
-            return False
-        try:
-            return DataSourceConfig.from_dict(self._data_source).configured
-        except Exception:
-            return False
-
-    def _var_names(self) -> list:
-        """可引用的变量：数据源字段 + 项目变量 + 循环项。"""
-        names = []
-        if self._data_source:
-            try:
-                names.extend(list_columns(DataSourceConfig.from_dict(
-                    self._data_source)))
-            except Exception:
-                pass
-        names.extend(self._variables.keys())
-        names.extend(["loop.item", "loop.index", "loop.zero_index"])
-        out = []
-        for n in names:
-            if n and n not in out:
-                out.append(n)
-        return out
-
     def _refresh_var_combos(self):
-        names = self._var_names()
+        names = list(self._var_names_list)
         for combo, placeholder in (
             (self.var_combo, "插入变量 ▾"),
-            (self.loop_range_var_combo, "插入变量 ▾"),
+            (self.loop_expr_var_combo, "插入变量 ▾"),
             (self.cond_var_combo, "插入变量 ▾"),
             (self.script_var_combo, "添加变量 ▾"),
         ):
@@ -622,22 +561,18 @@ class StepEditDialog(QDialog):
                 combo.addItem(f"{{{{{n}}}}}", n)
             combo.blockSignals(False)
 
-        # 只有 loop.* （自动附加）不算"有变量"，仍提示去哪里配置
+        # 名字不写全也能看懂：自定义变量 + 节点产出的，不算「运行时」的那些
         user_names = [n for n in names if not n.startswith("loop.")]
         if user_names:
-            src = ""
-            if self._data_source:
-                from pathlib import Path as _P
-                src = _P(self._data_source.get("path", "")).name
             self.value_hint.setText(
-                f"可用变量 {len(names)} 个"
-                + (f"（数据源：{src}）" if src else "")
-                + "，从右侧下拉选择即可插入。"
+                f"可用变量 {len(names)} 个，从右侧下拉选择即可插入。\n"
+                "循环体内可以用 {{loop.item.字段}} 取当前这一项、"
+                "{{loop.index}} 取第几轮。"
             )
         else:
             self.value_hint.setText(
-                "暂无可用变量：可先在主界面点【项目管理…】→【数据源与字段】配置，"
-                "或在【变量清单】里手工添加变量。"
+                "暂无变量：在【项目管理…】→【变量清单】里加自定义变量，"
+                "或者新增一个「读取数据」节点让它产出变量。"
             )
 
     def _insert_variable(self, index: int):
@@ -649,14 +584,14 @@ class StepEditDialog(QDialog):
         self.value_edit.setFocus()
         self.var_combo.setCurrentIndex(0)
 
-    def _insert_loop_range_var(self, index: int):
-        """把选中的变量插入到「索引范围」光标处。"""
-        name = self.loop_range_var_combo.itemData(index)
+    def _insert_loop_expr_var(self, index: int):
+        """把选中的变量插入到「循环内容」光标处。"""
+        name = self.loop_expr_var_combo.itemData(index)
         if not name:
             return
-        self.loop_range_edit.insert(f"{{{{{name}}}}}")
-        self.loop_range_edit.setFocus()
-        self.loop_range_var_combo.setCurrentIndex(0)
+        self.loop_expr_edit.insert(f"{{{{{name}}}}}")
+        self.loop_expr_edit.setFocus()
+        self.loop_expr_var_combo.setCurrentIndex(0)
 
     def _insert_script_var(self, index: int):
         """把选中的变量追加到「传入变量」列表。"""
@@ -683,8 +618,8 @@ class StepEditDialog(QDialog):
     def _on_cond_mode_changed(self):
         is_expr = self.cond_mode_combo.currentData() == "expr"
         self.cond_expr_edit.setPlaceholderText(
-            "Python 表达式，如 len({{row.正文}}) > 500"
-            if is_expr else "要判断的变量，如 {{row.地区}}"
+            "Python 表达式，如 len({{loop.item.内容}}) > 500"
+            if is_expr else "要判断的变量，如 {{loop.item.地区}}"
         )
         self.cond_hint.setText(
             "表达式里可以直接写 {{变量}}（系统会按数字/文本自动代入）；\n"
@@ -834,10 +769,9 @@ class StepEditDialog(QDialog):
         self.script_timeout.setValue(s.script_timeout or 30)
         self._on_script_lang_changed()
 
-        src_idx = self.loop_source_combo.findData(s.loop_source or "data")
-        self.loop_source_combo.setCurrentIndex(max(0, src_idx))
-        self.loop_items_edit.setPlainText(s.loop_items or "")
-        self.loop_range_edit.setText(s.loop_range or "")
+        self.output_var_edit.setText(s.output_var or "")
+        self.read_panel.load(s.data_cfg or {})
+        self.loop_expr_edit.setText(s.loop_expr or "")
 
         mode_idx = self.cond_mode_combo.findData(s.cond_mode or "equal")
         self.cond_mode_combo.setCurrentIndex(max(0, mode_idx))
@@ -891,42 +825,31 @@ class StepEditDialog(QDialog):
                     "恢复元素只能填 XPath（例如 //*[@id='wpadminbar']），"
                     "说明文字请写到【备注】里"
                 )
-        elif action == "loop_start":
-            src = self.loop_source_combo.currentData()
-            if src == "list":
-                if not self.loop_items_edit.toPlainText().strip():
-                    errors.append(
-                        "循环方式选「变量 / 手动列表」时，必须填写循环项"
-                        "（每行一项，或整框写一个变量，如 {{文件列表}}）"
-                    )
-            elif src == "range":
-                raw = self.loop_range_edit.text().strip()
-                if not raw:
-                    errors.append(
-                        "循环方式选「索引范围」时，必须填写索引范围"
-                        "（写 10 就跑 10 次，或写 0-10，也可用变量如 {{次数}}）"
-                    )
-                elif not _LOOP_RANGE_RE.match(raw):
-                    errors.append(
-                        "索引范围格式不对：只能填数字、数字-数字，或 {{变量}}，"
-                        "例如 10、0-10、5-10、{{次数}}、0-{{列表}}"
-                    )
-                else:
-                    m = _LOOP_RANGE_LITERAL_RE.match(raw)
-                    if m and int(m.group(1)) > int(m.group(2)):
-                        errors.append("索引范围的起始值不能大于结束值")
-                    elif raw.isdigit() and int(raw) <= 0:
-                        errors.append("只写一个数时它表示跑多少次，要填大于 0 的整数")
-            elif not self._data_source_ready():
+        elif action == "read_data":
+            if not self.output_var_edit.text().strip():
                 errors.append(
-                    "还没配置数据源：请点主界面【项目管理…】→【数据源与字段】配置文件路径，"
-                    "或把「循环方式」改成「索引范围」/「变量 / 手动列表」"
+                    "「读取数据」必须填一个产出变量名（如 文章列表）——"
+                    "循环节点里就是靠这个名字引用它的"
+                )
+            data_cfg = self.read_panel.config()
+            if not data_cfg.get("path"):
+                errors.append("「读取数据」必须选好要读的文件 / 文件夹路径")
+            elif not self.read_panel.field_names():
+                errors.append(
+                    "还没有勾选要保存的字段：点【读取预览】，"
+                    "在「保存」列勾上要用的字段（如 标题 / 内容）"
+                )
+        elif action == "loop_start":
+            if not self.loop_expr_edit.text().strip():
+                errors.append(
+                    "「循环」必须填循环内容："
+                    "写数字＝跑几次（如 10），或写变量＝按它的长度跑（如 {{文章列表}}）"
                 )
         elif action == "condition_start":
             if not self.cond_expr_edit.text().strip():
                 errors.append(
                     "条件节点必须填写「判断内容」"
-                    "（变量相等就填变量，如 {{row.地区}}；表达式就写 Python 表达式）"
+                    "（变量相等就填变量，如 {{loop.item.地区}}；表达式就写 Python 表达式）"
                 )
             branches = self._read_branches()
             if not branches:
@@ -964,6 +887,9 @@ class StepEditDialog(QDialog):
         if action == "navigate":
             step.url = self.url_edit.text().strip()
             step.nav_timeout = int(self.nav_timeout.value())
+        elif action == "read_data":
+            step.output_var = self.output_var_edit.text().strip()
+            step.data_cfg = self.read_panel.config()
         elif action in ("click", "fill", "select"):
             step.locator = Locator(
                 type=self.locator_type.currentData(),
@@ -986,9 +912,7 @@ class StepEditDialog(QDialog):
             step.script_vars = self.script_vars.text().strip()
             step.script_timeout = self.script_timeout.value()
         elif action == "loop_start":
-            step.loop_source = self.loop_source_combo.currentData()
-            step.loop_items = self.loop_items_edit.toPlainText().strip()
-            step.loop_range = self.loop_range_edit.text().strip()
+            step.loop_expr = self.loop_expr_edit.text().strip()
         elif action == "condition_start":
             step.cond_mode = self.cond_mode_combo.currentData()
             step.cond_expr = self.cond_expr_edit.text().strip()

@@ -30,11 +30,9 @@ def main():
 
     steps = store.load_steps()
     variables = store.load_variables()
-    data_source = store.load_data_source()
     print(f"加载项目 [{name}]，共 {len(steps)} 步。")
     executor = StepExecutor(
         steps, variables, headless=False, project_dir=store.dir,
-        data_source=data_source,
     )
     try:
         executor.run()
