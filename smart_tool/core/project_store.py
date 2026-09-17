@@ -16,11 +16,15 @@ steps.json 结构：
 """
 import json
 import re
+import shutil
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from smart_tool import paths
+
+# 自动备份：每次真改内容写盘前，把现有的 steps.json 存成 bak1，最多留这么多份
+BACKUP_KEEP = 3
 
 
 @dataclass
@@ -210,7 +214,6 @@ class ProjectStore:
     def save(self, steps: List[Step], variables: Optional[Dict[str, str]] = None,
              layout_version: Optional[str] = None):
         """保存步骤与变量。variables/layout 为 None 时保留原值。"""
-        self.ensure()
         old = self.load()
         data: Dict[str, Any] = {"steps": [s.to_dict() for s in steps]}
         data["variables"] = (
@@ -222,9 +225,7 @@ class ProjectStore:
             layout_version if layout_version is not None
             else old.get("layout", "")
         )
-        self.steps_file.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        self._write(data)
 
     def save_variables(self, variables: Dict[str, str]):
         """只更新变量，步骤保持不变。"""
@@ -243,13 +244,50 @@ class ProjectStore:
 
     def save_canvas_edges(self, edges: List[list]):
         """只更新画布手动连线，其余配置保持不变。"""
-        self.ensure()
-        old = self.load()
-        data = dict(old)
+        data = dict(self.load())
         data["canvas_edges"] = [[a, b] for a, b in edges]
+        self._write(data)
+
+    # ------------------------------
+    # 写盘 + 自动备份
+    # ------------------------------
+    def _write(self, data: Dict[str, Any]):
+        """写 steps.json；写之前先备份一份现有的（位置类改动不占备份额度）。"""
+        self.ensure()
+        self._backup_steps(data)
         self.steps_file.write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+
+    def _backup_steps(self, new_data: Dict[str, Any]):
+        """把现有的 steps.json 备份成 steps.json.bak1，旧的依次往后挪。
+
+        最多留 BACKUP_KEEP 份：bak1 最新、bak3 最旧。
+        只挪了画布位置 / 手动连线这种「没动内容」的写盘会跳过，
+        免得随手拖两下就把早先的好版本挤出备份队列。
+        """
+        if not self.steps_file.exists():
+            return
+        try:
+            old = json.loads(self.steps_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if _content_key(old) == _content_key(new_data):
+            return
+
+        baks = [self.steps_file.with_name(f"{self.steps_file.name}.bak{i}")
+                for i in range(1, BACKUP_KEEP + 1)]
+        # 先往后挪：bak2→bak3、bak1→bak2，再把当前文件存成 bak1
+        for older, newer in zip(reversed(baks[1:]), reversed(baks[:-1])):
+            if newer.exists():
+                try:
+                    shutil.copy2(newer, older)
+                except OSError:
+                    pass
+        try:
+            shutil.copy2(self.steps_file, baks[0])
+        except OSError:
+            pass
 
     def image_count(self) -> int:
         """img 目录内图片文件数量（删除前提示用）。"""
@@ -260,9 +298,21 @@ class ProjectStore:
                    if f.is_file() and f.suffix.lower() in exts)
 
     def delete(self):
-        """删除整个项目目录（含 steps.json 与 img 截图）。"""
-        import shutil
+        """删除整个项目目录（含 steps.json 与 img 截图、备份）。"""
         shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def _content_key(data: Dict[str, Any]) -> str:
+    """「实质内容」指纹：忽略画布坐标与手动连线，用来判断这次写盘算不算真改动。"""
+    steps = []
+    for s in data.get("steps") or []:
+        if isinstance(s, dict):
+            s = {k: v for k, v in s.items() if k != "pos"}
+        steps.append(s)
+    return json.dumps(
+        {"steps": steps, "variables": data.get("variables") or {}},
+        ensure_ascii=False, sort_keys=True,
+    )
 
 
 # ------------------------------
