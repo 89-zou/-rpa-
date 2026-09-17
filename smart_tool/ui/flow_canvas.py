@@ -6,14 +6,14 @@
   下一行反向（右→左），使连线始终最短；可随时点【自动排版】重排
 - 「循环开始/结束」「条件/分支/条件结束」这类配套节点用虚线框圈在一起：
   **结束端（循环结束 / 条件结束）在画布上不画卡片**（只在【流程编辑】里显示）
-- 块的内部连线一律是「扇出」风格，不把块里的节点串成一串：
-    - **循环体**：从「循环开始」卡分别连线到循环体的每个顶层单元，
-      **单元之间不连线**（循环的重复由紫色虚线框表达）
-    - **条件**：条件卡 → 各分支卡（蓝色扇出），分支之间不连线
-    - **分支体**：分支卡 → 分支体第一单元，之后照常顺序连线（分支体是顺序执行的）
-- 箭头连到「一个块」时，直接落在它最外层的虚线框上（不伸进框里去够卡片）；
-  分支不套框，所以分支的端点就是分支卡本身
-- 虚线框只有循环（紫）和条件（蓝）两种：**分支不套框**（靠分支卡片与扇出箭头区分）
+- 自动连线**只画「相邻的两个普通步骤卡片」**之间的灰色箭头（循环体 / 分支体
+  内部也照样连）；涉及循环、条件的一律不自动画——先后顺序看编号就够了，
+  也免得把并行的分支画成顺序
+- 想画哪条箭头，点工具栏【连线】自己在画布上连（点起点 → 点终点）；
+  点橙色箭头即可删掉。只影响画布展示，不动执行顺序
+  （存在 steps.json 的 canvas_edges 里，执行器不读它）
+- 箭头连到「一个块」时，直接落在它最外层的虚线框上（不伸进框里去够卡片）
+- 虚线框只有循环（紫）和条件（蓝）两种：**分支不套框**（靠分支卡片区分）
 - **拖虚线框＝整块移动**（块里嵌套的块与所有卡片一起走）；拖单个卡片仍是单独移动
 - 块可以嵌套（分支里放循环等），框按层级一层层套
 - 位置持久化到每个步骤的 pos；执行顺序由步骤列表顺序决定
@@ -317,11 +317,11 @@ class EdgeItem(QGraphicsPathItem):
     """节点之间的连线（可虚线、可带箭头；自动选择横/竖贝塞尔走向）。"""
 
     def __init__(self, color: str = "#9aa4b2", dashed: bool = False,
-                 arrow: bool = True):
+                 arrow: bool = True, width: float = 1.0):
         super().__init__()
         self._end = QPointF()
         self._arrow = arrow
-        pen = QPen(QColor(color), 1.0)
+        pen = QPen(QColor(color), width)
         if dashed:
             pen.setStyle(Qt.PenStyle.DashLine)
         self.setPen(pen)
@@ -400,6 +400,9 @@ REGION_COLORS = {
     "condition": "#2f6fb3",
 }
 
+# 手动连线的颜色（橙色，和自动连线的灰色区分开）
+MANUAL_EDGE_COLOR = "#f08a24"
+
 
 class _LoopBoxPort:
     """把块虚线框当成一个连线端点：外部箭头接到框上，框内部不画箭头。
@@ -452,6 +455,11 @@ class LoopRegion(QGraphicsRectItem):
         self._label = label
         self.setRect(rect)
         self.update()
+
+    @property
+    def span(self):
+        """这个框对应的块范围（连线模式里认它是「哪一块」）。"""
+        return self._span
 
     # ---- 拖框 = 整块移动 ----
     def mousePressEvent(self, event):
@@ -520,6 +528,15 @@ class _View(QGraphicsView):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_menu)
 
+    def mousePressEvent(self, event):
+        """连线模式下：左键点击交给画布处理（选端点 / 删手动箭头）。"""
+        if (self._canvas.connect_mode()
+                and event.button() == Qt.MouseButton.LeftButton):
+            self._canvas.handle_connect_click(self.itemAt(event.pos()))
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
     def wheelEvent(self, event):
         """Ctrl+滚轮 自由缩放（以鼠标位置为中心）；普通滚轮仍为上下滚动。"""
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -550,6 +567,8 @@ class FlowCanvas(QWidget):
     context_menu_requested = pyqtSignal(object, object)    # (step_id|None, 全局pos)
     positions_changed = pyqtSignal()                       # 拖拽结束
     auto_layout_applied = pyqtSignal()                     # 自动排版完成（需落盘）
+    edges_changed = pyqtSignal()                           # 手动连线增删（需落盘）
+    connect_status = pyqtSignal(str)                       # 连线模式的状态提示
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -569,6 +588,10 @@ class FlowCanvas(QWidget):
         self._edges: List[EdgeItem] = []
         self._edge_pairs: List[Tuple[EdgeItem, object, object]] = []
         self._spans: List[blocks.Span] = []
+        self._manual_edges: List[Tuple[object, object]] = []   # 手动连线（ref 对）
+        self._manual_edge_items: List[EdgeItem] = []           # 与 _manual_edges 一一对应
+        self._connect_mode = False                             # 是否处于连线模式
+        self._pending_source = None                            # 连线模式下已选的起点
         self._regions: List[LoopRegion] = []
         self._region_spans: List[blocks.Span] = []   # 与 _regions 一一对应
         self._block_moving = False                   # 整块拖动中：跳过逐节点刷新
@@ -742,6 +765,7 @@ class FlowCanvas(QWidget):
         self._nodes = {}
         self._edges = []
         self._edge_pairs = []
+        self._manual_edge_items = []
         self._spans = []
         self._regions = []
         self._region_spans = []
@@ -879,82 +903,34 @@ class FlowCanvas(QWidget):
         return units
 
     def _build_edges(self):
-        """分层连线。
+        """自动连线：**只连「相邻的两个普通步骤卡片」**。
 
-        - 顶层：相邻单元依次连线；循环 / 条件整块算一个单元；
-        - **循环体内部：从「循环开始」卡分别连线到循环体的每个顶层单元，
-          单元之间不连线**——和「条件 → 各分支」的展示风格一致，
-          循环的重复由紫色虚线框表达，不用箭头串成一串；
-        - 条件内部：「条件」卡扇出蓝色箭头指向各个「分支」，分支之间不连线；
-        - 分支内部：分支卡 → 分支体第一单元，之后照常顺序连线；
-        - 嵌套的块在内部递归处理（分支里放循环、循环里放条件都支持）。
+        循环 / 条件相关的箭头（框的进出、循环体内的扇出、条件→各分支、
+        分支卡→分支体）一律不自动画：
+        - 先后顺序本来就能从编号看出来；
+        - 想画哪条，点工具栏的【连线】自己在画布上连（也能删），
+          比自动猜更准，也不会把并行的分支画成顺序。
+
+        块内部照样递归进去，所以「循环体里相邻的两个普通步骤」「分支体里
+        相邻的普通步骤」之间仍然会自动连。
         """
-        self._collect_edges(0, len(self._steps), mode="seq")
-        self._build_branch_fanout()
+        self._collect_edges(0, len(self._steps))
+        self._build_manual_edges()
 
-    def _build_branch_fanout(self):
-        """条件 → 各分支 的箭头。
-
-        只连这个条件**自己的**分支：用 _units_in 把内部切成顶层单元，
-        嵌套条件整块算一个单元（它的分支由它自己那轮循环去连），
-        否则嵌套条件里的分支会被误当成外层条件的分支，多画出错误的扇出箭头。
-        """
-        for sp in self._spans:
-            if sp.kind != "condition":
-                continue
-            cond_node = self._nodes.get(self._steps[sp.start].id)
-            if cond_node is None:
-                continue
-            for u in self._units_in(sp.inner_lo, sp.inner_hi):
-                if not isinstance(u, tuple):
-                    continue
-                br_sp = self._span_by_start(u[1])
-                if br_sp is None or br_sp.kind != "branch":
-                    continue
-                br_node = self._nodes.get(self._steps[br_sp.start].id)
-                if br_node is None:
-                    continue
-                edge = EdgeItem(color=REGION_COLORS["condition"])
-                self._scene.addItem(edge)
-                edge.connect_nodes(cond_node, br_node)
-                self._edges.append(edge)
-                self._edge_pairs.append((edge, cond_node.step.id, br_node.step.id))
-
-    def _collect_edges(self, lo: int, hi: int, mode: str = "seq", hub=None):
-        """给 [lo, hi) 里的顶层单元连线，并递归处理里面嵌套的块。
-
-        :param mode: "seq"    相邻单元依次连线（顶层与分支体内部用）
-                     "fanout" 从 hub 卡分别连到每个单元，**单元之间不连线**
-                              （循环体内部用，和「条件 → 各分支」风格一致）
-                     "none"   本层不连线（条件的直接内部由蓝扇出表达）
-        :param hub:  fanout 模式的起点卡片（循环的「循环开始」卡）
-        """
+    def _collect_edges(self, lo: int, hi: int):
+        """连 [lo, hi) 里相邻的普通步骤，并递归进块内部。"""
         units = self._units_in(lo, hi)
-        if mode == "seq":
-            for k in range(len(units) - 1):
-                self._add_edge(units[k], units[k + 1])
-        elif mode == "fanout" and hub is not None:
-            for u in units:
-                self._add_edge(hub.step.id, u)
-
+        for k in range(len(units) - 1):
+            a, b = units[k], units[k + 1]
+            if isinstance(a, tuple) or isinstance(b, tuple):
+                continue        # 任一端是块（框 / 分支标记）→ 不自动画
+            self._add_edge(a, b)
         for u in units:
             if not isinstance(u, tuple):
                 continue
             sp = self._span_by_start(u[1])
-            if sp is None:
-                continue
-            if sp.kind == "loop":
-                # 循环体：从「循环开始」卡扇出到每个顶层单元
-                start_node = self._nodes.get(self._steps[sp.start].id)
-                self._collect_edges(sp.inner_lo, sp.inner_hi,
-                                    mode="fanout", hub=start_node)
-            elif sp.kind == "branch":
-                # 分支：分支卡 → 分支体第一单元，分支体内部顺序连线
-                self._add_branch_entry(sp)
-                self._collect_edges(sp.inner_lo, sp.inner_hi, mode="seq")
-            else:
-                # 条件：内部只有「条件 → 各分支」的蓝扇出，分支之间没有顺序
-                self._collect_edges(sp.inner_lo, sp.inner_hi, mode="none")
+            if sp is not None:
+                self._collect_edges(sp.inner_lo, sp.inner_hi)
 
     def _add_edge(self, ref_a, ref_b) -> None:
         """连一条灰色箭头（任一端拿不到就跳过）。"""
@@ -967,12 +943,151 @@ class FlowCanvas(QWidget):
         self._edges.append(edge)
         self._edge_pairs.append((edge, ref_a, ref_b))
 
-    def _add_branch_entry(self, sp) -> None:
-        """分支卡 → 分支体第一单元（分支没有出口箭头：执行完自然走到条件结束）。"""
-        inner_units = self._units_in(sp.inner_lo, sp.inner_hi)
-        if not inner_units:
+    # ------------------------------
+    # 手动连线（只在画布上展示，不参与执行顺序）
+    # ------------------------------
+    def set_manual_edges(self, edges: List[list]):
+        """载入手动连线。
+
+        每一端写成：步骤 id（卡片）或 "frame:<起始步骤id>"（循环 / 条件框）。
+        端点已经不存在的连线直接丢掉——步骤 id 会随增删重排，
+        留着的话会连到别的步骤上。
+        """
+        self._manual_edges = []
+        for pair in edges or []:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                continue
+            a, b = self._parse_anchor(pair[0]), self._parse_anchor(pair[1])
+            if a is None or b is None or a == b:
+                continue
+            self._manual_edges.append((a, b))
+        if self._steps:
+            self._rebuild_scene(keep_view=True)
+
+    def manual_edges(self) -> List[list]:
+        """导出成可写进 steps.json 的样子。"""
+        return [[self._anchor_value(a), self._anchor_value(b)]
+                for a, b in self._manual_edges]
+
+    def _parse_anchor(self, value):
+        """手动连线的一端 → 内部 ref（步骤 id 或 ("box", 下标)）；无效返回 None。"""
+        if isinstance(value, str) and value.startswith("frame:"):
+            try:
+                sid = int(value.split(":", 1)[1])
+            except ValueError:
+                return None
+            for i, s in enumerate(self._steps):
+                if s.id == sid:
+                    sp = self._span_by_start(i)
+                    return ("box", i) if (sp and sp.kind in REGION_COLORS) else None
+            return None
+        try:
+            sid = int(value)
+        except (TypeError, ValueError):
+            return None
+        return sid if any(s.id == sid for s in self._steps) else None
+
+    def _anchor_value(self, ref):
+        """内部 ref → 写进 json 的值。"""
+        if isinstance(ref, tuple):
+            return f"frame:{self._steps[ref[1]].id}"
+        return ref
+
+    def _build_manual_edges(self):
+        """画手动连的箭头（橙色，比自动箭头粗一点，一眼能认出来）。"""
+        for ref_a, ref_b in self._manual_edges:
+            a, b = self._endpoint(ref_a), self._endpoint(ref_b)
+            if a is None or b is None:
+                continue
+            edge = EdgeItem(color=MANUAL_EDGE_COLOR, width=1.4)
+            self._scene.addItem(edge)
+            edge.connect_nodes(a, b)
+            self._edges.append(edge)
+            self._edge_pairs.append((edge, ref_a, ref_b))
+            self._manual_edge_items.append(edge)   # 与 _manual_edges 一一对应
+
+    # ------------------------------
+    # 连线模式
+    # ------------------------------
+    def set_connect_mode(self, on: bool):
+        """开关「连线」模式：点起点 → 点终点＝连一条；点橙色箭头＝删掉它。"""
+        self._connect_mode = bool(on)
+        self._pending_source = None
+        self._view.setCursor(
+            Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor
+        )
+        if on:
+            self.connect_status.emit(
+                "连线模式：点一个节点/循环框/条件框当起点，再点一个当终点；"
+                "点橙色箭头可以删掉它。再点一次【连线】退出。"
+            )
+        else:
+            self.connect_status.emit("已退出连线模式。")
+
+    def connect_mode(self) -> bool:
+        return self._connect_mode
+
+    def handle_connect_click(self, item) -> None:
+        """连线模式下点了某个图元（由视图转发过来）。"""
+        # 点到手动箭头 → 删除
+        if isinstance(item, EdgeItem):
+            if item in self._manual_edge_items:
+                idx = self._manual_edge_items.index(item)
+                self._manual_edges.pop(idx)
+                self._rebuild_scene(keep_view=True)
+                self.edges_changed.emit()
+                self.connect_status.emit("已删除这条手动连线。")
+            else:
+                self.connect_status.emit(
+                    "这条是自动画的箭头（灰色/蓝色），不能删。"
+                )
             return
-        self._add_edge(self._steps[sp.start].id, inner_units[0])
+
+        ref = self._anchor_of_item(item)
+        if ref is None:
+            self.connect_status.emit("这里连不了：请点节点卡片、循环框或条件框。")
+            return
+        if self._pending_source is None:
+            self._pending_source = ref
+            if isinstance(item, NodeItem):
+                item.setSelected(True)      # 起点给个高亮，好认
+            self.connect_status.emit(
+                f"起点已选：{self._anchor_label(ref)}。再点一个节点/框作为终点。"
+            )
+            return
+        if ref == self._pending_source:
+            self._pending_source = None
+            self.connect_status.emit("起点和终点是同一个，已取消。")
+            return
+        if (self._pending_source, ref) in self._manual_edges:
+            self._pending_source = None
+            self.connect_status.emit("这两点之间已经有手动连线了。")
+            return
+        self._manual_edges.append((self._pending_source, ref))
+        self._pending_source = None
+        self._rebuild_scene(keep_view=True)
+        self.edges_changed.emit()
+        self.connect_status.emit("已连上（橙色箭头）。可以继续连，或退出连线模式。")
+
+    def _anchor_of_item(self, item):
+        """图元 → 连线端点 ref；不是可连的图元返回 None。"""
+        if isinstance(item, NodeItem):
+            return item.step.id
+        if isinstance(item, LoopRegion) and item.span is not None:
+            return ("box", item.span.start)
+        return None
+
+    def _anchor_label(self, ref) -> str:
+        if isinstance(ref, tuple):
+            sp = self._span_by_start(ref[1])
+            if sp is None:
+                return "（框）"
+            return f"{self._steps[sp.start].id}. {self._region_label(sp)}"
+        step = next((s for s in self._steps if s.id == ref), None)
+        if step is None:
+            return f"#{ref}"
+        name, _ = ACTION_META.get(step.action, (step.action, ""))
+        return f"{step.id}. {step.title or name}"
 
     def _build_regions(self):
         """循环 / 条件各画一个虚线框（嵌套时框也嵌套）；分支不画框。
