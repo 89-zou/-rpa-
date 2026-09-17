@@ -163,6 +163,14 @@ class StepEditDialog(QDialog):
             self.action_combo.addItem(ACTION_LABELS[a], a)
         self.action_combo.currentIndexChanged.connect(self._on_action_changed)
         form.addRow("动作：", self.action_combo)
+        self.title_edit = QLineEdit()
+        self.title_edit.setPlaceholderText("给自己看的名称（留空＝用上面的动作名）")
+        self.title_edit.setToolTip(
+            "画布和流程列表上显示的名称。\n"
+            "例如把「7. 打开网页」改成「7. 打开写文章页」，一眼就知道这一步在干嘛。\n"
+            "动作类型（打开网页/点击/循环…）会另外用一行小灰字标出来。"
+        )
+        form.addRow("名称：", self.title_edit)
 
         # --- navigate 组 ---
         self.url_edit = QLineEdit()
@@ -793,6 +801,7 @@ class StepEditDialog(QDialog):
         self.action_combo.setCurrentIndex(max(0, idx))
 
         self.url_edit.setText(s.url)
+        self.title_edit.setText(s.title)
         self.nav_timeout.setValue(int(s.nav_timeout or 120))
         if s.locator:
             self.locator_type.setCurrentIndex(
@@ -950,6 +959,7 @@ class StepEditDialog(QDialog):
         """收集表单为 Step。id 由调用方统一重排。"""
         action = self._current_action()
         step = Step(id=self._step_id, action=action)
+        step.title = self.title_edit.text().strip()
 
         if action == "navigate":
             step.url = self.url_edit.text().strip()

@@ -78,7 +78,9 @@ class _StepCard(QWidget):
             prefix = "⤴ "
         elif step.action == "branch":
             prefix = "⑂ "
-        title = QLabel(f"{prefix}{step.id}. {name}")
+        # 自定义名称优先，后面跟上类型名（如「登录页（打开网页）」）
+        shown = f"{step.title}（{name}）" if step.title else name
+        title = QLabel(f"{prefix}{step.id}. {shown}")
         title_font = QFont()
         title_font.setBold(True)
         title.setFont(title_font)

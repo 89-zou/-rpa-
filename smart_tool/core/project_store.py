@@ -28,6 +28,7 @@ class Step:
     id: int
     # navigate/click/fill/select/pause_for_human/loop_start/loop_end/script
     action: str
+    title: str = ""                        # 自定义名称（画布/列表上显示；空＝用动作默认名）
     url: str = ""                          # navigate 用
     locator: Optional[Locator] = None      # click/fill/select 用
     value: str = ""                        # fill 用（可含 {{变量}}）
@@ -71,6 +72,8 @@ class Step:
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {"id": self.id, "action": self.action}
+        if self.title:
+            d["title"] = self.title
         if self.url:
             d["url"] = self.url
         if self.locator:
@@ -129,6 +132,7 @@ class Step:
         return cls(
             id=d["id"],
             action=d["action"],
+            title=d.get("title", ""),
             url=d.get("url", ""),
             locator=locator,
             value=d.get("value", ""),
