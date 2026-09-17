@@ -16,20 +16,23 @@ from typing import Optional
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QPixmap
 from PyQt6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
-    QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
+    QPlainTextEdit, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
+from smart_tool.core import blocks
 from smart_tool.core.data_sources import DataSourceConfig, list_columns
 from smart_tool.core.project_store import Locator, Step
 
 ACTIONS = [
     "navigate", "click", "fill", "select", "pause_for_human",
-    "loop_start", "loop_end", "script",
+    "loop_start", "loop_end", "condition_start", "condition_end", "branch",
+    "script",
 ]
-# 新建步骤时不出现在菜单里的动作：「循环结束」由「循环」自动配对生成
-NEW_STEP_HIDDEN = {"loop_end"}
+# 新建步骤时不出现在菜单里的动作：这些标记由系统配对生成
+NEW_STEP_HIDDEN = {"loop_end", "condition_end", "branch"}
 ACTION_LABELS = {
     "navigate": "打开网页 navigate",
     "click": "点击 click",
@@ -38,10 +41,16 @@ ACTION_LABELS = {
     "pause_for_human": "暂停等人工 pause_for_human",
     "loop_start": "循环 loop（自动带上「循环结束」，夹在中间的步骤会重复执行）",
     "loop_end": "循环结束（设置与「循环开始」共用，点哪个都是编辑这个循环）",
+    "condition_start": "条件 if/else（自动带上分支与「条件结束」，按结果走某个分支）",
+    "condition_end": "条件结束（设置与「条件」共用，点哪个都是编辑这个条件）",
+    "branch": "分支（匹配值在「条件」节点里改，点它会打开那个条件）",
     "script": "自由代码 script（Python / JavaScript）",
 }
-# 循环标记不需要任何字段，只需备注
-LOOP_ACTIONS = {"loop_start", "loop_end"}
+# 条件判断方式
+COND_MODES = [
+    ("equal", "变量相等（变量值跟分支的匹配值比，一样就走那个分支）"),
+    ("expr", "表达式（写 Python 表达式，如 len({{row.正文}}) > 500）"),
+]
 SCRIPT_LANGS = [("python", "Python（本地执行）"),
                 ("javascript", "JavaScript（在网页里执行）")]
 
@@ -299,12 +308,81 @@ class StepEditDialog(QDialog):
             "· 循环方式选「数据源」：每行一次，字段用 {{row.列名}} / {{file.content}} 引用；\n"
             "· 选「变量 / 手动列表」：每行一项；整框只写 {{变量名}} 时按该变量展开，\n"
             "  列表项是对象（如 JSON 数组）时，它的键同样可以用 {{row.键}} 引用；\n"
-            "· 选「索引范围」：按次数或索引区间重复，{{loop.item}} 就是当前索引。\n"
-            "不支持嵌套循环。"
+            "· 选「索引范围」：按次数或索引区间重复，{{loop.item}} 就是当前索引。"
         )
         self.loop_hint.setWordWrap(True)
         self.loop_hint.setStyleSheet("color: #7a4fb5;")
         form.addRow("", self.loop_hint)
+
+        # --- 条件节点（condition_start）---
+        self.cond_mode_combo = QComboBox()
+        for key, label in COND_MODES:
+            self.cond_mode_combo.addItem(label, key)
+        self.cond_mode_combo.currentIndexChanged.connect(self._on_cond_mode_changed)
+        form.addRow("判断方式：", self.cond_mode_combo)
+
+        self.cond_expr_edit = QLineEdit()
+        self.cond_expr_edit.setPlaceholderText("要判断的变量，如 {{row.地区}}")
+        self.cond_var_combo = QComboBox()
+        self.cond_var_combo.setMinimumWidth(190)
+        self.cond_var_combo.setToolTip("选择后把变量插入到判断内容里")
+        self.cond_var_combo.activated.connect(self._insert_cond_var)
+        self.cond_row = QWidget()
+        cond_row_layout = QHBoxLayout(self.cond_row)
+        cond_row_layout.setContentsMargins(0, 0, 0, 0)
+        cond_row_layout.addWidget(self.cond_expr_edit, 1)
+        cond_row_layout.addWidget(self.cond_var_combo)
+        form.addRow("判断内容：", self.cond_row)
+
+        self.cond_hint = QLabel("")
+        self.cond_hint.setWordWrap(True)
+        self.cond_hint.setStyleSheet("color: #888;")
+        form.addRow("", self.cond_hint)
+
+        self.branch_table = QTableWidget(0, 2)
+        self.branch_table.setHorizontalHeaderLabels(
+            ["分支名（自己看得懂就行）", "匹配值（逗号分隔多个；表达式模式可留空）"]
+        )
+        self.branch_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents)
+        self.branch_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch)
+        self.branch_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.branch_table.setMinimumHeight(120)
+        form.addRow("分支：", self.branch_table)
+
+        branch_btns = QWidget()
+        bb = QHBoxLayout(branch_btns)
+        bb.setContentsMargins(0, 0, 0, 0)
+        self.btn_add_branch = QPushButton("＋ 添加分支")
+        self.btn_add_branch.clicked.connect(lambda: self._add_branch_row())
+        bb.addWidget(self.btn_add_branch)
+        self.btn_del_branch = QPushButton("－ 删除选中分支")
+        self.btn_del_branch.clicked.connect(self._remove_branch_row)
+        bb.addWidget(self.btn_del_branch)
+        self.cond_count_label = QLabel("")
+        self.cond_count_label.setStyleSheet("color:#777;")
+        bb.addWidget(self.cond_count_label, 1)
+        form.addRow("", branch_btns)
+
+        self.cond_branch_hint = QLabel(
+            "执行时会先算出「判断内容」的结果，然后从上往下找第一个匹配的分支，"
+            "只执行那个分支里的步骤；都不匹配就整个跳过（后面步骤照常执行）。\n"
+            "「变量相等」：变量值跟某分支的某个匹配值一样 → 走这个分支；\n"
+            "「表达式」：结果是真/假时走第 1 / 第 2 个分支，结果是别的值时按匹配值走。\n"
+            "删除分支会把它里面的步骤一起删掉。"
+        )
+        self.cond_branch_hint.setWordWrap(True)
+        self.cond_branch_hint.setStyleSheet("color: #888;")
+        form.addRow("", self.cond_branch_hint)
+
+        self._cond_widgets = [
+            self.cond_mode_combo, self.cond_row, self.cond_hint,
+            self.branch_table, branch_btns, self.cond_branch_hint,
+        ]
+        # 被删除的分支行号（原下标），保存时由调用方据此删掉分支标记
+        self._dropped_branches: list = []
 
         # --- 自由代码节点（script）---
         self.script_lang_combo = QComboBox()
@@ -399,7 +477,8 @@ class StepEditDialog(QDialog):
         切换动作后就冒出用不到的输入框。
         """
         action = self._current_action()
-        is_loop = action in LOOP_ACTIONS
+        is_loop = action in ("loop_start", "loop_end")
+        is_cond = action == "condition_start"
         is_locate = action in ("click", "fill", "select")
         is_fill = action in ("fill", "select")
         is_image = is_locate and self.locator_type.currentData() == "image"
@@ -435,6 +514,8 @@ class StepEditDialog(QDialog):
         self._show(self.loop_items_edit, is_loop and loop_src == "list")
         for w in (self.loop_range_row, self.loop_range_hint):
             self._show(w, is_loop and loop_src == "range")
+        for w in self._cond_widgets:
+            self._show(w, is_cond)
 
         self.locator_value.setPlaceholderText(
             "选择截图后自动填入 img/xxx.png" if is_image
@@ -443,6 +524,12 @@ class StepEditDialog(QDialog):
         self.adjustSize()
 
     def _on_action_changed(self):
+        # 新建条件节点时先给两个空分支，省得用户还要手动加
+        if (not self._editing and self._current_action() == "condition_start"
+                and self.branch_table.rowCount() == 0):
+            self._add_branch_row("分支 1")
+            self._add_branch_row("分支 2")
+        self._on_cond_mode_changed()
         self._sync_visibility()
 
     def _on_locator_type_changed(self):
@@ -495,6 +582,7 @@ class StepEditDialog(QDialog):
         for combo, placeholder in (
             (self.var_combo, "插入变量 ▾"),
             (self.loop_range_var_combo, "插入变量 ▾"),
+            (self.cond_var_combo, "插入变量 ▾"),
             (self.script_var_combo, "添加变量 ▾"),
         ):
             combo.blockSignals(True)
@@ -558,6 +646,78 @@ class StepEditDialog(QDialog):
         is_js = self.script_lang_combo.currentData() == "javascript"
         self.script_hint.setText(SCRIPT_HINT_JS if is_js else SCRIPT_HINT_PY)
         self.script_timeout.setSuffix(" 秒" + ("" if is_js else "（仅提示，不强制中断）"))
+
+    # ------------------------------
+    # 条件分支表
+    # ------------------------------
+    def _on_cond_mode_changed(self):
+        is_expr = self.cond_mode_combo.currentData() == "expr"
+        self.cond_expr_edit.setPlaceholderText(
+            "Python 表达式，如 len({{row.正文}}) > 500"
+            if is_expr else "要判断的变量，如 {{row.地区}}"
+        )
+        self.cond_hint.setText(
+            "表达式里可以直接写 {{变量}}（系统会按数字/文本自动代入）；\n"
+            "算出来是真/假 → 走第 1 / 第 2 个分支，算出来是别的值 → 按下面的匹配值走。"
+            if is_expr else
+            "把「判断内容」渲染出来的值，跟各分支的匹配值逐个比，一样就走那个分支。"
+        )
+        self.branch_table.setHorizontalHeaderLabels([
+            "分支名（自己看得懂就行）",
+            "匹配值（表达式结果是真/假时可留空）" if is_expr
+            else "匹配值（逗号分隔多个）",
+        ])
+        self._update_branch_count()
+
+    def _insert_cond_var(self, index: int):
+        """把选中的变量插入到「判断内容」光标处。"""
+        name = self.cond_var_combo.itemData(index)
+        if not name:
+            return
+        self.cond_expr_edit.insert(f"{{{{{name}}}}}")
+        self.cond_expr_edit.setFocus()
+        self.cond_var_combo.setCurrentIndex(0)
+
+    def _add_branch_row(self, name: str = "", values: str = "",
+                        origin: int = -1) -> int:
+        """加一行分支；origin 是它在原清单里的下标（新建的为 -1）。"""
+        row = self.branch_table.rowCount()
+        self.branch_table.insertRow(row)
+        name_item = QTableWidgetItem(name)
+        name_item.setData(Qt.ItemDataRole.UserRole, origin)
+        self.branch_table.setItem(row, 0, name_item)
+        self.branch_table.setItem(row, 1, QTableWidgetItem(values))
+        self._update_branch_count()
+        return row
+
+    def _remove_branch_row(self):
+        row = self.branch_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "提示", "请先在表里点一下要删除的分支。")
+            return
+        name_item = self.branch_table.item(row, 0)
+        origin = name_item.data(Qt.ItemDataRole.UserRole) if name_item else -1
+        if isinstance(origin, int) and origin >= 0:
+            self._dropped_branches.append(origin)
+        self.branch_table.removeRow(row)
+        self._update_branch_count()
+
+    def _read_branches(self) -> list:
+        out = []
+        for r in range(self.branch_table.rowCount()):
+            name_item = self.branch_table.item(r, 0)
+            value_item = self.branch_table.item(r, 1)
+            out.append({
+                "name": (name_item.text() if name_item else "").strip(),
+                "values": (value_item.text() if value_item else "").strip(),
+            })
+        return out
+
+    def _update_branch_count(self):
+        n = self.branch_table.rowCount()
+        self.cond_count_label.setText(
+            f"共 {n} 个分支" + ("（至少要 1 个）" if n < 1 else "")
+        )
 
     # ------------------------------
     # 截图选择
@@ -646,6 +806,14 @@ class StepEditDialog(QDialog):
         self.loop_items_edit.setPlainText(s.loop_items or "")
         self.loop_range_edit.setText(s.loop_range or "")
 
+        mode_idx = self.cond_mode_combo.findData(s.cond_mode or "equal")
+        self.cond_mode_combo.setCurrentIndex(max(0, mode_idx))
+        self.cond_expr_edit.setText(s.cond_expr or "")
+        self.branch_table.setRowCount(0)
+        for i, m in enumerate(s.cond_branches or []):
+            self._add_branch_row(m.get("name", ""), m.get("values", ""), origin=i)
+        self._on_cond_mode_changed()
+
         self.note_edit.setText(s.note)
 
     def _on_accept(self):
@@ -721,6 +889,23 @@ class StepEditDialog(QDialog):
                     "还没配置数据源：请点主界面【数据源…】配置文件路径，"
                     "或把「循环方式」改成「索引范围」/「变量 / 手动列表」"
                 )
+        elif action == "condition_start":
+            if not self.cond_expr_edit.text().strip():
+                errors.append(
+                    "条件节点必须填写「判断内容」"
+                    "（变量相等就填变量，如 {{row.地区}}；表达式就写 Python 表达式）"
+                )
+            branches = self._read_branches()
+            if not branches:
+                errors.append("条件节点至少要有一个分支（点【＋ 添加分支】）")
+            elif self.cond_mode_combo.currentData() == "equal":
+                empty = [str(i + 1) for i, b in enumerate(branches)
+                         if not b["values"]]
+                if empty:
+                    errors.append(
+                        "「变量相等」模式下每个分支都要填匹配值，"
+                        f"第 {'、'.join(empty)} 个分支还是空的"
+                    )
         elif action == "script":
             if not self.script_code.toPlainText().strip():
                 errors.append("自由代码节点必须填写脚本代码")
@@ -768,6 +953,12 @@ class StepEditDialog(QDialog):
             step.loop_source = self.loop_source_combo.currentData()
             step.loop_items = self.loop_items_edit.toPlainText().strip()
             step.loop_range = self.loop_range_edit.text().strip()
+        elif action == "condition_start":
+            step.cond_mode = self.cond_mode_combo.currentData()
+            step.cond_expr = self.cond_expr_edit.text().strip()
+            step.cond_branches = self._read_branches()
+            # 界面记下的「被删掉的分支行号」，调用方据此删掉对应分支标记
+            step.cond_dropped = sorted(set(self._dropped_branches))
 
         step.note = self.note_edit.text().strip()
         return step

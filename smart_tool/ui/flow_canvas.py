@@ -4,8 +4,9 @@
 - 每个步骤是一张可自由拖动的圆角卡片，按 steps 列表顺序连线
 - 默认【横向蛇形排版】：从左到右排列，超出宽度自动换行，
   下一行反向（右→左），使连线始终最短；可随时点【自动排版】重排
-- 「循环开始/结束」这一对节点用紫色虚线框圈在一起，画布上当「一块」看：
-  框内部不画箭头，外部连线直接接到框上（左边进、右边出）
+- 「循环开始/结束」「条件/分支/条件结束」这类配合节点用虚线框圈在一起，画布上当
+  「一块」看：框内部不画箭头，外部连线直接接到框上（左边进、右边出）
+- 块可以嵌套（分支里放循环等），框按层级一层层套，颜色区分：循环紫、条件蓝、分支浅蓝
 - 位置持久化到每个步骤的 pos；执行顺序由步骤列表顺序决定
 """
 from pathlib import Path
@@ -22,7 +23,8 @@ from PyQt6.QtWidgets import (
     QGraphicsView, QSizePolicy, QVBoxLayout, QWidget,
 )
 
-from smart_tool.core.project_store import Step, loop_ranges
+from smart_tool.core import blocks
+from smart_tool.core.project_store import Step
 
 # 排版版本：与 steps.json 里的 layout 不一致时自动重排。
 # h1→h2：卡片尺寸减半，旧坐标间距过大，需按新尺寸重排。
@@ -41,9 +43,6 @@ MARGIN_X = 18
 MARGIN_Y = 18
 DEFAULT_PER_ROW = 6
 MAX_PER_ROW = 12
-
-# 循环框留白（顶部留够标签与连线的高度）
-REGION_PAD = (-14, -22, 14, 14)
 
 # 场景留白：起点侧留小一点（内容不会缩在一个巨大空白画布的角落），
 # 拖动方向留足空间，方便继续往外拖
@@ -74,6 +73,9 @@ ACTION_META = {
     "pause_for_human": ("暂停等人工", "#d1495b"),
     "loop_start": ("循环开始", "#7a4fb5"),
     "loop_end": ("循环结束", "#7a4fb5"),
+    "condition_start": ("条件", "#2f6fb3"),
+    "condition_end": ("条件结束", "#2f6fb3"),
+    "branch": ("分支", "#5b8fd0"),
     "script": ("自由代码", "#475569"),
 }
 
@@ -99,8 +101,9 @@ def _range_summary(text: str) -> str:
     return f"索引范围：{t}"
 
 
-def step_summary(s: Step, data_source: dict) -> List[str]:
-    """卡片正文最多 3 行摘要。"""
+def step_summary(s: Step, data_source: dict,
+                 branch_text: str = "") -> List[str]:
+    """卡片正文最多 3 行摘要（branch_text 是分支标记从所属条件里取的匹配值）。"""
     if s.action == "navigate":
         return [s.url or "（未填网址）"]
     if s.action == "click" and s.locator:
@@ -130,6 +133,15 @@ def step_summary(s: Step, data_source: dict) -> List[str]:
         return [f"数据源：{Path(p).name}" if p else "未配置数据源（请点【数据源…】）"]
     if s.action == "loop_end":
         return ["循环体到此结束"]
+    if s.action == "condition_start":
+        mode = "表达式" if (s.cond_mode or "equal") == "expr" else "变量相等"
+        lines = [f"{mode}：{s.cond_expr or '（未填判断内容）'}"]
+        lines.append(f"{len(s.cond_branches or [])} 个分支，命中哪个走哪个")
+        return lines
+    if s.action == "branch":
+        return [branch_text or "（匹配值在条件节点里改）"]
+    if s.action == "condition_end":
+        return ["条件体到此结束"]
     if s.action == "script":
         lang = "JavaScript" if (s.script_lang or "").lower() == "javascript" else "Python"
         first = ""
@@ -144,13 +156,14 @@ def step_summary(s: Step, data_source: dict) -> List[str]:
 class NodeItem(QGraphicsItem):
     """步骤卡片。"""
 
-    def __init__(self, step: Step, data_source: dict, canvas: "FlowCanvas"):
+    def __init__(self, step: Step, data_source: dict, canvas: "FlowCanvas",
+                 branch_text: str = ""):
         super().__init__()
         self.step = step
         self._canvas = canvas
         self._name, color = ACTION_META.get(step.action, (step.action, "#888888"))
         self._color = QColor(color)
-        self._lines = step_summary(step, data_source)
+        self._lines = step_summary(step, data_source, branch_text)
         self._h = node_height_for(step, data_source)
 
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
@@ -345,8 +358,22 @@ class EdgeItem(QGraphicsPathItem):
         painter.restore()
 
 
+def _region_pad(depth: int) -> Tuple[float, float, float, float]:
+    """块框的留白：层级越深留白越大，保证嵌套时里面的框不会被外面的框压住。"""
+    d = 13.0 * max(0, depth)
+    return (-14 - d, -22 - d, 14 + d, 14 + d)
+
+
+# 每类块的颜色：循环紫、条件蓝、分支浅蓝
+REGION_COLORS = {
+    "loop": "#7a4fb5",
+    "condition": "#2f6fb3",
+    "branch": "#5b8fd0",
+}
+
+
 class _LoopBoxPort:
-    """把循环虚线框当成一个连线端点：外部箭头接到框上，框内部不画箭头。
+    """把块虚线框当成一个连线端点：外部箭头接到框上，框内部不画箭头。
 
     只需要提供 connect_nodes 用到的那几个锚点，接口与 NodeItem 一致。
     """
@@ -371,14 +398,17 @@ class _LoopBoxPort:
 
 
 class LoopRegion(QGraphicsRectItem):
-    """循环体虚线背景框。"""
+    """块虚线背景框（循环 / 条件 / 分支共用，靠颜色区分）。"""
 
-    def __init__(self):
+    def __init__(self, color: str = "#7a4fb5"):
         super().__init__()
         self._label = ""
+        self._color = QColor(color)
         self.setZValue(-10)
-        self.setPen(QPen(QColor("#7a4fb5"), 1.0, Qt.PenStyle.DashLine))
-        self.setBrush(QBrush(QColor(122, 79, 181, 22)))
+        self.setPen(QPen(self._color, 1.0, Qt.PenStyle.DashLine))
+        fill = QColor(color)
+        fill.setAlpha(22)
+        self.setBrush(QBrush(fill))
 
     def update_rect(self, rect: QRectF, label: str):
         self._label = label
@@ -390,7 +420,7 @@ class LoopRegion(QGraphicsRectItem):
         painter.setPen(self.pen())
         painter.setBrush(self.brush())
         painter.drawRoundedRect(self.rect(), 6, 6)
-        painter.setPen(QPen(QColor("#7a4fb5")))
+        painter.setPen(QPen(self._color))
         font = QFont()
         font.setBold(True)
         font.setPointSizeF(LABEL_FONT_PT)
@@ -472,7 +502,7 @@ class FlowCanvas(QWidget):
         self._nodes: Dict[int, NodeItem] = {}
         self._edges: List[EdgeItem] = []
         self._edge_pairs: List[Tuple[EdgeItem, object, object]] = []
-        self._loop_ranges: List[Tuple[int, int]] = []
+        self._spans: List[blocks.Span] = []
         self._regions: List[LoopRegion] = []
         self._placeholder = None
         # 空画布提示语（未载入项目 / 项目没有步骤 时不一样）
@@ -565,6 +595,9 @@ class FlowCanvas(QWidget):
             return
         per_row = max(1, per_row or self.compute_per_row())
         heights = [node_height_for(s, self._data_source) for s in steps]
+        # 块框会往外扩（层级越深越大），行距跟着放大，免得框压到上一行
+        max_depth = max((sp.depth for sp in blocks.spans(steps)), default=0)
+        gap_y = GAP_Y + 13.0 * (max_depth + 1)
 
         y = float(MARGIN_Y)
         for row_start in range(0, len(steps), per_row):
@@ -579,7 +612,7 @@ class FlowCanvas(QWidget):
                     float(MARGIN_X + col * (NODE_W + GAP_X)),
                     y,
                 ]
-            y += row_h + GAP_Y
+            y += row_h + gap_y
 
     def apply_auto_layout(self):
         """对外入口：按当前宽度重排全部节点并刷新画布。"""
@@ -635,18 +668,20 @@ class FlowCanvas(QWidget):
         self._nodes = {}
         self._edges = []
         self._edge_pairs = []
-        self._loop_ranges = []
+        self._spans = []
         self._regions = []
         self._placeholder = None
         self._scene.clear()
 
+        self._spans = blocks.spans(self._steps)
         for s in self._steps:
-            node = NodeItem(s, self._data_source, self)
+            node = NodeItem(s, self._data_source, self,
+                            branch_text=self._branch_text_of(s))
             self._scene.addItem(node)
             self._nodes[s.id] = node
 
         self._build_edges()
-        self._build_loop_regions()
+        self._build_regions()
 
         if not self._steps:
             self._placeholder = self._scene.addText(self._placeholder_text)
@@ -698,76 +733,120 @@ class FlowCanvas(QWidget):
         self._view.centerOn(r.left() + vp.width() / 2,
                             r.top() + vp.height() / 2)
 
-    def _loop_ranges_of(self, steps: List[Step]) -> List[Tuple[int, int]]:
-        """找出所有循环体的 [起, 止] 索引（不支持嵌套）。"""
-        return loop_ranges(steps)
+    # ------------------------------
+    # 连线与块框
+    # ------------------------------
+    def _branch_text_of(self, step: Step) -> str:
+        """分支标记的摘要文字：从它所属的条件的分支清单里取匹配值。"""
+        if step.action != "branch":
+            return ""
+        idx = next((i for i, s in enumerate(self._steps) if s is step
+                    or s.id == step.id), -1)
+        cond = next((sp for sp in self._spans
+                     if sp.kind == "condition" and sp.contains(idx)), None)
+        if cond is None:
+            return ""
+        order = [k for k in range(cond.inner_lo, cond.inner_hi)
+                 if self._steps[k].action == "branch"]
+        bi = order.index(idx) if idx in order else -1
+        if bi < 0:
+            return ""
+        cond_step = self._steps[cond.start]
+        name = blocks.condition_branch_name(cond_step, bi)
+        values = "、".join(blocks.condition_branch_values(cond_step, bi))
+        return f"{name}：{values}" if values else name
 
-    def _flow_units(self) -> List[object]:
-        """连线的「单元」列表：普通步骤 → 它的 id；循环 → ("box", 循环开始下标)。
+    def _span_by_start(self, index: int):
+        return next((sp for sp in self._spans if sp.start == index), None)
 
-        循环开始/结束是配合使用的一对节点，画布上整块当一个节点看：
-        框内部不画箭头，外部连线接到框上。
-        """
-        starts = {a: b for a, b in self._loop_ranges}
+    def _endpoint(self, ref):
+        """连线单元 → 端点对象（步骤卡片或块虚线框）；拿不到返回 None。"""
+        if isinstance(ref, tuple):
+            sp = self._span_by_start(ref[1])
+            return _LoopBoxPort(self._span_rect(sp)) if sp else None
+        return self._nodes.get(ref)
+
+    def _units_in(self, lo: int, hi: int) -> List[object]:
+        """把 [lo, hi) 里的步骤按「单元」切开：块整块算一个单元。"""
         units: List[object] = []
-        i = 0
-        while i < len(self._steps):
-            end = starts.get(i)
-            if end is not None:
+        i = lo
+        while i < hi:
+            sp = self._span_by_start(i)
+            if sp is not None and sp.end < hi:
                 units.append(("box", i))
-                i = end + 1
+                i = sp.end + 1
             else:
                 units.append(self._steps[i].id)
                 i += 1
         return units
 
-    def _endpoint(self, ref):
-        """连线单元 → 端点对象（步骤卡片或循环虚线框）；拿不到返回 None。"""
-        if isinstance(ref, tuple):
-            _, a_idx = ref
-            for a, b in self._loop_ranges:
-                if a == a_idx:
-                    return _LoopBoxPort(self._loop_rect(a, b))
-            return None
-        return self._nodes.get(ref)
-
     def _build_edges(self):
-        """按 steps 顺序连线；循环整块只连外部两端，框内部不画箭头。"""
-        self._loop_ranges = self._loop_ranges_of(self._steps)
-        units = self._flow_units()
+        """分层连线。
 
-        for k in range(len(units) - 1):
-            a = self._endpoint(units[k])
-            b = self._endpoint(units[k + 1])
-            if a is None or b is None:
-                continue
-            edge = EdgeItem(color="#9aa4b2")
-            self._scene.addItem(edge)
-            edge.connect_nodes(a, b)
-            self._edges.append(edge)
-            self._edge_pairs.append((edge, units[k], units[k + 1]))
+        - 同一层里的相邻单元依次连线；
+        - 循环块/条件块整块算一个单元，外部箭头直接接到框上；
+        - 循环体与条件内部（各分支之间是并列关系）不画箭头；
+        - 分支内部的步骤是顺序执行的，照常连线。
+        """
+        self._collect_edges(0, len(self._steps), draw=True)
 
-    def _build_loop_regions(self):
-        for a_idx, b_idx in self._loop_ranges:
-            region = LoopRegion()
-            region.update_rect(self._loop_rect(a_idx, b_idx),
-                               self._loop_label(self._steps[a_idx]))
+    def _collect_edges(self, lo: int, hi: int, draw: bool):
+        units = self._units_in(lo, hi)
+        if draw:
+            for k in range(len(units) - 1):
+                a, b = self._endpoint(units[k]), self._endpoint(units[k + 1])
+                if a is None or b is None:
+                    continue
+                edge = EdgeItem(color="#9aa4b2")
+                self._scene.addItem(edge)
+                edge.connect_nodes(a, b)
+                self._edges.append(edge)
+                self._edge_pairs.append((edge, units[k], units[k + 1]))
+        for u in units:
+            if isinstance(u, tuple):
+                sp = self._span_by_start(u[1])
+                if sp is None:
+                    continue
+                # 分支里的步骤是顺序执行的 → 继续连线；循环体/条件内部不连
+                self._collect_edges(sp.inner_lo, sp.inner_hi,
+                                    draw=(sp.kind == "branch"))
+
+    def _build_regions(self):
+        """每个块画一个虚线框（嵌套时框也嵌套）。"""
+        for sp in self._spans:
+            region = LoopRegion(REGION_COLORS.get(sp.kind, "#7a4fb5"))
+            region.update_rect(self._span_rect(sp), self._region_label(sp))
             self._scene.addItem(region)
             self._regions.append(region)
 
-    def _loop_rect(self, a_idx: int, b_idx: int) -> QRectF:
+    def _span_rect(self, sp) -> QRectF:
+        """块框的矩形：把块里所有卡片圈起来，再按层级留白。"""
         rect = QRectF()
-        for k in range(a_idx, b_idx + 1):
-            node = self._nodes[self._steps[k].id]
+        for k in range(sp.start, max(sp.end, sp.inner_hi - 1) + 1):
+            if k >= len(self._steps):
+                break
+            node = self._nodes.get(self._steps[k].id)
+            if node is None:
+                continue
             r = QRectF(node.pos().x(), node.pos().y(), NODE_W, node.node_height)
             rect = r if rect.isNull() else rect.united(r)
-        x1, y1, x2, y2 = REGION_PAD
+        x1, y1, x2, y2 = _region_pad(sp.depth)
         return rect.adjusted(x1, y1, x2, y2)
 
-    def _loop_label(self, start_step: Optional[Step] = None) -> str:
-        src = (start_step.loop_source if start_step else "data") or "data"
+    def _region_label(self, sp) -> str:
+        """块框左上角的说明文字。"""
+        if sp.kind == "branch":
+            return f"↳ 分支（{self._branch_text_of(self._steps[sp.start])}）"
+        if sp.kind == "condition":
+            step = self._steps[sp.start]
+            mode = "表达式" if (step.cond_mode or "equal") == "expr" else "变量"
+            count = sum(1 for k in range(sp.inner_lo, sp.inner_hi)
+                        if self._steps[k].action == "branch")
+            return f"↳ 条件（{mode}：{step.cond_expr or '未填'}，{count} 个分支）"
+        step = self._steps[sp.start]
+        src = (step.loop_source or "data") if step else "data"
         if src == "range":
-            return f"↳ 循环体（{_range_summary(start_step.loop_range)}）"
+            return f"↳ 循环体（{_range_summary(step.loop_range)}）"
         if src == "list":
             return "↳ 循环体（循环项列表，每一项重复）"
         p = (self._data_source or {}).get("path", "")
@@ -779,7 +858,7 @@ class FlowCanvas(QWidget):
     # 运行期刷新
     # ------------------------------
     def scene_refresh_overlays(self):
-        """节点拖动时实时更新连线、循环框与场景范围。"""
+        """节点拖动时实时更新连线、块框与场景范围。"""
         if not self._nodes:
             return
         for edge, ref_a, ref_b in self._edge_pairs:
@@ -787,9 +866,8 @@ class FlowCanvas(QWidget):
             if pa is None or pb is None:
                 continue
             edge.connect_nodes(pa, pb)
-        for region, (a_idx, b_idx) in zip(self._regions, self._loop_ranges):
-            region.update_rect(self._loop_rect(a_idx, b_idx),
-                               self._loop_label(self._steps[a_idx]))
+        for region, sp in zip(self._regions, self._spans):
+            region.update_rect(self._span_rect(sp), self._region_label(sp))
         # 拖动中同步扩大场景范围，保证被拖远的节点仍能滚回来
         self._sync_scene_rect(keep_view=False, expand_only=True)
 

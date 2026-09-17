@@ -11,11 +11,9 @@ from PyQt6.QtWidgets import (
     QPushButton, QTextEdit, QVBoxLayout, QWidget,
 )
 
+from smart_tool.core import blocks
 from smart_tool.core.data_sources import DataSourceConfig, list_columns
-from smart_tool.core.project_store import (
-    ProjectStore, Step, list_projects, loop_block_at, loop_ranges,
-    loop_start_index,
-)
+from smart_tool.core.project_store import ProjectStore, Step, list_projects
 from smart_tool.core.step_executor import (
     PauseHandle, StepExecutor, check_variables,
 )
@@ -431,6 +429,7 @@ class WebAutomationTab(QWidget):
         """
         if not self._current_store:
             return
+        blocks.normalize_branch_lists(self._steps)
         for i, s in enumerate(self._steps, start=1):
             s.id = i
         self._current_store.save(self._steps)
@@ -468,19 +467,17 @@ class WebAutomationTab(QWidget):
                             dlg.get_step())
 
     def _insert_at(self, pos: int, step: Step):
-        """插入步骤；新增「循环」时自动补上配对的结束标记。"""
-        if step.action == "loop_start" and any(
-            a < pos <= b for a, b in loop_ranges(self._steps)
-        ):
-            QMessageBox.warning(
-                self, "不支持嵌套循环",
-                "「循环」里面不能再放「循环」。\n"
-                "如果想改成别的循环，请先选中原来那个「循环」把它删掉。"
-            )
-            return
+        """插入步骤；新增「循环」/「条件」时自动补上配套的结构节点。"""
         new_steps = [step]
         if step.action == "loop_start":
-            new_steps.append(Step(id=0, action="loop_end"))
+            new_steps.append(Step(id=0, action=blocks.LOOP_END))
+        elif step.action == "condition_start":
+            if not step.cond_branches:
+                step.cond_branches = [blocks.new_branch("分支 1"),
+                                      blocks.new_branch("分支 2")]
+            new_steps.append(Step(id=0, action=blocks.BRANCH))
+            new_steps.append(Step(id=0, action=blocks.BRANCH))
+            new_steps.append(Step(id=0, action=blocks.COND_END))
         self._steps[pos:pos] = new_steps
         self._persist(select_row=pos, auto_layout=True)
 
@@ -492,39 +489,46 @@ class WebAutomationTab(QWidget):
     def _edit_step_by_id(self, step_id: int):
         """双击节点/点编辑：保留画布位置。
 
-        「循环结束」的设置与「循环开始」合并成一份，点它也是编辑那个循环。
+        「循环结束」「分支」「条件结束」的设置与所属块的配置节点合并成一份，
+        点它们也是编辑那个块。
         """
         row = next((i for i, s in enumerate(self._steps) if s.id == step_id), -1)
         if row < 0:
             return
-        if self._steps[row].action == "loop_end":
-            start_idx = loop_start_index(self._steps, row)
-            if start_idx >= 0:
-                row = start_idx
-        dlg = self._make_step_dialog(self._steps[row])
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            new_step = dlg.get_step()
-            new_step.pos = self._steps[row].pos
-            self._steps[row] = new_step
+        row = blocks.marker_owner_index(self._steps, row)
+        old = self._steps[row]
+        dlg = self._make_step_dialog(old)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_step = dlg.get_step()
+        new_step.pos = old.pos
+        if old.action == "condition_start" and new_step.action == "condition_start":
+            note = blocks.apply_condition_edit(self._steps, row, new_step)
             self._persist(select_row=row)
+            if note:
+                self._append_log(f"条件改动：{note}")
+            return
+        self._steps[row] = new_step
+        self._persist(select_row=row)
 
     def _delete_selected_step(self):
         row = self._selected_row()
         if row < 0:
             return
-        block = loop_block_at(self._steps, row)
-        if block and row in (block[0], block[1]):
-            # 只删循环的「两端」才连循环体一起删；体内的普通步骤只删自己
-            a, b = block
+        block = blocks.span_by_marker(blocks.spans(self._steps), row)
+        if block is not None:
+            # 只有选中块的「标记」才整块删；块里的普通步骤只删自己
+            cn = blocks.ACTION_CN.get(self._steps[row].action, "结构节点")
             reply = QMessageBox.question(
-                self, "删除循环",
-                f"「循环」是一对配套节点，删除会连同里面的 {b - a - 1} 个步骤一起去掉。\n"
-                f"确定删除这个循环吗？",
+                self, f"删除{cn}",
+                f"「{cn}」是配套的结构节点，删除会连同里面的 "
+                f"{block.end - block.start - 1} 个步骤一起去掉。\n确定删除吗？",
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
-            del self._steps[a:b + 1]
-            self._persist(select_row=min(a, len(self._steps) - 1),
+            blocks.drop_branch_entry(self._steps, block.start)
+            del self._steps[block.start:block.end + 1]
+            self._persist(select_row=min(block.start, len(self._steps) - 1),
                           auto_layout=True)
             return
         step = self._steps[row]
@@ -538,26 +542,17 @@ class WebAutomationTab(QWidget):
                       auto_layout=True)
 
     def _move_bounds(self, idx: int) -> Tuple[int, int]:
-        """该步骤允许上下移动到的下标范围（不许跨过循环边界）。"""
-        block = loop_block_at(self._steps, idx)
-        if block and block[0] < idx:
-            return block[0] + 1, block[1] - 1
-        lo, hi = 0, len(self._steps) - 1
-        for a, b in loop_ranges(self._steps):
-            if b < idx:
-                lo = max(lo, b + 1)
-            elif a > idx:
-                hi = min(hi, a - 1)
-        return lo, hi
+        """该步骤允许上下移动到的下标范围（不许跨出自己所在的块）。"""
+        return blocks.move_bounds(self._steps, idx)
 
     def _move_selected(self, delta: int):
         row = self._selected_row()
         if row < 0:
             return
-        block = loop_block_at(self._steps, row)
-        if block and row in (block[0], block[1]):
-            # 选中循环的任一端：整块上下移动
-            a, b = block
+        block = blocks.span_by_marker(blocks.spans(self._steps), row)
+        if block is not None:
+            # 选中块的标记：整块上下移动
+            a, b = block.start, block.end
             if delta < 0:
                 if a == 0:
                     return
@@ -609,9 +604,9 @@ class WebAutomationTab(QWidget):
             act("在此之前插入", self._insert_step)
             act("删除", self._delete_selected_step)
             menu.addSeparator()
-            block = loop_block_at(self._steps, row)
-            if block and row in (block[0], block[1]):
-                lo, hi = block            # 选中循环的任一端：整块上下移动
+            block = blocks.span_by_marker(blocks.spans(self._steps), row)
+            if block is not None:
+                lo, hi = block.start, block.end   # 选中块的标记：整块上下移动
             else:
                 lo, hi = self._move_bounds(row)
             act("上移", lambda: self._move_selected(-1), row > lo)

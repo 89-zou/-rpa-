@@ -10,7 +10,7 @@ steps.json 结构：
 import json
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from smart_tool import paths
 
@@ -58,6 +58,14 @@ class Step:
     loop_source: str = "data"
     loop_items: str = ""
     loop_range: str = ""
+    # ---- condition_start 专用：条件分支 ----
+    # cond_mode: equal  把 cond_expr 渲染成文本，跟分支的匹配值比相等
+    #            expr   Python 表达式（能当数字的变量按数字代入），
+    #                   结果为 True/False 时走第 1/2 个分支，其他结果按值匹配
+    cond_mode: str = "equal"
+    cond_expr: str = ""
+    # 分支清单，顺序＝各分支块的先后： [{"name": "北京", "values": "北京,上海"}, ...]
+    cond_branches: List[Dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {"id": self.id, "action": self.action}
@@ -94,6 +102,11 @@ class Step:
                 d["loop_items"] = self.loop_items
             if self.loop_range:
                 d["loop_range"] = self.loop_range
+        if self.action == "condition_start":
+            d["cond_mode"] = self.cond_mode
+            if self.cond_expr:
+                d["cond_expr"] = self.cond_expr
+            d["cond_branches"] = [dict(m) for m in self.cond_branches]
         if self.pos is not None:
             d["pos"] = [float(self.pos[0]), float(self.pos[1])]
         return d
@@ -129,6 +142,10 @@ class Step:
             loop_source=d.get("loop_source", "data") or "data",
             loop_items=d.get("loop_items", ""),
             loop_range=d.get("loop_range", ""),
+            cond_mode=d.get("cond_mode", "equal") or "equal",
+            cond_expr=d.get("cond_expr", ""),
+            cond_branches=[dict(m) for m in d.get("cond_branches", [])
+                           if isinstance(m, dict)],
         )
 
 
@@ -234,37 +251,6 @@ def validate_project_name(name: str) -> Optional[str]:
     if (paths.PROJECTS_DIR / name).exists():
         return f"项目「{name}」已存在"
     return None
-
-
-def loop_ranges(steps: List[Step]) -> List[Tuple[int, int]]:
-    """找出所有循环体的 [循环开始下标, 循环结束下标]（不支持嵌套）。
-
-    「循环开始 / 循环结束」是一对节点，新增「循环」时由系统一起创建；
-    两者的设置合并成一份（配置存在循环开始节点上，点哪个都是编辑它）。
-    """
-    ranges: List[Tuple[int, int]] = []
-    start: Optional[int] = None
-    for i, s in enumerate(steps):
-        if s.action == "loop_start":
-            start = i
-        elif s.action == "loop_end" and start is not None:
-            ranges.append((start, i))
-            start = None
-    return ranges
-
-
-def loop_block_at(steps: List[Step], index: int) -> Optional[Tuple[int, int]]:
-    """index 落在哪个循环块里（含首尾两个标记）；不在循环里返回 None。"""
-    for a, b in loop_ranges(steps):
-        if a <= index <= b:
-            return a, b
-    return None
-
-
-def loop_start_index(steps: List[Step], index: int) -> int:
-    """index 所在循环的「循环开始」下标；不在循环里返回 -1。"""
-    block = loop_block_at(steps, index)
-    return block[0] if block else -1
 
 
 def list_projects() -> List[ProjectStore]:
