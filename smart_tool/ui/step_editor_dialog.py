@@ -943,21 +943,25 @@ class StepEditDialog(QDialog):
     def _capture_desktop_control(self, target: str):
         """桌面场景的捕获：划到哪高亮哪，点一下自动裁图当模板。"""
         dlg = DesktopPickerDialog(self.project_dir, self)
-        if not dlg.run() or not dlg.result_path:
-            return
-        text = dlg.result_text or dlg.result_path
-        if target == "wait":
-            self.wait_target.setText(dlg.result_path)
-            self.capture_hint.setText(f"已捕获等待模板：{text}")
-        else:
-            self.locator_value.setText(dlg.result_path)
-            self.capture_hint.setText(
-                f"已捕获：{text}　→　{dlg.result_path}"
-                + ("　（窗口标题可填到【激活窗口】那一步里）"
-                   if dlg.window_title else "")
-            )
-        self._show_preview(self.project_dir / dlg.result_path)
-        self._sync_visibility()
+        try:
+            if not dlg.run() or not dlg.result_path:
+                return
+            text = dlg.result_text or dlg.result_path
+            if target == "wait":
+                self.wait_target.setText(dlg.result_path)
+                self.capture_hint.setText(f"已捕获等待模板：{text}")
+            else:
+                self.locator_value.setText(dlg.result_path)
+                self.capture_hint.setText(
+                    f"已捕获：{text}　→　{dlg.result_path}"
+                    + ("　（窗口标题可填到【激活窗口】那一步里）"
+                       if dlg.window_title else "")
+                )
+            self._show_preview(self.project_dir / dlg.result_path)
+            self._sync_visibility()
+        finally:
+            # 用完就销毁：捕获器里有个全屏遮罩窗口，攒着不放会越堆越多
+            dlg.deleteLater()
 
     def _capture_screen(self, target: str):
         """截屏拖框取模板（桌面场景）：target=main 填定位，wait 填等待目标。"""

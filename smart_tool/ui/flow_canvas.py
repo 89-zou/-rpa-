@@ -627,9 +627,14 @@ class _View(QGraphicsView):
         return self.transform().m11()
 
     def _show_menu(self, pos):
+        # 和双击一样「延后一拍」再发信号：
+        # 这一下右键还在 Qt 的事件分发栈里（场景正在处理它），而菜单里的
+        # 「新增 / 编辑步骤」会重建整个画布（图元被销毁），事件分发返回时
+        # 还要接着访问那张卡片——和双击弹编辑框是同一个坑，照同样的办法躲。
         item = self.itemAt(pos)
         sid = item.step.id if isinstance(item, NodeItem) else None
-        self._canvas.context_menu_requested.emit(sid, self.mapToGlobal(pos))
+        canvas, gpos = self._canvas, self.mapToGlobal(pos)
+        QTimer.singleShot(0, lambda: canvas.context_menu_requested.emit(sid, gpos))
 
 
 class FlowCanvas(QWidget):

@@ -488,10 +488,13 @@ class WebAutomationTab(QWidget):
             return
         row = self._selected_row()
         dlg = self._make_step_dialog()
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            step = dlg.get_step()
-            pos = row + 1 if row >= 0 else len(self._steps)
-            self._insert_at(pos, step)
+        try:
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                step = dlg.get_step()
+                pos = row + 1 if row >= 0 else len(self._steps)
+                self._insert_at(pos, step)
+        finally:
+            dlg.deleteLater()       # 弹窗用完就销毁，别越攒越多
 
     def _insert_step(self):
         """在选中步骤之前插入；未选中时追加（右键菜单入口）。"""
@@ -499,9 +502,12 @@ class WebAutomationTab(QWidget):
             return
         row = self._selected_row()
         dlg = self._make_step_dialog()
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._insert_at(row if row >= 0 else len(self._steps),
-                            dlg.get_step())
+        try:
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                self._insert_at(row if row >= 0 else len(self._steps),
+                                dlg.get_step())
+        finally:
+            dlg.deleteLater()
 
     def _insert_at(self, pos: int, step: Step):
         """插入步骤；新增「循环」/「条件」时自动补上配套的结构节点。"""
@@ -535,9 +541,12 @@ class WebAutomationTab(QWidget):
         row = blocks.marker_owner_index(self._steps, row)
         old = self._steps[row]
         dlg = self._make_step_dialog(old)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        new_step = dlg.get_step()
+        try:
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            new_step = dlg.get_step()
+        finally:
+            dlg.deleteLater()       # 弹窗用完就销毁，别越攒越多
         new_step.pos = old.pos
         if old.action == "condition_start" and new_step.action == "condition_start":
             note = blocks.apply_condition_edit(self._steps, row, new_step)
@@ -626,7 +635,7 @@ class WebAutomationTab(QWidget):
             return
         menu = QMenu(self)
         if step_id is None:
-            act_add = QAction("新增步骤", self)
+            act_add = QAction("新增步骤", menu)
             act_add.triggered.connect(self._add_step)
             menu.addAction(act_add)
         else:
@@ -635,7 +644,7 @@ class WebAutomationTab(QWidget):
                 return
 
             def act(text, slot, enabled=True):
-                a = QAction(text, self)
+                a = QAction(text, menu)
                 a.setEnabled(enabled)
                 a.triggered.connect(slot)
                 menu.addAction(a)
@@ -652,7 +661,11 @@ class WebAutomationTab(QWidget):
                 lo, hi = self._move_bounds(row)
             act("上移", lambda: self._move_selected(-1), row > lo)
             act("下移", lambda: self._move_selected(1), row < hi)
-        menu.exec(global_pos)
+        try:
+            menu.exec(global_pos)
+        finally:
+            # 每次右键都会建一个菜单，用完就销毁，别让它们一直堆着
+            menu.deleteLater()
 
     # ------------------------------
     # 运行/停止
