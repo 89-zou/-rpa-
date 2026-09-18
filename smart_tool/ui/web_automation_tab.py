@@ -19,13 +19,15 @@ from smart_tool.core.step_executor import (
     PauseHandle, StepExecutor, available_variables, check_variables,
 )
 from smart_tool.ui.flow_canvas import (
-    DEFAULT_PLACEHOLDER, LAYOUT_VERSION, NO_PROJECT_PLACEHOLDER, FlowCanvas,
+    ACTION_META, DEFAULT_PLACEHOLDER, LAYOUT_VERSION, NO_PROJECT_PLACEHOLDER,
+    FlowCanvas, step_summary,
 )
 from smart_tool.ui.flow_editor_dialog import FlowEditorDialog
 from smart_tool.ui.project_manager_dialog import ProjectManagerDialog
 from smart_tool.ui.project_picker_dialog import (
     NewProjectDialog, ProjectPickerDialog,
 )
+from smart_tool.ui.run_monitor import RunMonitor
 from smart_tool.ui.step_editor_dialog import StepEditDialog
 
 
@@ -38,6 +40,8 @@ class ExecutorWorker(QThread):
     log_signal = pyqtSignal(str)
     pause_signal = pyqtSignal(str, int)        # (提示, step_id)
     pause_resolved = pyqtSignal(str)           # auto/manual/abort，用于复位按钮
+    step_signal = pyqtSignal(int)              # 开始执行某一步（步骤 id）
+    state_signal = pyqtSignal(str)             # 手动暂停：paused / running
 
     def __init__(
         self,
@@ -58,6 +62,8 @@ class ExecutorWorker(QThread):
             log=self.log_signal.emit,
             on_pause=self._on_pause,
             on_resume=self.pause_resolved.emit,
+            on_step=self.step_signal.emit,
+            on_state=self.state_signal.emit,
             real_mouse=real_mouse,
             scene=scene,
         )
@@ -80,6 +86,10 @@ class ExecutorWorker(QThread):
         else:
             handle.manual_abort.set()
 
+    def pause_run(self, paused: bool):
+        """主线程调用：小窗上的手动暂停 / 继续（当前步骤跑完才真的停）。"""
+        self._executor.set_user_pause(paused)
+
     def stop(self):
         """请求停止（含解除可能的暂停）。"""
         self._executor.stop()
@@ -101,6 +111,8 @@ class WebAutomationTab(QWidget):
         self._current_store: Optional[ProjectStore] = None
         self._steps: List[Step] = []
         self._scene: str = "web"        # 当前项目的场景：web / desktop
+        self._user_paused = False       # 小窗上手动暂停中
+        self._flow_paused = False       # 流程里的「暂停等人工」节点正在等
         self._init_ui()
         # 启动不自动载入项目：避免读盘/排版拖慢界面，由用户点【载入项目…】
         self._clear_project()
@@ -205,6 +217,12 @@ class WebAutomationTab(QWidget):
         self.log_text.setMaximumHeight(160)
         self.log_text.setVisible(False)      # 默认收起
         layout.addWidget(self.log_text, 1)
+
+        # 运行小窗：跑流程时主页收起来，只留屏幕右下角这一块（独立顶层窗口）
+        self.monitor = RunMonitor()
+        self.monitor.pause_clicked.connect(self._on_monitor_pause)
+        self.monitor.stop_clicked.connect(self._stop)
+        self.monitor.home_clicked.connect(self._back_to_home)
 
     def _on_real_mouse_toggled(self, _state):
         """「真实鼠标」开关：立即写进项目（每个项目各存各的）。"""
@@ -697,12 +715,84 @@ class WebAutomationTab(QWidget):
         self._worker.finished.connect(self._on_finished)
         self._worker.pause_signal.connect(self._on_pause)
         self._worker.pause_resolved.connect(self._on_pause_resolved)
+        self._worker.step_signal.connect(self._on_step)
+        self._worker.state_signal.connect(self._on_worker_state)
         self._worker.start()
         self.canvas.set_readonly(True)
         self._update_edit_buttons()
+        self._start_monitor()
+
+    # ------------------------------
+    # 运行小窗
+    # ------------------------------
+    def _start_monitor(self):
+        """开跑：主页收起来，右下角摆上小窗。"""
+        self._user_paused = False
+        self._flow_paused = False
+        name = self._current_store.name if self._current_store else ""
+        self.monitor.start(name, len(self._steps))
+        win = self.window()
+        if win is not self:
+            win.hide()
+
+    def _show_home_window(self):
+        win = self.window()
+        if win is self:
+            return
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+    def _back_to_home(self):
+        """小窗上点【显示主页】：主页回来、小窗收起（流程在后台继续跑）。"""
+        self.monitor.hide()
+        self._show_home_window()
+        if self._worker is not None:
+            self._append_log(
+                "已回到主界面（流程仍在后台运行，想停下点【停止】）。"
+            )
+
+    def _on_step(self, step_id: int):
+        """小窗上显示「跑到第几步、这一步在干什么」。"""
+        step = next((s for s in self._steps if s.id == step_id), None)
+        if step is None:
+            return
+        cn = ACTION_META.get(step.action, (step.action, ""))[0]
+        detail = " / ".join(step_summary(step)[:2])
+        if step.title:
+            detail = f"{step.title}｜{detail}" if detail else step.title
+        self.monitor.set_step(step_id, cn, detail)
+
+    def _on_monitor_pause(self):
+        """小窗上那个按钮：随当前状态既是「暂停」也是「继续」。"""
+        if self._worker is None:
+            return
+        if self._flow_paused:                   # 流程暂停节点在等人工
+            self._resolve_pause_continue()
+            return
+        self._set_user_pause(not self._user_paused)
+
+    def _set_user_pause(self, paused: bool):
+        self._user_paused = paused
+        if self._worker:
+            self._worker.pause_run(paused)
+        self.monitor.set_state("user" if paused else "running")
+        self._append_log(
+            "已请求暂停：当前这一步跑完就停住。" if paused else "继续执行。"
+        )
+
+    def _on_worker_state(self, state: str):
+        """执行器回报：手动暂停真的停住了 / 又开始跑了。"""
+        if state == "paused":
+            self.monitor.set_state("user")
+        elif state == "running":
+            self._user_paused = False
+            self.monitor.set_state("flow" if self._flow_paused else "running")
 
     def _stop(self):
         if self._worker:
+            self._user_paused = False
+            self.monitor.set_state("stopping")
             self._worker.stop()
 
     def _on_finished(self):
@@ -713,16 +803,21 @@ class WebAutomationTab(QWidget):
         self._worker = None
         self.canvas.set_readonly(False)
         self._update_edit_buttons()
+        # 跑完：收起小窗、主页回来（这是小窗退场的两种情况之一）
+        self._user_paused = False
+        self._flow_paused = False
+        self.monitor.hide()
+        self._show_home_window()
 
     def _on_pause(self, prompt: str, step_id: int):
         self._append_log(
             f"暂停 [步骤 {step_id}] {prompt} —— 满足恢复条件会自动继续，"
-            f"也可手动点【继续】或【终止】"
+            f"也可在小窗（或这里）点【继续】"
         )
         self.btn_continue.setEnabled(True)
         self.btn_abort.setEnabled(True)
-        self.window().raise_()
-        self.window().activateWindow()
+        self._flow_paused = True
+        self.monitor.set_state("flow")
 
     def _on_pause_resolved(self, reason: str):
         tip = {
@@ -733,6 +828,8 @@ class WebAutomationTab(QWidget):
         self._append_log(f"暂停解除：{tip}")
         self.btn_continue.setEnabled(False)
         self.btn_abort.setEnabled(False)
+        self._flow_paused = False
+        self.monitor.set_state("running")
 
     def _resolve_pause_continue(self):
         if self._worker:
@@ -752,3 +849,5 @@ class WebAutomationTab(QWidget):
     def _append_log(self, message: str):
         ts = datetime.now().strftime("%H:%M:%S")
         self.log_text.append(f"[{ts}] {message}")
+        if self.monitor.isVisible():        # 小窗上也滚动显示最近几条
+            self.monitor.add_log(message)

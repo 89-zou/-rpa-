@@ -339,6 +339,8 @@ class StepExecutor:
         log: Callable[[str], None] = print,
         on_pause: Optional[Callable[[Step], Optional[PauseHandle]]] = None,
         on_resume: Optional[Callable[[str], None]] = None,
+        on_step: Optional[Callable[[int], None]] = None,
+        on_state: Optional[Callable[[str], None]] = None,
         real_mouse: bool = False,
         scene: str = "web",
     ):
@@ -350,6 +352,8 @@ class StepExecutor:
                          此时仅靠 resume_condition 自动检测，manual 条件则等回车。
         :param on_resume: 暂停结束回调，参数为原因：
                           auto（信号自动检测）/manual（人工继续）/abort（人工终止）。
+        :param on_step: 每一步开始执行时回调（参数是步骤 id），给运行小窗显示进度。
+        :param on_state: 手动暂停的状态回调：paused（停住了）/ running（继续了）。
         :param real_mouse: 用 OS 级真实鼠标点击（pyautogui）代替合成事件，
                            给 canvas / 拖拽类站点用。默认关。
         :param scene: web（浏览器）/ desktop（桌面应用：全屏截图定位 + 系统鼠标键盘）。
@@ -361,11 +365,15 @@ class StepExecutor:
         self.log = log
         self.on_pause = on_pause
         self.on_resume = on_resume
+        self.on_step = on_step
+        self.on_state = on_state
         self.real_mouse = bool(real_mouse) and not headless
         self.desktop = scene == "desktop"
         self._real_mouse = None
         self._stop = False
         self._page: Optional[Page] = None
+        # 用户在小窗上点【暂停】时置位：执行器在每个步骤开始前停住等它清掉
+        self._pause_requested = threading.Event()
 
     # ------------------------------
     # 对外控制
@@ -373,7 +381,44 @@ class StepExecutor:
     def stop(self):
         """请求停止（线程安全，主线程调用）。"""
         self._stop = True
+        self._pause_requested.clear()      # 暂停中也要能停下来
         self.log("收到停止请求，将在当前步骤完成后退出。")
+
+    def set_user_pause(self, paused: bool):
+        """小窗上的手动暂停 / 继续（线程安全，主线程调用）。
+
+        不是立刻停：执行器在**每个步骤开始前**检查一次，所以点了暂停后，
+        当前这一步（连同它的等待）会跑完才停住，最长可能等上十几秒。
+        """
+        if paused:
+            self._pause_requested.set()
+        else:
+            self._pause_requested.clear()
+
+    def _check_user_pause(self) -> bool:
+        """步骤边界上的检查点：用户按了暂停就停在这儿等。
+
+        返回 False 表示这次暂停里被按了终止，调用方该收工了。
+        """
+        if not self._pause_requested.is_set():
+            return not self._stop
+        self._notify_state("paused")
+        self.log("已暂停（小窗上点【继续】恢复）。")
+        while self._pause_requested.is_set() and not self._stop:
+            time.sleep(0.1)
+        if self._stop:
+            return False
+        self._notify_state("running")
+        self.log("继续执行。")
+        return True
+
+    def _notify_state(self, state: str):
+        if self.on_state is None:
+            return
+        try:
+            self.on_state(state)
+        except Exception:
+            pass
 
     def _on_dialog(self, dialog):
         """页面弹出 confirm/alert/离开确认时一律点「确定」。
@@ -428,6 +473,8 @@ class StepExecutor:
             "桌面场景：全屏截图定位 + 系统级鼠标键盘。\n"
             "   运行时别动鼠标键盘（程序要用它们）；也别让本工具的窗口盖住目标程序"
             "（截图会拍到它，定位就不准了）。\n"
+            "   右下角会显示运行小窗，它盖住的那一小块屏幕截不到——"
+            "目标控件正好在那儿的话会「找不到图片」，把目标程序窗口错开一点再跑。\n"
             "   紧急情况把鼠标猛地甩到屏幕左上角可急停。"
         )
         try:
@@ -438,7 +485,8 @@ class StepExecutor:
     def _run_nodes(self, nodes: List[Any]):
         """顺序执行同一层里的节点（普通步骤或嵌套的块）。"""
         for node in nodes:
-            if self._stop:
+            # 每个步骤开始前的检查点：能顺手处理「用户暂停」与「已停止」
+            if not self._check_user_pause():
                 self.log("已停止。")
                 return
             if isinstance(node, Block):
@@ -592,6 +640,11 @@ class StepExecutor:
     # ------------------------------
     def _execute_step(self, step: Step):
         self.log(f"[步骤 {step.id}] {step.action}")
+        if self.on_step is not None:
+            try:
+                self.on_step(step.id)      # 给运行小窗显示「跑到第几步了」
+            except Exception:
+                pass
         try:
             if step.action == "navigate":
                 self._require_web(step, "打开网页")
