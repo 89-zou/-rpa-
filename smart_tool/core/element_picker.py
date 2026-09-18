@@ -37,16 +37,43 @@ PICKER_JS = r"""
     + 'padding:4px 7px;border-radius:4px;max-width:72vw;white-space:pre-wrap;'
     + 'box-shadow:0 2px 8px rgba(0,0,0,.35)';
 
-  var box = document.createElement('div');
-  box.style.cssText = STYLE_BOX;
-  var tip = document.createElement('div');
-  tip.style.cssText = STYLE_TIP;
+  // 点中之后「盖章」用的两个浮层：绿色粗框 + 屏幕顶端的大提示条。
+  // 为什么要有它们：捕获器自己的窗口被浏览器盖住了，只更新那边的文字，
+  // 用户在页面里什么都看不到，新手会以为「点了没反应」。
+  var STYLE_OK = 'position:fixed;z-index:2147483646;pointer-events:none;display:none;'
+    + 'border:3px solid #16a34a;background:rgba(22,163,74,.16);'
+    + 'box-sizing:border-box;border-radius:3px';
+  var STYLE_TOAST = 'position:fixed;z-index:2147483647;pointer-events:none;'
+    + 'left:50%;top:14px;transform:translateX(-50%);max-width:86vw;'
+    + 'background:#15803d;color:#fff;font:13px/1.7 "Microsoft YaHei",sans-serif;'
+    + 'padding:9px 16px;border-radius:8px;white-space:pre-wrap;text-align:center;'
+    + 'box-shadow:0 6px 20px rgba(0,0,0,.4)';
+
+  // 四个浮层都挂在 window 上：连着抓下一个时会重新装填脚本，复用同一批节点，
+  // 免得每抓一次就往页面里多贴四个 div。
+  function layer(key, css) {
+    var name = '__traeLayer_' + key;
+    if (!window[name]) {
+      var el = document.createElement('div');
+      el.style.cssText = css;
+      window[name] = el;
+    }
+    return window[name];
+  }
+
+  var box = layer('box', STYLE_BOX);
+  var tip = layer('tip', STYLE_TIP);
+  var okBox = layer('ok', STYLE_OK);
+  var toast = layer('toast', STYLE_TOAST);
 
   function mount() {
     var root = document.documentElement;
     if (!root) { return; }
-    if (!root.contains(box)) { root.appendChild(box); }
-    if (!root.contains(tip)) { root.appendChild(tip); }
+    // 四个都是「贴上去就不管」的浮层：页面自己重画 DOM 时（SPA 切页）要补回去
+    var layers = [box, tip, okBox, toast];
+    for (var i = 0; i < layers.length; i++) {
+      if (!root.contains(layers[i])) { root.appendChild(layers[i]); }
+    }
   }
   mount();
   window.__traeMountTimer = setInterval(mount, 800);
@@ -148,7 +175,8 @@ PICKER_JS = r"""
     var hits = countOf(cand.path);
     tip.textContent = labelOf(el) + '\n' + cand.path + '\n'
       + '命中 ' + hits + ' 个（' + cand.why + '）'
-      + (hits === 1 ? '' : '  ← 不唯一，注意核对');
+      + (hits === 1 ? '' : '  ← 不唯一，注意核对')
+      + '\n左键点一下＝捕获这个元素';
     tip.style.display = 'block';
     var top = r.top > 62 ? r.top - 52 : r.bottom + 8;
     tip.style.left = Math.max(4, Math.min(r.left, window.innerWidth - 120)) + 'px';
@@ -158,6 +186,32 @@ PICKER_JS = r"""
   function hide() {
     box.style.display = 'none';
     tip.style.display = 'none';
+  }
+
+  function stamp(el, cand, hits) {
+    /* 点中之后在页面里「盖个章」：绿框留住 3 秒 + 顶端弹一条绿提示。
+       捕获器自己的窗口在浏览器下面，用户看不见，所以反馈必须画在页面里。
+       绿框与提示条是常驻的两个浮层（见上面的 layer/mount），这里只改位置和文字。
+       计时器也挂在 window 上：重新装填脚本后还能取消上一轮的手，免得提前收掉。 */
+    try {
+      window.__traePickTotal = (window.__traePickTotal || 0) + 1;
+      var r = el.getBoundingClientRect();
+      okBox.style.left = r.left + 'px';
+      okBox.style.top = r.top + 'px';
+      okBox.style.width = r.width + 'px';
+      okBox.style.height = r.height + 'px';
+      okBox.style.display = 'block';
+      toast.textContent = '✓ 已捕获第 ' + window.__traePickTotal + ' 个：' + labelOf(el)
+        + '\nXPath：' + (cand.path || '（生成失败）') + '　命中 ' + hits + ' 个'
+        + (hits === 1 ? '' : '（不唯一，建议重抓一个更准的）')
+        + '\n回到「元素捕获」窗口点【完成】即可写进步骤';
+      toast.style.display = 'block';
+      if (window.__traeOkTimer) { clearTimeout(window.__traeOkTimer); }
+      window.__traeOkTimer = setTimeout(function () {
+        okBox.style.display = 'none';
+        toast.style.display = 'none';
+      }, 3000);
+    } catch (err) { /* 反馈画不出来也不影响捕获本身 */ }
   }
 
   function disarm() {
@@ -189,15 +243,17 @@ PICKER_JS = r"""
     var cand;
     try { cand = candidate(el); } catch (err) { cand = { path: '', why: '生成失败' }; }
     var r = el.getBoundingClientRect();
+    var hits = countOf(cand.path);
     var payload = {
       xpath: cand.path,
       why: cand.why,
       desc: labelOf(el),
-      count: countOf(cand.path),
+      count: hits,
       top: window.top === window,
       frame: location.href,
       rect: [r.left, r.top, r.width, r.height]
     };
+    stamp(el, cand, hits);
     disarm();
     if (typeof window.__trae_pick === 'function') { window.__trae_pick(payload); }
   }

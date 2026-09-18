@@ -158,7 +158,9 @@ class ElementPickerDialog(QDialog):
         tip = QLabel(
             "点【开始捕获】会打开一个浏览器窗口：\n"
             "· 鼠标划过元素 → 画橙框，并显示「这个选择器命中几个」；\n"
-            "· 点一下 → 抓下它的 XPath，同时把这个元素的图截下来存进 img/。\n"
+            "· 点一下 → 抓下它的 XPath，同时把这个元素的图截下来存进 img/；\n"
+            "· 抓到没有，看页面就知道：点中的元素会被「绿框」圈住，屏幕顶端还会弹一条"
+            "绿色提示「✓ 已捕获第 N 个」。\n"
             "可以连着抓多个；抓到满意为止点【完成】。按 Esc 只是收起橙框，不会退出。"
         )
         tip.setWordWrap(True)
@@ -253,6 +255,7 @@ class ElementPickerDialog(QDialog):
         xpath = payload.get("xpath") or "（生成失败）"
         count = payload.get("count", -1)
         lines = [
+            f"✓ 已捕获第 {len(self._hits)} 个",
             f"元素：{payload.get('desc', '')}",
             f"XPath：{xpath}",
             f"命中：{count} 个" + ("" if count == 1 else "（不唯一，建议换更稳的写法）"),
