@@ -28,7 +28,7 @@ from PyQt6.QtGui import QFont, QIcon
 from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from smart_tool import paths
-from smart_tool.core import crash_guard
+from smart_tool.core import crash_guard, temp_cleanup
 from smart_tool.ui.main_window import MainWindow
 
 try:                     # 开源版不带启动广告页
@@ -98,6 +98,25 @@ def run_first_time_setup() -> str:
     return "continue"
 
 
+def clean_temp_leftovers():
+    """后台清掉单文件版被强杀留下的解包残渣（`%TEMP%\\_MEIxxxxxx`）。
+
+    只清「超过 24 小时没动过」的，正在跑的那份动不了会被跳过（见 core/temp_cleanup.py）。
+    在后台线程里做，不耽误开界面；清了东西才写一行 cleanup.log（在用户数据目录里）。
+    """
+    def report(removed: int, freed: int):
+        try:
+            log = paths.DATA_DIR / "cleanup.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("a", encoding="utf-8") as f:
+                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  "
+                        f"清掉 {removed} 个 _MEI 残渣，释放 {freed / 1024 / 1024:.0f} MB\n")
+        except OSError:
+            pass
+
+    temp_cleanup.clean_in_background(on_done=report)
+
+
 def main():
     # 卸载入口：系统「设置 → 应用 → 小邹RPA → 卸载」执行的就是这条
     # （注册表里的 UninstallString 写着 "<本程序>" --uninstall）
@@ -118,6 +137,9 @@ def main():
             print("这个版本不带安装向导：直接 `python -m smart_tool.main` 就能跑。")
             return
         sys.exit(setup_main())
+
+    # 顺手清掉上次被强杀留下的解包残渣（后台做，不影响启动）
+    clean_temp_leftovers()
 
     app = QApplication(sys.argv)
     # Windows 下显式指定中文字体，避免回退到无 CJK 字形的字体
