@@ -37,13 +37,13 @@ from smart_tool.ui.screen_capture import ScreenCaptureDialog
 # 网页场景能用的动作
 WEB_ACTIONS = [
     "navigate", "read_data", "collect", "click", "fill", "select",
-    "pause_for_human", "loop_start", "loop_end", "condition_start",
+    "note", "pause_for_human", "loop_start", "loop_end", "condition_start",
     "condition_end", "branch", "script",
 ]
 # 桌面场景能用的动作（没有浏览器，也就没有 XPath / 下拉选择）
 DESKTOP_ACTIONS = [
     "win_activate", "click", "fill", "hotkey", "delay", "read_data",
-    "pause_for_human", "loop_start", "loop_end", "condition_start",
+    "note", "pause_for_human", "loop_start", "loop_end", "condition_start",
     "condition_end", "branch", "script",
 ]
 # 新建步骤时不出现在菜单里的动作：这些标记由系统配对生成
@@ -52,6 +52,7 @@ ACTION_LABELS = {
     "navigate": "打开网页 navigate",
     "read_data": "读取数据 read_data（读文件夹/文件 → 产出一个列表变量）",
     "collect": "采集数据 collect（把页面上的文字/链接/图片/截图取下来 → 存 data/ 并进变量）",
+    "note": "提示 / 日志 note（画布上写一句说明；运行时把内容打进日志，可含 {{变量}}）",
     "click": "点击 click",
     "fill": "填入 fill",
     "select": "下拉选择 select",
@@ -237,6 +238,36 @@ class StepEditDialog(QDialog):
         self.collect_panel = CollectPanel()
         self.collect_panel.capture_requested.connect(self._capture_collect_row)
         form.addRow("采集什么：", self.collect_panel)
+
+        # --- note 组：画布上的提示 / 运行日志（不碰浏览器，纯说明 + 打日志）---
+        self.note_box = QWidget()
+        nb = QVBoxLayout(self.note_box)
+        nb.setContentsMargins(0, 0, 0, 0)
+        nb.setSpacing(4)
+        self.note_text = QPlainTextEdit()
+        self.note_text.setPlaceholderText(
+            "写给自己看的话，画布上就显示这段；运行时它会（把 {{变量}} 换成实际值后）"
+            "打到运行日志里")
+        self.note_text.setFixedHeight(78)
+        nb.addWidget(self.note_text)
+        note_vars = QHBoxLayout()
+        note_vars.addStretch()
+        self.note_var_combo = QComboBox()
+        self.note_var_combo.setMinimumWidth(190)
+        self.note_var_combo.setToolTip("选一个变量插到光标处（运行时换成实际值）")
+        self.note_var_combo.activated.connect(self._insert_note_var)
+        note_vars.addWidget(self.note_var_combo)
+        nb.addLayout(note_vars)
+        note_hint = QLabel(
+            "这个节点不点页面、不填表单，只是给你自己留记号：\n"
+            "· 画布上它就是一张说明卡片（如「下面开始登录」）；\n"
+            "· 运行时会把内容打进日志——想看看某个变量到底取到了什么，"
+            "在它后面插一个、写上 {{那个变量}} 就行。"
+        )
+        note_hint.setWordWrap(True)
+        note_hint.setStyleSheet("color: #888;")
+        nb.addWidget(note_hint)
+        form.addRow("提示内容：", self.note_box)
 
         # --- 桌面动作专用 ---
         self.win_title_edit = QLineEdit()
@@ -589,6 +620,7 @@ class StepEditDialog(QDialog):
         self._navigate_widgets = [self.url_edit, self.nav_timeout]
         self._read_widgets = [self.read_panel]
         self._collect_widgets = [self.collect_panel]
+        self._note_widgets = [self.note_box]
         self._locator_widgets = [self.locator_type, loc_row, self.locator_hint]
         self._image_widgets = [self.image_hint, self.preview]
         self._value_widgets = [value_row, self.value_hint]
@@ -642,6 +674,8 @@ class StepEditDialog(QDialog):
             self._show(w, is_read)
         for w in self._collect_widgets:
             self._show(w, is_collect)
+        for w in self._note_widgets:
+            self._show(w, action == "note")
         # 产出变量名：读取 / 采集都要填
         self._show(self.output_var_edit, is_read or is_collect)
         for w in self._locator_widgets:
@@ -740,6 +774,7 @@ class StepEditDialog(QDialog):
             (self.var_combo, "插入变量 ▾"),
             (self.loop_expr_var_combo, "插入变量 ▾"),
             (self.cond_var_combo, "插入变量 ▾"),
+            (self.note_var_combo, "插入变量 ▾"),
             (self.script_var_combo, "添加变量 ▾"),
         ):
             combo.blockSignals(True)
@@ -771,6 +806,15 @@ class StepEditDialog(QDialog):
         self.value_edit.insert(f"{{{{{name}}}}}")
         self.value_edit.setFocus()
         self.var_combo.setCurrentIndex(0)
+
+    def _insert_note_var(self, index: int):
+        """把选中的变量插到「提示内容」的光标处。"""
+        name = self.note_var_combo.itemData(index)
+        self.note_var_combo.setCurrentIndex(0)
+        if not name:
+            return
+        self.note_text.insertPlainText(f"{{{{{name}}}}}")
+        self.note_text.setFocus()
 
     def _insert_loop_expr_var(self, index: int):
         """把选中的变量插入到「循环内容」光标处。"""
@@ -1095,6 +1139,7 @@ class StepEditDialog(QDialog):
         self.output_var_edit.setText(s.output_var or "")
         self.read_panel.load(s.data_cfg or {})
         self.collect_panel.load(s)
+        self.note_text.setPlainText(s.text or "")
         self.loop_expr_edit.setText(s.loop_expr or "")
         self.win_title_edit.setText(s.win_title or "")
         self.keys_edit.setText(s.keys or "")
@@ -1262,6 +1307,8 @@ class StepEditDialog(QDialog):
             step.collect_mode = mode
             step.collect_row = row
             step.collect_fields = fields
+        elif action == "note":
+            step.text = self.note_text.toPlainText().strip()
         elif action in ("click", "fill", "select"):
             step.locator = Locator(
                 # 桌面场景一律是「图片模板」；网页场景看「定位方式」

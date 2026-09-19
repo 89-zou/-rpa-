@@ -90,6 +90,7 @@ ACTION_META = {
     "condition_end": ("条件结束", "#2f6fb3"),
     "branch": ("分支", "#5b8fd0"),
     "collect": ("采集数据", "#9d174d"),
+    "note": ("提示 / 日志", "#a16207"),
     "group_start": ("组合", "#0d7a6a"),
     "group_end": ("组合结束", "#0d7a6a"),
     "script": ("自由代码", "#475569"),
@@ -118,8 +119,48 @@ def group_card_lines(count: int, skip_if_logged_in: bool = False) -> List[str]:
     return [f"组合（{count} 个步骤）", second]
 
 
+def wrap_for_card(text: str, cols: int = 19, max_lines: int = 3) -> List[str]:
+    """把一段话按卡片宽度折行（一个中文占 2 格、西文占 1 格），最多 max_lines 行。
+
+    给「提示 / 日志」节点用：它整张卡片就是一段话，不折行的话会被截成一条。
+    """
+    paras = [p.strip() for p in str(text or "").splitlines()]
+    paras = [p for p in paras if p]
+    if not paras:
+        return ["（写点什么当提示）"]
+    total = sum(2 if ord(ch) > 127 else 1 for p in paras for ch in p)
+    lines: List[str] = []
+    shown = 0
+    for para in paras:
+        cur, used = "", 0
+        for ch in para:
+            w = 2 if ord(ch) > 127 else 1
+            if used + w > cols * 2:
+                lines.append(cur)
+                shown += used
+                cur, used = "", 0
+                if len(lines) >= max_lines:
+                    break
+            cur += ch
+            used += w
+        if len(lines) >= max_lines:
+            break
+        if cur:
+            lines.append(cur)
+            shown += used
+        if len(lines) >= max_lines:
+            break
+    if not lines:
+        return ["（写点什么当提示）"]
+    if shown < total:
+        lines[-1] += "…"          # 还有没画完的，末尾给个省略号（后面会被 elide 兜住）
+    return lines[:max_lines]
+
+
 def step_summary(s: Step, branch_text: str = "") -> List[str]:
     """卡片正文最多 3 行摘要（branch_text 是分支标记从所属条件里取的匹配值）。"""
+    if s.action == "note":
+        return wrap_for_card(s.text)
     if s.action == "navigate":
         return [s.url or "（未填网址）"]
     if s.action == "read_data":

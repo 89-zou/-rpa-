@@ -20,9 +20,9 @@ from typing import List, Optional, Tuple
 from PyQt6.QtCore import QSize, Qt, QTimer
 from PyQt6.QtGui import QAction, QFont
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
-    QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QVBoxLayout,
-    QWidget,
+    QAbstractItemView, QCheckBox, QDialog, QFormLayout, QFrame, QHBoxLayout,
+    QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
+    QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
 from smart_tool.core import blocks, project_store, step_executor
@@ -779,3 +779,85 @@ class FlowEditorDialog(QDialog):
     def get_steps(self) -> List[Step]:
         """返回编辑后的步骤（已按 1 起重新编号，且已写盘）。"""
         return self._steps
+
+
+class GroupEditDialog(QDialog):
+    """编辑一个组合（画布上双击组合卡片时弹这个）。
+
+    【流程编辑】里能做的事这里只挑最常用的三件：改名、标记「登录用」、取消组合。
+    合并（选多个节点收成一个组合）还是得去【流程编辑】里多选——那需要列表。
+    """
+
+    def __init__(self, step: Step, count: int, number: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("编辑组合")
+        self.setMinimumWidth(460)
+        self._step = step
+        self.want_ungroup = False
+
+        root = QVBoxLayout(self)
+        tip = QLabel(
+            f"这个组合里有 {count} 个步骤"
+            + (f"（编号 {number}）" if number else "")
+            + "。运行时会按顺序把它们跑完，就像收在一张卡片里一样。"
+        )
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#555555;")
+        root.addWidget(tip)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 8, 0, 0)
+        self.name_edit = QLineEdit(step.title or blocks.DEFAULT_GROUP_NAME)
+        form.addRow("组合名：", self.name_edit)
+
+        self.chk_login = QCheckBox("登录态有效时整块跳过（登录用）")
+        self.chk_login.setChecked(bool(step.skip_if_logged_in))
+        self.chk_login.setToolTip(
+            "把「打开登录页 → 填账号 → 点登录」这几步收成一个组合并勾上它：\n"
+            "运行时带着有效的登录态就直接跳过这块，不用每次都登。"
+        )
+        form.addRow("", self.chk_login)
+        root.addLayout(form)
+
+        hint = QLabel(
+            "「登录用」组合要配合【项目管理…】→【登录态】使用："
+            "那边配好登录态和「登录后才有的元素」，这里勾上，登录步骤才会被跳过。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#888888;")
+        root.addWidget(hint)
+
+        root.addStretch()
+        btns = QHBoxLayout()
+        self.btn_ungroup = QPushButton("取消组合")
+        self.btn_ungroup.setToolTip("只去掉这层壳，里面的步骤一个都不删")
+        self.btn_ungroup.clicked.connect(self._accept_ungroup)
+        btns.addWidget(self.btn_ungroup)
+        btns.addStretch()
+        self.btn_cancel = QPushButton("取消")
+        self.btn_cancel.clicked.connect(self.reject)
+        btns.addWidget(self.btn_cancel)
+        self.btn_ok = QPushButton("确定")
+        self.btn_ok.setDefault(True)
+        self.btn_ok.clicked.connect(self.accept)
+        btns.addWidget(self.btn_ok)
+        root.addLayout(btns)
+
+    def _accept_ungroup(self):
+        reply = QMessageBox.question(
+            self, "取消组合",
+            f"确定取消「{self.name_edit.text().strip() or '组合'}」这层组合吗？\n"
+            "里面的步骤一个都不会删，只是画布上重新变成一张张卡片。",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.want_ungroup = True
+        self.accept()
+
+    @property
+    def group_name(self) -> str:
+        return self.name_edit.text().strip() or blocks.DEFAULT_GROUP_NAME
+
+    @property
+    def skip_if_logged_in(self) -> bool:
+        return self.chk_login.isChecked()

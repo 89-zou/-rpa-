@@ -22,7 +22,7 @@ from smart_tool.ui.flow_canvas import (
     ACTION_META, DEFAULT_PLACEHOLDER, LAYOUT_VERSION, NO_PROJECT_PLACEHOLDER,
     FlowCanvas, step_summary,
 )
-from smart_tool.ui.flow_editor_dialog import FlowEditorDialog
+from smart_tool.ui.flow_editor_dialog import FlowEditorDialog, GroupEditDialog
 from smart_tool.ui.project_manager_dialog import ProjectManagerDialog
 from smart_tool.ui.project_picker_dialog import (
     NewProjectDialog, ProjectPickerDialog,
@@ -564,13 +564,8 @@ class WebAutomationTab(QWidget):
         row = blocks.marker_owner_index(self._steps, row)
         old = self._steps[row]
         if old.action == blocks.GROUP_START:
-            # 组合的结构改动（合并 / 取消 / 改名 / 展开）只在【流程编辑】里做
-            QMessageBox.information(
-                self, "组合节点",
-                f"「{old.title or '组合'}」是一个组合节点，画布上只显示这张卡片。\n\n"
-                "想展开看里面的步骤、改名、或者取消组合，"
-                "请点上方【流程编辑…】，在列表里操作。",
-            )
+            # 画布上只有一张组合卡片，双击它直接编辑这个组合（改名 / 登录用 / 取消组合）
+            self._edit_group(row)
             return
         dlg = self._make_step_dialog(old)
         try:
@@ -592,6 +587,37 @@ class WebAutomationTab(QWidget):
             for note in rename_field_refs(self._steps, old, new_step, skip=row):
                 self._append_log(f"变量改名：{note}")
         self._persist(select_row=row)
+
+    def _edit_group(self, row: int):
+        """双击画布上的组合卡片：直接改这个组合（不用再绕去【流程编辑】）。"""
+        step = self._steps[row]
+        span = blocks.span_by_marker(blocks.spans(self._steps), row)
+        count = blocks.inner_count(span) if span is not None else 0
+        number = blocks.number_of(self._steps, row)
+        dlg = GroupEditDialog(step, count, number, self)
+        try:
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            name, logged_in, ungroup = dlg.group_name, dlg.skip_if_logged_in, \
+                dlg.want_ungroup
+        finally:
+            dlg.deleteLater()
+        if ungroup:
+            blocks.ungroup(self._steps, row)
+            self._persist(select_row=min(row, len(self._steps) - 1))
+            self._append_log("已取消组合（里面的步骤一个没删，画布上重新变成一张张卡片）。")
+            return
+        changed = []
+        if step.title != name:
+            changed.append(f"名字 → {name}")
+        if bool(step.skip_if_logged_in) != logged_in:
+            changed.append("已标记为「登录用」" if logged_in
+                           else "已取消「登录用」标记")
+        step.title = name
+        step.skip_if_logged_in = logged_in
+        self._persist(select_row=row)
+        if changed:
+            self._append_log("组合「" + name + "」：" + "；".join(changed))
 
     def _delete_selected_step(self):
         row = self._selected_row()

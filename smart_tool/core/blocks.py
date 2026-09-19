@@ -374,8 +374,11 @@ def can_group(steps: List[Step], lo: int, hi: int) -> Optional[str]:
                 "请先对它【取消组合】，或者只选组合外面的节点。")
     for sp in all_spans:
         overlap = sp.start <= hi and sp.end >= lo
-        inside = lo <= sp.start and sp.end <= hi
-        if overlap and not inside:
+        inside = lo <= sp.start and sp.end <= hi      # 选中的范围把整个块包住
+        nested = sp.start <= lo and hi <= sp.end      # 选中的范围整个缩在块里面
+        # 两种都不算「切开」：整个包住＝块被收进去；缩在里面＝新组合嵌在这个块里
+        # （循环里、条件分支里都能再合并出一个组合）
+        if overlap and not (inside or nested):
             name = {"loop": "循环", "condition": "条件",
                     "branch": "分支", "group": "组合"}.get(sp.kind, sp.kind)
             return (f"选中的范围把一个「{name}」切成了两半：\n"

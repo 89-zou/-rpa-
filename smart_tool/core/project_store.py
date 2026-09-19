@@ -113,6 +113,10 @@ class Step:
     collect_mode: str = "page"
     collect_row: str = ""
     collect_fields: List[Dict[str, str]] = field(default_factory=list)
+    # ---- note 专用：画布上的提示 / 运行日志 ----
+    # 这段文字直接画在画布卡片上（当说明用），运行时会把 {{变量}} 渲染出来
+    # 打进日志——想看看某个变量到底取到了什么，插一个这种节点就行。
+    text: str = ""
     # ---- group_start 专用：这个组合是「登录用」的 ----
     # 运行时如果用的是有效登录态（cookie 还没过期），整个组合直接跳过，
     # 不用再登一遍；登录态失效时会自动重跑整条流程，那时它照常执行。
@@ -184,6 +188,8 @@ class Step:
             d["pos"] = [float(self.pos[0]), float(self.pos[1])]
         if self.skip_if_logged_in:
             d["skip_if_logged_in"] = True
+        if self.text:
+            d["text"] = self.text
         return d
 
     @classmethod
@@ -232,6 +238,7 @@ class Step:
             keys=d.get("keys", ""),
             click_times=int(d.get("click_times", 1) or 1),
             skip_if_logged_in=bool(d.get("skip_if_logged_in")),
+            text=str(d.get("text") or ""),
         )
 
 
