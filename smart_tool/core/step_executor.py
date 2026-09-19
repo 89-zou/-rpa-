@@ -10,12 +10,13 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urljoin
 
 from playwright.sync_api import (
     Page, TimeoutError as PlaywrightTimeout, sync_playwright,
 )
 
-from smart_tool.core import auth_store, blocks, desktop, image_locator
+from smart_tool.core import auth_store, blocks, datastore, desktop, image_locator
 from smart_tool.core import real_mouse as real_mouse_mod
 from smart_tool.core.blocks import Block
 from smart_tool.core.data_sources import DataSourceConfig, load_rows
@@ -48,6 +49,8 @@ DEFAULT_PAGE_TIMEOUT_MS = 30000
 NAV_TIMEOUT_DEFAULT_S = 120
 # 点击元素的等待上限（毫秒）
 CLICK_TIMEOUT_MS = 20000
+# 采集节点下载图片 / 附件的等待上限（毫秒）
+DOWNLOAD_TIMEOUT_MS = 30000
 # 每个步骤之间的最小缓冲（秒）。站点慢的时候连点太密会丢事件
 # （典型：点了发布，但页面正好在自己刷新，这一下点击就被吃掉了）
 STEP_GAP_SECONDS = 1.0
@@ -161,7 +164,35 @@ def step_var_fields(step: Step) -> List[str]:
         texts.append(path)
     # 条件分支的匹配值也允许写 {{变量}}（运行时先渲染再比）
     texts += [m.get("values", "") for m in (step.cond_branches or [])]
+    # 「采集数据」的行定位、字段定位与属性名里也允许写 {{变量}}
+    texts.append(step.collect_row)
+    for item in step.collect_fields or []:
+        if isinstance(item, dict):
+            texts.extend([item.get("locator", ""), item.get("extra", "")])
     return [t for t in texts if t]
+
+
+def collect_fields(step: Step) -> List[Dict[str, str]]:
+    """「采集数据」节点里配好的字段（没写名字的丢掉）。"""
+    out: List[Dict[str, str]] = []
+    for item in step.collect_fields or []:
+        if isinstance(item, dict) and str(item.get("name") or "").strip():
+            out.append(item)
+    return out
+
+
+def collect_outputs(step: Step) -> List[str]:
+    """「采集数据」节点会产出哪些变量名。
+
+    - 一条记录模式：每个字段一个 `{{变量.字段}}`
+    - 列表模式：`{{变量}}`（JSON 数组，每项一个对象，配「循环」节点遍历）
+    """
+    var = (step.output_var or "").strip()
+    if not var:
+        return []
+    if (step.collect_mode or "page") == "list":
+        return [var]
+    return [f"{var}.{str(f.get('name')).strip()}" for f in collect_fields(step)]
 
 
 def collect_variables(steps: List[Step]) -> List[str]:
@@ -176,32 +207,47 @@ def collect_variables(steps: List[Step]) -> List[str]:
 
 
 def produced_variables(steps: List[Step]) -> Dict[str, Step]:
-    """「读取数据」节点产出的变量 → 那个节点。"""
+    """会产出变量的节点 → 那个节点（「读取数据」与「采集数据」）。"""
     out: Dict[str, Step] = {}
     for s in steps:
         if s.action == "read_data":
             name = (s.output_var or "").strip()
             if name:
                 out[name] = s
+        elif s.action == "collect":
+            for name in collect_outputs(s):
+                out.setdefault(name, s)
     return out
+
+
+def produced_loop_fields(node: Step) -> List[str]:
+    """这个产出节点被「循环」遍历时，循环体里能用的 {{loop.item.字段}}。"""
+    if node.action == "collect":
+        if (node.collect_mode or "page") != "list":
+            return []
+        return [str(f.get("name")).strip() for f in collect_fields(node)]
+    fields: List[str] = []
+    for item in (node.data_cfg or {}).get("field_map") or []:
+        if isinstance(item, dict):
+            var = (item.get("var") or "").strip()
+            if var and var not in fields:
+                fields.append(var)
+    return fields
 
 
 def available_variables(steps: List[Step],
                         project_variables: Optional[dict] = None) -> List[str]:
     """步骤里可以插入的变量名（变量下拉 / 提示用）。
 
-    顺序：自定义变量 → 读取节点产出的列表变量 → 运行时变量
-    （{{loop.index}} 与各读取节点的 {{loop.item.字段}}）。
+    顺序：自定义变量 → 读取 / 采集节点产出的变量 → 运行时变量
+    （{{loop.index}} 与各产出节点的 {{loop.item.字段}}）。
     """
     names: List[str] = list(project_variables or {})
     produced = produced_variables(steps)
     names.extend(produced)
     names.extend(LOOP_VARS)
     for node in produced.values():
-        for item in (node.data_cfg or {}).get("field_map") or []:
-            var = (item.get("var") or "").strip() if isinstance(item, dict) else ""
-            if var:
-                names.append(f"loop.item.{var}")
+        names.extend(f"loop.item.{f}" for f in produced_loop_fields(node))
     out: List[str] = []
     for n in names:
         if n and n not in out:
@@ -212,8 +258,8 @@ def available_variables(steps: List[Step],
 def loop_fields(steps: List[Step], start: Step) -> List[str]:
     """这个循环遍历的数据有哪些字段（供 {{loop.item.字段}} 使用）。
 
-    循环内容写的是 {{A}}、而 A 是某个「读取数据」节点产出的 → 返回该节点
-    配置的字段名；否则返回空（列表项是普通文本，只有 {{loop.item}} 本身）。
+    循环内容写的是 {{A}}、而 A 是某个「读取数据」/「采集数据」节点产出的 →
+    返回那个节点配置的字段名；否则返回空（列表项是普通文本，只有 {{loop.item}} 本身）。
     """
     raw = (start.loop_expr or "").strip()
     m = VAR_PATTERN.fullmatch(raw)
@@ -222,13 +268,7 @@ def loop_fields(steps: List[Step], start: Step) -> List[str]:
     node = produced_variables(steps).get(m.group(1))
     if node is None:
         return []
-    fields: List[str] = []
-    for item in (node.data_cfg or {}).get("field_map") or []:
-        if isinstance(item, dict):
-            var = (item.get("var") or "").strip()
-            if var and var not in fields:
-                fields.append(var)
-    return fields
+    return produced_loop_fields(node)
 
 
 def check_variables(steps: List[Step],
@@ -284,12 +324,23 @@ def check_variables(steps: List[Step],
 
     # 先看「读取数据」节点自身配全了没有
     for name, node in produced.items():
+        if node.action != "read_data":
+            continue
         if not (node.data_cfg or {}).get("type") or not (node.data_cfg or {}).get("path"):
             add(node.id, f"「读取数据」节点还没选好文件 / 文件夹（它要产出 {{{{{name}}}}}）")
 
     for s in steps:
         if s.action == "read_data" and not (s.output_var or "").strip():
             add(s.id, "「读取数据」节点还没填产出变量名（双击节点填写，如 文章列表）")
+        if s.action == "collect":
+            if not (s.output_var or "").strip():
+                add(s.id, "「采集数据」节点还没填产出变量名（双击节点填写，如 采集结果）")
+            if not collect_fields(s):
+                add(s.id, "「采集数据」节点还没加要采集的字段"
+                          "（双击节点添加：文字 / 属性 / 链接 / 图片 / 截图）")
+            if (s.collect_mode or "page") == "list" and not (s.collect_row or "").strip():
+                add(s.id, "「采集数据」是列表模式，但没填「每行的定位」"
+                          "（比如 //div[@class='item']）")
         if s.action == "loop_start" and not (s.loop_expr or "").strip():
             add(s.id, "「循环」节点还没填循环内容（双击节点填写：数字＝跑几次，"
                       "或 {{变量}}＝按它的长度跑）")
@@ -310,7 +361,7 @@ def check_variables(steps: List[Step],
                     continue
                 add(s.id, f"{{{name}}} 找不到来源："
                           "要么在【项目管理…】里加一个自定义变量，"
-                          "要么用「读取数据」节点产出它")
+                          "要么用「读取数据」/「采集数据」节点产出它")
     return problems
 
 
@@ -766,6 +817,9 @@ class StepExecutor:
                 self._navigate(step)
             elif step.action == "read_data":
                 self._read_data(step)
+            elif step.action == "collect":
+                self._require_web(step, "采集数据")
+                self._collect(step)
             elif step.action == "win_activate":
                 self._win_activate(step)
             elif step.action == "hotkey":
@@ -1067,6 +1121,188 @@ class StepExecutor:
         if fields:
             names = "、".join(f"{{{{loop.item.{f}}}}}" for f in fields[:6])
             self.log(f"  每个文件的字段：{names}" + ("…" if len(fields) > 6 else ""))
+
+    # ------------------------------
+    # 采集数据：把页面上的东西取下来（落盘 + 进变量）
+    # ------------------------------
+    def _collect(self, step: Step):
+        """「采集数据」节点：按字段清单把页面上的东西取下来。
+
+        - 一条记录模式：当前页面采一条 → 每个字段进一个变量 `{{产出.字段}}`
+        - 列表模式：页面上的多行各采一条 → `{{产出}}` 是 JSON 数组，
+          配「循环」节点逐行遍历，循环体里用 `{{loop.item.字段}}`
+
+        数据一律落到项目的 `data/`：结构化数据追加进 `records.jsonl`，
+        图片 / 附件 / 截图存进 `data/files/`。每条记录自动带 `_time` / `_url` / `_step`。
+        """
+        if self.project_dir is None:
+            raise ValueError("「采集数据」要把数据存进项目目录，但当前没有项目目录")
+        fields = collect_fields(step)
+        if not fields:
+            raise ValueError(
+                "「采集数据」节点还没有要采集的字段。\n"
+                "   双击这个节点，点【＋ 添加字段】选「取什么」（文字 / 属性 / 链接 / "
+                "图片 / 文件 / 截图）。"
+            )
+        var = (step.output_var or "").strip()
+        label = self._labels.get(id(step), step.id)
+        if (step.collect_mode or "page") == "list":
+            self._collect_list(step, fields, var, label)
+            return
+        record = self._collect_record(step, fields, None, 0, label, None)
+        for item in fields:
+            name = str(item.get("name") or "").strip()
+            if var:
+                value = record.get(name, "")
+                self.variables[f"{var}.{name}"] = "" if value is None else str(value)
+        self.log(f"  采集完成：1 条记录 → data/{datastore.RECORDS_NAME}"
+                 + (f"；变量 {{{{ {var}.字段 }}}}" if var else ""))
+
+    def _collect_list(self, step: Step, fields: List[Dict[str, str]],
+                      var: str, label: Any):
+        """列表模式：先定位每一行，再在行内取字段。"""
+        row_xpath = self._resolve_value(step.collect_row or "").strip()
+        if not row_xpath:
+            raise ValueError(
+                "「采集数据」是列表模式，但没填「每行的定位」。\n"
+                "   双击节点，在「每行的定位」里填一个能命中多行的 XPath，"
+                "比如 //div[@class='item']；字段的定位就在每一行里面找。"
+            )
+        rows = self._page.locator(f"xpath={row_xpath}")
+        try:
+            total = rows.count()
+        except Exception as e:
+            raise ValueError(
+                f"列表定位「{row_xpath}」用不了：{_first_line(e)}\n"
+                "   注意这里只能填 XPath。"
+            ) from None
+        self.log(f"  列表采集：{row_xpath} 命中 {total} 行")
+        if total == 0:
+            self.log("  一行都没命中：确认页面已经加载出来、定位也写对了。")
+        problems: Dict[str, List] = {}
+        records: List[Dict] = []
+        for i in range(total):
+            records.append(self._collect_record(step, fields, rows.nth(i),
+                                                i + 1, label, problems))
+        if var:
+            self.variables[var] = json.dumps(records, ensure_ascii=False)
+        self.log(f"  采集完成：{len(records)} 条记录 → data/{datastore.RECORDS_NAME}"
+                 + (f"；变量 {{{{{var}}}}} 可配「循环」逐行遍历" if var else ""))
+        for name, (count, reason) in problems.items():
+            self.log(f"    字段「{name}」有 {count} 条没取到（{reason}）")
+
+    def _collect_record(self, step: Step, fields: List[Dict[str, str]], row,
+                        index: int, label: Any,
+                        problems: Optional[Dict[str, List]]) -> Dict:
+        """采一条记录并写盘。"""
+        record: Dict[str, Any] = {
+            "_time": datastore.now_text(),
+            "_url": self._current_url(),
+            "_step": label,
+        }
+        for item in fields:
+            name = str(item.get("name") or "").strip()
+            try:
+                value = self._collect_value(item, row, index)
+            except Exception as e:
+                value = ""
+                if problems is not None:
+                    slot = problems.setdefault(name, [0, _first_line(e)])
+                    slot[0] += 1
+                else:
+                    self.log(f"    字段「{name}」没取到：{_first_line(e)}")
+            record[name] = value
+        datastore.append_record(self.project_dir, record)
+        return record
+
+    def _locator_for(self, locator: str, row):
+        """列表模式在「当前行」里找（Playwright 的嵌套 XPath 就是元素内定位）。"""
+        if not locator:
+            return None
+        if row is not None:
+            return row.locator(f"xpath={locator}")
+        return self._page.locator(f"xpath={locator}")
+
+    def _collect_value(self, item: Dict[str, str], row, index: int) -> str:
+        """取一个字段的值（返回能写进记录 / 变量的文本）。"""
+        kind = str(item.get("kind") or "text").lower()
+        locator = self._resolve_value(str(item.get("locator") or "")).strip()
+        extra = str(item.get("extra") or "").strip()
+        if kind == "shot":
+            return self._collect_shot(item, locator, extra, row, index)
+        target = self._locator_for(locator, row)
+        if target is None:
+            raise ValueError("没填定位（XPath）")
+        el = target.first
+        if kind == "text":
+            return (el.inner_text() or "").strip()
+        if kind == "html":
+            return el.inner_html()
+        if kind == "attr":
+            if not extra:
+                raise ValueError("取属性时要填属性名（如 src / title）")
+            return el.get_attribute(extra) or ""
+        if kind == "link":
+            href = el.get_attribute(extra or "href") or ""
+            return urljoin(self._current_url(), href) if href else ""
+        if kind in ("image", "file"):
+            attr = extra or ("src" if kind == "image" else "href")
+            src = el.get_attribute(attr) or ""
+            if not src:
+                raise ValueError(f"这个元素没有 {attr} 属性")
+            return self._download(urljoin(self._current_url(), src), item, index)
+        raise ValueError(f"不认识的采集方式：{kind}")
+
+    def _collect_shot(self, item: Dict[str, str], locator: str, extra: str,
+                      row, index: int) -> str:
+        """截图：元素（默认）/ 整页（附加写「整页」）/ 区域（附加写 x,y,宽,高）。"""
+        stem = (f"{time.strftime('%Y%m%d_%H%M%S')}_{index or 1}_"
+                f"{datastore.safe_stem(item.get('name'))}")
+        if extra in ("", "元素", "element"):
+            target = self._locator_for(locator, row)
+            if target is None:
+                raise ValueError("截元素要填定位；想截整页就在「附加」里写「整页」")
+            data = target.first.screenshot()
+        elif extra in ("整页", "全页", "page", "full"):
+            data = self._page.screenshot(full_page=True)
+            stem += "_整页"
+        else:
+            data = self._page.screenshot(clip=self._parse_area(extra))
+        return datastore.save_bytes(self.project_dir, stem, ".png", data)
+
+    @staticmethod
+    def _parse_area(text: str) -> Dict[str, float]:
+        """「x,y,宽,高」→ Playwright 的 clip 参数。"""
+        parts = [p.strip() for p in text.replace("，", ",").split(",")]
+        if len(parts) != 4:
+            raise ValueError(
+                "区域截图要在「附加」里填 x,y,宽,高（如 0,120,800,600），"
+                "或留空＝截那个元素、写「整页」＝截整页")
+        try:
+            x, y, w, h = (float(p) for p in parts)
+        except ValueError:
+            raise ValueError("区域坐标得是数字：x,y,宽,高") from None
+        if w <= 0 or h <= 0:
+            raise ValueError("区域的宽 / 高要大于 0")
+        return {"x": x, "y": y, "width": w, "height": h}
+
+    def _download(self, url: str, item: Dict[str, str], index: int) -> str:
+        """把图片 / 附件下载进 data/files/，返回相对项目的路径。"""
+        if url.startswith("data:"):
+            raise ValueError("这是内嵌的 data: 图片，用「截图」方式取它更稳")
+        try:
+            resp = self._page.request.get(url, timeout=DOWNLOAD_TIMEOUT_MS)
+        except Exception as e:
+            raise ValueError(f"下载失败：{_first_line(e)}") from None
+        if not resp.ok:
+            raise ValueError(f"下载失败（HTTP {resp.status}）")
+        body = resp.body()
+        if not body:
+            raise ValueError("下载到的是空文件")
+        ext = datastore.guess_ext(url, resp.headers.get("content-type", ""))
+        stem = (f"{time.strftime('%Y%m%d_%H%M%S')}_{index or 1}_"
+                f"{datastore.safe_stem(item.get('name'))}")
+        return datastore.save_bytes(self.project_dir, stem, ext, body)
 
     def _navigate(self, step: Step):
         """打开网页。

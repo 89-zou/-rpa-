@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
 )
 
 from smart_tool.core.project_store import Locator, Step
+from smart_tool.ui.collect_panel import CollectPanel
 from smart_tool.ui.desktop_picker import DesktopPickerDialog
 from smart_tool.ui.element_picker_dialog import ElementPickerDialog
 from smart_tool.ui.read_data_panel import ReadDataPanel
@@ -33,9 +34,9 @@ from smart_tool.ui.screen_capture import ScreenCaptureDialog
 
 # 网页场景能用的动作
 WEB_ACTIONS = [
-    "navigate", "read_data", "click", "fill", "select", "pause_for_human",
-    "loop_start", "loop_end", "condition_start", "condition_end", "branch",
-    "script",
+    "navigate", "read_data", "collect", "click", "fill", "select",
+    "pause_for_human", "loop_start", "loop_end", "condition_start",
+    "condition_end", "branch", "script",
 ]
 # 桌面场景能用的动作（没有浏览器，也就没有 XPath / 下拉选择）
 DESKTOP_ACTIONS = [
@@ -48,6 +49,7 @@ NEW_STEP_HIDDEN = {"loop_end", "condition_end", "branch"}
 ACTION_LABELS = {
     "navigate": "打开网页 navigate",
     "read_data": "读取数据 read_data（读文件夹/文件 → 产出一个列表变量）",
+    "collect": "采集数据 collect（把页面上的文字/链接/图片/截图取下来 → 存 data/ 并进变量）",
     "click": "点击 click",
     "fill": "填入 fill",
     "select": "下拉选择 select",
@@ -228,6 +230,10 @@ class StepEditDialog(QDialog):
 
         self.read_panel = ReadDataPanel()
         form.addRow("读什么：", self.read_panel)
+
+        # --- collect 组：把页面上的东西采下来（存 data/ + 进变量）---
+        self.collect_panel = CollectPanel()
+        form.addRow("采集什么：", self.collect_panel)
 
         # --- 桌面动作专用 ---
         self.win_title_edit = QLineEdit()
@@ -569,7 +575,8 @@ class StepEditDialog(QDialog):
 
         # 各字段的 label buddy 不便单独拿，统一用 widget 列表控制显隐
         self._navigate_widgets = [self.url_edit, self.nav_timeout]
-        self._read_widgets = [self.output_var_edit, self.read_panel]
+        self._read_widgets = [self.read_panel]
+        self._collect_widgets = [self.collect_panel]
         self._locator_widgets = [self.locator_type, loc_row]
         self._image_widgets = [self.image_hint, self.preview]
         self._value_widgets = [value_row, self.value_hint]
@@ -602,6 +609,7 @@ class StepEditDialog(QDialog):
         is_loop = action in ("loop_start", "loop_end")
         is_cond = action == "condition_start"
         is_read = action == "read_data"
+        is_collect = action == "collect"
         is_locate = action in ("click", "fill", "select")
         is_fill = action in ("fill", "select")
         is_image = is_locate and self.locator_type.currentData() == "image"
@@ -620,6 +628,10 @@ class StepEditDialog(QDialog):
             self._show(w, action == "navigate")
         for w in self._read_widgets:
             self._show(w, is_read)
+        for w in self._collect_widgets:
+            self._show(w, is_collect)
+        # 产出变量名：读取 / 采集都要填
+        self._show(self.output_var_edit, is_read or is_collect)
         for w in self._locator_widgets:
             self._show(w, is_locate)
         self._show(self.win_title_edit, is_win)
@@ -1039,6 +1051,7 @@ class StepEditDialog(QDialog):
 
         self.output_var_edit.setText(s.output_var or "")
         self.read_panel.load(s.data_cfg or {})
+        self.collect_panel.load(s)
         self.loop_expr_edit.setText(s.loop_expr or "")
         self.win_title_edit.setText(s.win_title or "")
         self.keys_edit.setText(s.keys or "")
@@ -1140,6 +1153,15 @@ class StepEditDialog(QDialog):
                     "还没有勾选要保存的字段：点【读取预览】，"
                     "在「保存」列勾上要用的字段（如 标题 / 内容）"
                 )
+        elif action == "collect":
+            if not self.output_var_edit.text().strip():
+                errors.append(
+                    "「采集数据」必须填一个产出变量名（如 采集结果）——"
+                    "后面的步骤就是靠这个名字引用采到的数据的"
+                )
+            problem = self.collect_panel.validate()
+            if problem:
+                errors.append("「采集数据」：" + problem)
         elif action == "loop_start":
             if not self.loop_expr_edit.text().strip():
                 errors.append(
@@ -1191,6 +1213,12 @@ class StepEditDialog(QDialog):
         elif action == "read_data":
             step.output_var = self.output_var_edit.text().strip()
             step.data_cfg = self.read_panel.config()
+        elif action == "collect":
+            step.output_var = self.output_var_edit.text().strip()
+            mode, row, fields = self.collect_panel.config()
+            step.collect_mode = mode
+            step.collect_row = row
+            step.collect_fields = fields
         elif action in ("click", "fill", "select"):
             step.locator = Locator(
                 # 桌面场景一律是「图片模板」；网页场景看「定位方式」

@@ -103,6 +103,16 @@ class Step:
     win_title: str = ""                  # win_activate：窗口标题里的一小段
     keys: str = ""                       # hotkey：要按的键，如 ctrl+s、enter
     click_times: int = 1                 # click：点几次（2＝双击）
+    # ---- collect 专用：把页面上的东西采下来（存 data/ + 进变量）----
+    # collect_mode: page＝当前页面采一条；list＝页面上多行，每行采一条
+    # collect_row ：list 模式里「每一行」的 XPath
+    # collect_fields：要采哪些字段，每项：
+    #   {"name": 字段名, "kind": text/attr/html/link/image/file/shot,
+    #    "locator": 定位（list 模式里是在「当前行」里找）,
+    #    "extra": 取属性时＝属性名；截图时＝"整页" 或 "x,y,宽,高"（留空＝截元素）}
+    collect_mode: str = "page"
+    collect_row: str = ""
+    collect_fields: List[Dict[str, str]] = field(default_factory=list)
     # ---- group_start 专用：这个组合是「登录用」的 ----
     # 运行时如果用的是有效登录态（cookie 还没过期），整个组合直接跳过，
     # 不用再登一遍；登录态失效时会自动重跑整条流程，那时它照常执行。
@@ -149,6 +159,14 @@ class Step:
         if self.action == "read_data":
             d["output_var"] = self.output_var
             d["data_cfg"] = dict(self.data_cfg or {})
+        if self.action == "collect":
+            d["output_var"] = self.output_var
+            d["collect_mode"] = self.collect_mode or "page"
+            if self.collect_row:
+                d["collect_row"] = self.collect_row
+            if self.collect_fields:
+                d["collect_fields"] = [dict(f) for f in self.collect_fields
+                                       if isinstance(f, dict)]
         if self.action == "loop_start":
             d["loop_expr"] = self.loop_expr
         if self.action == "condition_start":
@@ -201,6 +219,10 @@ class Step:
             script_vars=d.get("script_vars", ""),
             output_var=d.get("output_var", ""),
             data_cfg=dict(d.get("data_cfg") or {}),
+            collect_mode=d.get("collect_mode", "page") or "page",
+            collect_row=d.get("collect_row", ""),
+            collect_fields=[dict(f) for f in d.get("collect_fields", [])
+                            if isinstance(f, dict)],
             loop_expr=d.get("loop_expr", ""),
             cond_mode=d.get("cond_mode", "equal") or "equal",
             cond_expr=d.get("cond_expr", ""),
