@@ -89,6 +89,7 @@ ACTION_META = {
     "condition_start": ("条件", "#2f6fb3"),
     "condition_end": ("条件结束", "#2f6fb3"),
     "branch": ("分支", "#5b8fd0"),
+    "collect": ("采集数据", "#9d174d"),
     "group_start": ("组合", "#0d7a6a"),
     "group_end": ("组合结束", "#0d7a6a"),
     "script": ("自由代码", "#475569"),
@@ -182,6 +183,23 @@ def step_summary(s: Step, branch_text: str = "") -> List[str]:
         return lines
     if s.action == "group_end":
         return ["组合到此结束"]
+    if s.action == "collect":
+        fields = [str(f.get("name") or "").strip()
+                  for f in (s.collect_fields or []) if isinstance(f, dict)]
+        fields = [f for f in fields if f]
+        mode = "列表" if (s.collect_mode or "page") == "list" else "当前页"
+        if fields:
+            head = f"{mode}采集：{'、'.join(fields[:4])}" + ("…" if len(fields) > 4 else "")
+        else:
+            head = "（还没加要采集的字段）"
+        var = (s.output_var or "").strip()
+        if not var:
+            tail = "（未填产出变量名）"
+        elif mode == "列表":
+            tail = f"产出 {{{{{var}}}}}（可配循环逐行遍历）"
+        else:
+            tail = f"产出 {{{{{var}.字段}}}}，并可存 data/"
+        return [head, tail]
     if s.action == "script":
         lang = "JavaScript" if (s.script_lang or "").lower() == "javascript" else "Python"
         first = ""

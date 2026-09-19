@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from smart_tool.core import blocks, real_mouse
+from smart_tool.core import blocks, datastore, real_mouse
 from smart_tool.core.project_store import (
     ProjectStore, Step, list_projects, rename_field_refs,
 )
@@ -19,6 +19,7 @@ from smart_tool.core.step_executor import (
     PauseHandle, StepExecutor, available_variables, check_variables,
 )
 from smart_tool.ui.auth_dialog import AuthDialog
+from smart_tool.ui.data_dialog import DataDialog
 from smart_tool.ui.flow_canvas import (
     ACTION_META, DEFAULT_PLACEHOLDER, LAYOUT_VERSION, NO_PROJECT_PLACEHOLDER,
     FlowCanvas, step_summary,
@@ -155,6 +156,14 @@ class WebAutomationTab(QWidget):
         )
         self.btn_auth.clicked.connect(self._open_auth_dialog)
         proj_layout.addWidget(self.btn_auth)
+        self.btn_data = QPushButton("数据…")
+        self.btn_data.setToolTip(
+            "看「采集数据」节点采到了什么（存在项目的 data/ 里）：\n"
+            "records.jsonl＝结构化数据，files/＝图片、附件、截图。\n"
+            "可以导出成 Excel 能打开的 CSV。"
+        )
+        self.btn_data.clicked.connect(self._open_data_dialog)
+        proj_layout.addWidget(self.btn_data)
         layout.addLayout(proj_layout)
 
         # 编辑按钮条
@@ -382,6 +391,12 @@ class WebAutomationTab(QWidget):
             )
             self._update_edit_buttons()
 
+    def _open_data_dialog(self):
+        """打开【数据…】：看采集结果、导出 CSV。"""
+        if not self._require_project():
+            return
+        DataDialog(self._current_store, self).exec()
+
     def _open_project_manager(self):
         """打开【项目管理】：项目列表 + 变量清单。"""
         if self._worker is not None:
@@ -424,6 +439,7 @@ class WebAutomationTab(QWidget):
         # 登录态是浏览器专属：桌面场景用不上
         self.btn_auth.setEnabled(editable and self._scene != "desktop")
         self.btn_auth.setVisible(self._scene != "desktop")
+        self.btn_data.setEnabled(self._current_store is not None)
 
     def _require_project(self) -> bool:
         if not self._current_store:
@@ -875,6 +891,12 @@ class WebAutomationTab(QWidget):
         self._flow_paused = False
         self.monitor.hide()
         self._show_home_window()
+        if self._current_store:
+            total = datastore.count_records(self._current_store.dir)
+            if total:
+                self._append_log(
+                    f"采集到的数据：data/{datastore.RECORDS_NAME} 共 {total} 条"
+                    "（点【数据…】查看 / 导出 CSV）")
 
     def _on_pause(self, prompt: str, step_id: int):
         num = self._step_labels.get(step_id, step_id)
