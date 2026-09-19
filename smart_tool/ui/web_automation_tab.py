@@ -589,35 +589,44 @@ class WebAutomationTab(QWidget):
         self._persist(select_row=row)
 
     def _edit_group(self, row: int):
-        """双击画布上的组合卡片：直接改这个组合（不用再绕去【流程编辑】）。"""
-        step = self._steps[row]
-        span = blocks.span_by_marker(blocks.spans(self._steps), row)
-        count = blocks.inner_count(span) if span is not None else 0
+        """画布上双击组合卡片：改名字 + 进去编辑里面的节点。
+
+        画布上这张卡片只是一层壳——合并 / 取消组合 / 删除这类结构改动
+        都留在【流程编辑…】里，免得在画布上顺手一点就把流程结构改了。
+        """
+        group = self._steps[row]
         number = blocks.number_of(self._steps, row)
-        dlg = GroupEditDialog(step, count, number, self)
+
+        def build_items():
+            span = blocks.span_by_marker(blocks.spans(self._steps), row)
+            if span is None:
+                return []
+            numbers = blocks.step_numbers(self._steps)
+            out = []
+            for i in range(span.inner_lo, span.inner_hi):
+                s = self._steps[i]
+                if s.action in blocks.END_MARKERS:
+                    continue        # 结束端不单独列（它的设置和开始端是同一份）
+                name = ACTION_META.get(s.action, (s.action, ""))[0]
+                summary = (step_summary(s) or [""])[0]
+                out.append((f"{numbers[i]}. {s.title or name}", summary, i))
+            return out
+
+        def on_edit(index: int):
+            if 0 <= index < len(self._steps):
+                self._edit_step_by_id(self._steps[index].id)
+
+        dlg = GroupEditDialog(group, number, build_items, on_edit, self)
         try:
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
-            name, logged_in, ungroup = dlg.group_name, dlg.skip_if_logged_in, \
-                dlg.want_ungroup
+            name = dlg.group_name
         finally:
             dlg.deleteLater()
-        if ungroup:
-            blocks.ungroup(self._steps, row)
-            self._persist(select_row=min(row, len(self._steps) - 1))
-            self._append_log("已取消组合（里面的步骤一个没删，画布上重新变成一张张卡片）。")
-            return
-        changed = []
-        if step.title != name:
-            changed.append(f"名字 → {name}")
-        if bool(step.skip_if_logged_in) != logged_in:
-            changed.append("已标记为「登录用」" if logged_in
-                           else "已取消「登录用」标记")
-        step.title = name
-        step.skip_if_logged_in = logged_in
-        self._persist(select_row=row)
-        if changed:
-            self._append_log("组合「" + name + "」：" + "；".join(changed))
+        if name != group.title:
+            group.title = name
+            self._persist(select_row=row)
+            self._append_log(f"组合改名：{name}")
 
     def _delete_selected_step(self):
         row = self._selected_row()
@@ -625,17 +634,16 @@ class WebAutomationTab(QWidget):
             return
         block = blocks.span_by_marker(blocks.spans(self._steps), row)
         if block is not None and block.kind == "group":
-            # 组合上按「删除」＝取消组合：里面的步骤一个都不删
+            # 组合只当一层壳：画布上不给「取消组合 / 删除」，那些是【流程编辑】里的操作
             gname = self._steps[block.start].title or "组合"
-            reply = QMessageBox.question(
-                self, "取消组合",
-                f"「{gname}」是组合节点。\n"
-                "取消组合只是去掉这一层壳，里面的步骤一个都不会删。\n确定取消吗？",
+            QMessageBox.information(
+                self, "组合节点",
+                f"「{gname}」是一层组合，里面收了 {blocks.inner_count(block)} 个步骤。\n\n"
+                "画布上只能做两件事：改它的名字、双击进去编辑里面的节点\n"
+                "（双击这张卡片就行）。\n\n"
+                "取消组合（只拆壳、不删步骤）请到【流程编辑…】里，"
+                "右键那个组合选【取消组合（里面的步骤都留着）】。",
             )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-            blocks.ungroup(self._steps, block.start)
-            self._persist(select_row=min(block.start, len(self._steps) - 1))
             return
         if block is not None:
             # 只有选中块的「标记」才整块删；块里的普通步骤只删自己

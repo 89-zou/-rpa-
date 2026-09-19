@@ -113,9 +113,9 @@ def node_height_for(step: Step, lines: Optional[List[str]] = None) -> float:
 
 
 def group_card_lines(count: int, skip_if_logged_in: bool = False) -> List[str]:
-    """组合卡片上的正文：里面收了几步 + 去哪儿展开。"""
+    """组合卡片上的正文：里面收了几步 + 这张卡片能干什么。"""
     second = ("登录态有效时自动跳过（登录用）" if skip_if_logged_in
-              else "在【流程编辑…】里展开 / 取消组合")
+              else "双击＝改名 / 编辑里面的节点")
     return [f"组合（{count} 个步骤）", second]
 
 
