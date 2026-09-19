@@ -234,7 +234,8 @@ class NodeItem(QGraphicsItem):
     """步骤卡片。"""
 
     def __init__(self, step: Step, canvas: "FlowCanvas",
-                 branch_text: str = "", lines: Optional[List[str]] = None):
+                 branch_text: str = "", lines: Optional[List[str]] = None,
+                 number: str = ""):
         super().__init__()
         self.step = step
         self.canvas = canvas
@@ -243,6 +244,8 @@ class NodeItem(QGraphicsItem):
         self._color = QColor(color)
         self._lines = lines if lines is not None else step_summary(step, branch_text)
         self._h = node_height_for(step, self._lines)
+        # 显示编号：组合显示成「2-4」这种范围，见 blocks.step_numbers
+        self._number = number or ""
 
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
@@ -354,7 +357,8 @@ class NodeItem(QGraphicsItem):
         title_font.setBold(True)
         title_font.setPointSizeF(TITLE_FONT_PT)
         painter.setFont(title_font)
-        title = f"{self.step.id}. {self.step.title or self._name}"
+        title = f"{self._number}. {self.step.title or self._name}" \
+            if self._number else (self.step.title or self._name)
         painter.drawText(
             QRectF(5, 0, NODE_W - 9, HEADER_H),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
@@ -834,6 +838,52 @@ class FlowCanvas(QWidget):
         self._rebuild_scene(keep_view=False)
         self.auto_layout_applied.emit()
 
+    def place_missing_positions(self, steps: List[Step]) -> bool:
+        """只给「还没有坐标」的步骤安排位置，已有坐标的节点一个都不动。
+
+        为什么不整体重排：画布上的布局是用户自己摆的（拖过、对过齐），
+        加一个节点就把整片打乱太难受了。这里只给新节点找一个不压到任何
+        现有卡片的空格，其余照旧。想整体重排有【自动排版】按钮。
+        """
+        hidden = blocks.card_hidden_indices(steps)
+        span_map = {sp.start: sp for sp in blocks.spans(steps)}
+        taken: List[QRectF] = []
+        missing: List[int] = []
+        for i, s in enumerate(steps):
+            if i in hidden:
+                continue
+            if s.pos:
+                taken.append(QRectF(s.pos[0], s.pos[1], NODE_W,
+                                    node_height_for(s, self._card_lines(
+                                        i, s, span_map))))
+            else:
+                missing.append(i)
+        if not missing:
+            return False
+        per_row = max(1, self.compute_per_row())
+        for i in missing:
+            step = steps[i]
+            h = node_height_for(step, self._card_lines(i, step, span_map))
+            spot = self._free_spot(taken, h, per_row)
+            step.pos = [spot.x(), spot.y()]
+            taken.append(QRectF(spot.x(), spot.y(), NODE_W, h))
+        return True
+
+    def _free_spot(self, taken: List[QRectF], height: float,
+                   per_row: int) -> QPointF:
+        """按横向蛇形的格子顺序找第一个不压到现有卡片的空位。"""
+        row_h = height + GAP_Y
+        for row in range(200):              # 上限只是兜底，正常第一屏就能找到
+            for col in range(per_row):
+                x = MARGIN_X + col * (NODE_W + GAP_X)
+                y = MARGIN_Y + row * row_h
+                # 四面八方留出半个间距，挨着别的卡片也不算挤
+                probe = QRectF(x - GAP_X / 2, y - GAP_Y / 2,
+                               NODE_W + GAP_X, height + GAP_Y)
+                if not any(probe.intersects(t) for t in taken):
+                    return QPointF(x, y)
+        return QPointF(MARGIN_X, MARGIN_Y)
+
     # ------------------------------
     # 数据装载
     # ------------------------------
@@ -843,18 +893,18 @@ class FlowCanvas(QWidget):
                    keep_view: Optional[bool] = None):
         """重建画布。
 
-        :param auto_layout: None 时：有节点缺位置就整体重排
+        :param auto_layout: True 才整体重排（【自动排版】按钮 / 排版版本变了）；
+                            None / False＝只给新节点补个空位，其余节点原地不动
         :param keep_view: 是否保持当前视野。默认：重排/换项目→回到流程开头，
                           仅改内容→保持视野（避免编辑后视图乱跳）
         """
         self._steps = steps
 
-        if auto_layout is None:
-            hidden = blocks.card_hidden_indices(steps)
-            auto_layout = any(s.pos is None for i, s in enumerate(steps)
-                              if i not in hidden)
         if auto_layout:
             self.assign_auto_layout(steps)
+        else:
+            # 新增的节点还没坐标：给它找个空位就好，别动用户摆好的布局
+            self.place_missing_positions(steps)
         if keep_view is None:
             keep_view = not auto_layout
 
@@ -890,12 +940,14 @@ class FlowCanvas(QWidget):
         self._spans = blocks.spans(self._steps)
         hidden = blocks.card_hidden_indices(self._steps)
         span_map = {sp.start: sp for sp in self._spans}
+        numbers = blocks.step_numbers(self._steps)
         for i, s in enumerate(self._steps):
             if i in hidden:
                 continue        # 结束端标记、以及组合体内部：画布上不画卡片
             node = NodeItem(s, self,
                             branch_text=self._branch_text_of(s),
-                            lines=self._card_lines(i, s, span_map))
+                            lines=self._card_lines(i, s, span_map),
+                            number=numbers[i])
             # 块内的节点才给「连线小箭头」：最外层是自动连好的，不用手动连
             node.set_connectable(self._inside_block(s))
             self._scene.addItem(node)
@@ -1192,16 +1244,22 @@ class FlowCanvas(QWidget):
         return None
 
     def _anchor_label(self, ref) -> str:
+        """连线两端的名字（编号用显示编号，跟画布上看到的一致）。"""
         if isinstance(ref, tuple):
             sp = self._span_by_start(ref[1])
             if sp is None:
                 return "（框）"
-            return f"{self._steps[sp.start].id}. {self._region_label(sp)}"
-        step = next((s for s in self._steps if s.id == ref), None)
-        if step is None:
+            num = blocks.step_numbers(self._steps)[sp.start]
+            label = self._region_label(sp)
+            return f"{num}. {label}" if num else label
+        idx = next((i for i, s in enumerate(self._steps) if s.id == ref), -1)
+        if idx < 0:
             return f"#{ref}"
+        step = self._steps[idx]
         name, _ = ACTION_META.get(step.action, (step.action, ""))
-        return f"{step.id}. {step.title or name}"
+        shown = step.title or name
+        num = blocks.step_numbers(self._steps)[idx]
+        return f"{num}. {shown}" if num else shown
 
     def _build_regions(self):
         """循环 / 条件各画一个虚线框（嵌套时框也嵌套）；分支、组合不画框。

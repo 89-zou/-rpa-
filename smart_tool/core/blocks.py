@@ -323,6 +323,42 @@ def inner_count(sp: Span) -> int:
     return max(0, sp.inner_hi - sp.inner_lo)
 
 
+def step_numbers(steps: List[Step]) -> List[str]:
+    """每个步骤对外显示的编号（列表，和 steps 一一对应；空字符串＝不显示编号）。
+
+    **组合不占编号**：它就是它里面那几步的「壳」，所以显示成范围（如 `2-4`），
+    后面的节点接着这个范围往下数（下一个是 5）。
+    其它结构标记（循环开始/结束、条件、分支）跟真正的步骤一样占编号——
+    它们在画布上本来就各是一张卡片。
+    """
+    labels = [""] * len(steps)
+    n = 0
+    for i, s in enumerate(steps):
+        if s.action in (GROUP_START, GROUP_END):
+            continue
+        n += 1
+        labels[i] = str(n)
+    for sp in group_spans(spans(steps)):
+        inner = [labels[k] for k in range(sp.inner_lo, sp.inner_hi) if labels[k]]
+        if not inner:
+            continue        # 空组合不写编号，免得跟后面那个节点撞号
+        labels[sp.start] = (inner[0] if inner[0] == inner[-1]
+                            else f"{inner[0]}-{inner[-1]}")
+    return labels
+
+
+def number_of(steps: List[Step], index: int) -> str:
+    """第 index 个步骤的显示编号（越界返回空串）。"""
+    if not (0 <= index < len(steps)):
+        return ""
+    return step_numbers(steps)[index]
+
+
+def last_number(steps: List[Step]) -> str:
+    """显示编号里最大的那个数字（写「编号 1~N」用；组合的范围不参与）。"""
+    return next((n for n in reversed(step_numbers(steps)) if n.isdigit()), "")
+
+
 def can_group(steps: List[Step], lo: int, hi: int) -> Optional[str]:
     """[lo, hi] 这几行能不能合成一个组合：能返回 None，否则返回中文原因。"""
     if lo > hi:
@@ -372,10 +408,17 @@ def ungroup(steps: List[Step], index: int) -> Optional[str]:
     if sp is None or sp.kind != "group":
         return None
     name = steps[sp.start].title
-    # 组合卡片被拖动过的话，坐标交给里面第一个步骤，画布上位置看着不变
-    if sp.inner_hi > sp.inner_lo and steps[sp.start].pos:
-        if not steps[sp.inner_lo].pos:
-            steps[sp.inner_lo].pos = list(steps[sp.start].pos)
+    gpos = steps[sp.start].pos
+    inner = list(range(sp.inner_lo, sp.inner_hi))
+    if gpos and inner:
+        if all(steps[k].pos == gpos for k in inner):
+            # 里面几步的坐标跟组合卡片完全重合＝排版时留下的占位，
+            # 直接清掉，让画布重新给它们找空位（不然拆开后几张卡片叠成一摞）
+            for k in inner:
+                steps[k].pos = None
+        elif not steps[inner[0]].pos:
+            # 组合被拖动过：坐标交给里面第一个步骤，画布上位置看着不变
+            steps[inner[0]].pos = list(gpos)
     del steps[sp.end]
     del steps[sp.start]
     return name

@@ -151,11 +151,11 @@ class RunMonitor(QWidget):
         self.show()
         self.raise_()
 
-    def set_step(self, index: int, action_cn: str, detail: str = ""):
-        """跑到第几步了。"""
+    def set_step(self, number, action_cn: str, detail: str = ""):
+        """跑到第几步了（number 是显示编号：普通步骤是 3、组合是 2-4 这种范围）。"""
         self.step_label.setText(
-            f"第 {index} / {self._total} 步　{action_cn}" if self._total
-            else f"第 {index} 步　{action_cn}"
+            f"第 {number} / {self._total} 步　{action_cn}" if self._total
+            else f"第 {number} 步　{action_cn}"
         )
         self.detail_label.setText(_clip(detail, 60))
 
