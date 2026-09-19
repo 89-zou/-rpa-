@@ -83,7 +83,7 @@ class Step:
     script_lang: str = "python"           # python | javascript
     script_code: str = ""
     script_output: str = ""
-    script_timeout: int = 30              # 秒（JS 生效；Python 无法强制中断）
+    script_timeout: int = 30              # 秒；到点中断（卡在等外部返回时拦不住）
     script_vars: str = ""                 # 逗号分隔的变量名；空=传入全部变量
     # ---- read_data 专用：读文件 / 文件夹，产出一个「列表变量」 ----
     # data_cfg 的字段与 DataSourceConfig 一致（type/path/pattern/recursive/
