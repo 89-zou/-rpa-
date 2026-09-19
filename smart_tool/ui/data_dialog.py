@@ -23,11 +23,35 @@ from PyQt6.QtWidgets import (
 
 from smart_tool.core import datastore
 from smart_tool.core.project_store import ProjectStore
+from smart_tool.ui.help_tip import help_row
 
 #: 表格最多显示多少条（多的请看文件 / 导出 CSV）
 MAX_ROWS = 500
 #: 自动刷新的间隔（毫秒）：只在文件真的变了才重读
 REFRESH_MS = 1500
+
+#: 【?】里的完整说明（界面上只留一句摘要，其余收进弹窗）
+DATA_HELP = (
+    "数据存在项目目录的 data/ 下：\n"
+    "· records.jsonl ＝ 结构化数据，一行一条（「采集数据」节点追加写进去的）；\n"
+    "· files/ ＝ 采集时下载的图片、附件，以及截图。\n"
+    "每条记录都自动带 _time（采集时间）、_url（来源网址）、_step（第几步）三个\n"
+    "元信息，不用自己采。\n"
+    "\n"
+    "【表格里能做什么】\n"
+    "· 双击某一格：如果那一格是 files/… 的文件，就用系统程序打开它；\n"
+    "· 表格最多显示最近 500 条，更多的请导出或直接看 records.jsonl。\n"
+    "\n"
+    "【导出】\n"
+    "· 导出 Excel（.xlsx）：Excel 原生格式，表头冻结、列宽自动撑开，\n"
+    "  长文本（比如文章正文）不会串行，单元格里的换行也原样保留；\n"
+    "· 导出 CSV（.csv）：通用格式，各种软件都能开（用 utf-8-sig，中文不乱码）。\n"
+    "超长文本（超过 Excel 单个单元格上限）会被截断并在末尾标注，\n"
+    "完整内容始终在 records.jsonl 里。\n"
+    "\n"
+    "【删数据】「清空记录」只清 records.jsonl；files/ 里的图片、截图不会被删。\n"
+    "想彻底重来，就自己删掉项目的 data 目录。"
+)
 
 
 class DataDialog(QDialog):
@@ -81,15 +105,8 @@ class DataDialog(QDialog):
     def _init_ui(self):
         root = QVBoxLayout(self)
 
-        tip = QLabel(
-            "「采集数据」节点采到的东西都在这里：数据存在项目目录的 data/ 下——\n"
-            "records.jsonl＝结构化数据（每行一条）；files/＝图片、附件、截图。\n"
-            "表格里双击一格：如果那一格是 files/… 的文件，就用系统程序打开它。\n"
-            "导出可以选 Excel（.xlsx，长文本不乱行）或 CSV（.csv，几乎什么软件都能开）。"
-        )
-        tip.setWordWrap(True)
-        tip.setStyleSheet("color:#555555;")
-        root.addWidget(tip)
+        root.addWidget(help_row("「采集数据」节点采到的东西都在这里。",
+                                "采集数据", DATA_HELP))
 
         row = QHBoxLayout()
         self.summary = QLabel("")

@@ -30,10 +30,50 @@ from smart_tool.core.data_sources import DataSourceConfig
 from smart_tool.core.project_store import ProjectStore, Step, list_projects
 from smart_tool.ui.auth_dialog import AuthDialog
 from smart_tool.ui.data_dialog import DataDialog
+from smart_tool.ui.help_tip import help_row
 from smart_tool.ui.step_editor_dialog import StepEditDialog
 
 # 页签下标
 TAB_VARS, TAB_IMAGES, TAB_AUTH, TAB_DATA = 0, 1, 2, 3
+
+#: 【?】里的完整说明（界面上只留一句摘要，其余收进弹窗）
+VARS_HELP = (
+    "步骤里用 {{变量名}} 引用。变量有四个来源：\n"
+    "\n"
+    "1) 读取节点\n"
+    "   「读取数据」节点从文件 / 文件夹读到的：第一行是它产出的列表变量\n"
+    "   （如 数据列表），下面几行是每个文件的字段（如 loop.item.标题）。\n"
+    "\n"
+    "2) 采集节点\n"
+    "   「采集数据」节点从网页上采到的：列表采集配「循环」逐项遍历\n"
+    "   （循环里用 {{loop.item.字段}}）；采当前页面则用 {{变量.字段}}。\n"
+    "\n"
+    "3) 元素定位\n"
+    "   捕获元素时存下来的 XPath（名字 → XPath）。任何步骤的「定位路径」里\n"
+    "   写 {{名字}} 就能复用它，改这一处、全项目跟着变。\n"
+    "\n"
+    "4) 自定义创建\n"
+    "   手工加的，账号密码之类。\n"
+    "\n"
+    "【能不能改】前两类是只读展示：想改名 / 换路径，点那一行的【来源】\n"
+    "跳进对应节点去改（改名后别处的引用会自动跟着改）。\n"
+    "元素定位和自定义变量可以在这里直接改，改完立即保存。\n"
+    "\n"
+    "循环里的 {{loop.index}}（第几轮）是运行时自动有的，不用配置；\n"
+    "元素定位和自定义变量如果重名，运行时按元素定位取值（状态栏会提醒）。"
+)
+
+IMAGES_HELP = (
+    "项目 img/ 目录里的元素截图：用【捕获元素…】抓的、以及你自己裁剪的都在这。\n"
+    "\n"
+    "「用在哪」列出引用它的步骤——定位方式＝截图的，或者 XPath 步骤的兜底截图。\n"
+    "\n"
+    "删除前先看这一列：删掉正在用的图，那些步骤运行时会报「截图文件不存在」。\n"
+    "如果是图过时了（页面改版），用【替换…】换一张就行，文件名不变、步骤不用改。\n"
+    "\n"
+    "一个技巧：XPath 是主定位、截图是兜底。页面小改动时截图还能顶一阵，\n"
+    "但别只靠图——图对分辨率 / 缩放敏感，换台机器可能就匹配不上了。"
+)
 
 # 变量行类型（存在「来源」列的 UserRole 里，用来区分增删改行为）
 KIND_DATA, KIND_PROJECT, KIND_LOCATOR = "data", "project", "locator"
@@ -127,23 +167,8 @@ class ProjectManagerDialog(QDialog):
         lay = QVBoxLayout(page)
         lay.setContentsMargins(0, 6, 0, 0)
 
-        tip = QLabel(
-            "步骤里用 {{变量名}} 引用。变量有四个来源：\n"
-            "· 读取节点 ＝「读取数据」节点从文件/文件夹读到的："
-            "第一行是它产出的列表变量（如 数据列表），"
-            "下面几行是每个文件的字段（如 loop.item.标题）。\n"
-            "· 采集节点 ＝「采集数据」节点从网页上采到的：列表采集配「循环」逐项遍历"
-            "（循环里用 {{loop.item.字段}}），采当前页面用 {{变量.字段}}。\n"
-            "· 元素定位 ＝ 捕获元素时存下来的 XPath（名字 → XPath）。"
-            "任何步骤的「定位路径」里写 {{名字}} 就能复用它，改这一处全项目跟着变。\n"
-            "· 自定义创建 ＝ 手工加的（账号密码之类）。\n"
-            "前两类是**只读展示**（点【来源】跳进那个节点改配置）；"
-            "元素定位和自定义变量可以在这里直接改，改完立即保存。\n"
-            "循环里的 {{loop.index}}（第几轮）不用配置。"
-        )
-        tip.setWordWrap(True)
-        tip.setStyleSheet("color: #777;")
-        lay.addWidget(tip)
+        lay.addWidget(help_row("变量用 {{变量名}} 引用；下面按来源分组。",
+                               "变量清单", VARS_HELP))
 
         self.data_label = QLabel("")
         self.data_label.setWordWrap(True)
@@ -190,15 +215,8 @@ class ProjectManagerDialog(QDialog):
         lay = QVBoxLayout(page)
         lay.setContentsMargins(0, 6, 0, 0)
 
-        tip = QLabel(
-            "项目 img/ 目录里的元素截图：用【捕获元素…】抓的、以及你自己裁剪的都在这。\n"
-            "「用在哪」列出引用它的步骤——定位方式＝截图的，或 XPath 步骤的兜底截图。\n"
-            "删之前先看这一列：删掉正在用的图，那些步骤运行时会报「截图文件不存在」"
-            "（也可以先【替换…】换成新图，步骤不用改）。"
-        )
-        tip.setWordWrap(True)
-        tip.setStyleSheet("color: #777;")
-        lay.addWidget(tip)
+        lay.addWidget(help_row("项目 img/ 目录里的元素截图。",
+                               "图片库", IMAGES_HELP))
 
         body = QHBoxLayout()
 

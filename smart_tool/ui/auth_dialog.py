@@ -25,9 +25,46 @@ from PyQt6.QtWidgets import (
 from smart_tool.core import auth_store, blocks, step_executor
 from smart_tool.core.project_store import ProjectStore, Step
 from smart_tool.ui.element_picker_dialog import drop_capture_image, pick_element
+from smart_tool.ui.help_tip import help_row
 
 NO_AUTH_TEXT = "（不使用登录态）"
 XPATH_PLACEHOLDER = "（下拉＝本项目已用过的定位）"
+
+#: 【?】里的完整说明（界面上只留一句摘要，其余收进弹窗）
+AUTH_HELP = (
+    "干嘛用的：登录一次，以后运行就不用再登了。\n"
+    "\n"
+    "运行时会把这里保存的登录态（cookie，含 httpOnly 的，以及 localStorage\n"
+    "里的 token）一起带上，直接就是登录状态。\n"
+    "\n"
+    "【第一次运行】还没有登录态文件 → 正常走完整登录流程，跑完自动存一份。\n"
+    "【以后运行】带上登录态 → 查一下「登录后才有的元素」在不在：\n"
+    "          在 ＝ 还有效，登录那几步会自动跳过；\n"
+    "          不在 ＝ 失效了，自动清掉、把整条流程重跑一遍（这次走完整登录），\n"
+    "                跑完再把新的登录态存回去（相当于自动续期）。\n"
+    "\n"
+    "【要让登录步骤真的被跳过，得配两处】\n"
+    "1) 这里：选一个名字（决定文件存在 projects/<项目>/auth/<名字>.json），\n"
+    "   并填「登录后才有的元素」——一个只有登录之后才会出现的 XPath，\n"
+    "   比如后台左侧菜单 //*[@id=\"menu-posts\"]。可以直接敲、\n"
+    "   从下拉挑本项目用过的定位、点【捕获元素…】去页面上点，或者写 {{元素定位}}。\n"
+    "   留空＝不做体检：照样能用，但登录态失效了发现不了。\n"
+    "2) 【流程编辑…】里：把「打开登录页 → 填账号 → 填密码 → 点登录」多选，\n"
+    "   右键「合并选中节点」起个名，再右键「标记为登录用」。\n"
+    "\n"
+    "【体检的时机】流程里第一个「打开网页」之后。所以那个元素必须是\n"
+    "第一步打开的那个页面上就能看到的（通常用后台菜单这种全站都有的元素）。\n"
+    "如果第一步打开的是公开首页，登录后才有的元素在那页本来就找不到，\n"
+    "就会每次都被判失效、每次都重新登（不会报错，但这么配就没意义了）。\n"
+    "\n"
+    "【其它】\n"
+    "· 存的不是 cookie 字符串，是 Playwright 的 storage_state：httpOnly cookie\n"
+    "  和 localStorage 一次存全。（手拼 cookie 很容易漏东西，被站点判定无效。）\n"
+    "· 每次跑完都会把最新的 cookie 存回去；这次一条 cookie 都没拿到就不写文件，\n"
+    "  免得把好的一份覆盖了。\n"
+    "· 下面表格里能看到每个登录态的情况：几个 cookie、几个站点有 localStorage、\n"
+    "  最早什么时候过期。可以导入 / 改名 / 删除，也能直接打开所在文件夹。"
+)
 
 
 def _fmt_time(stamp: Optional[float]) -> str:
@@ -110,18 +147,8 @@ class AuthDialog(QDialog):
     def _init_ui(self):
         root = QVBoxLayout(self)
 
-        tip = QLabel(
-            "登录一次，以后就不用再登了：运行时会把这里保存的 cookie（含 httpOnly 的、"
-            "以及 localStorage 里的 token）一起带上，直接进后台。\n"
-            "· 第一次运行：还没有登录态 → 正常走完整登录流程，「跑完自动存一份」；\n"
-            "· 以后运行：带上登录态 → 查一下「登录后才有的元素」在不在，在就跳过登录；\n"
-            "· 失效了：元素不在 → 自动清掉、把整条流程重跑一遍（走完整登录）再存新的。\n"
-            "要让登录那几步被跳过，得在【流程编辑】里把它们收进一个组合，"
-            "再右键把这个组合标记为「登录用」。"
-        )
-        tip.setWordWrap(True)
-        tip.setStyleSheet("color:#555555;")
-        root.addWidget(tip)
+        root.addWidget(help_row("登录一次，以后直接复用 cookie / localStorage。",
+                                "登录态", AUTH_HELP))
 
         # 运行时使用哪个
         row = QHBoxLayout()
@@ -164,9 +191,8 @@ class AuthDialog(QDialog):
         row2.addWidget(self.btn_capture)
         root.addLayout(row2)
         hint = QLabel(
-            "填一个「只有登录之后才会出现」的元素（比如后台左侧菜单）。"
-            "执行器打开第一个网页后查它：在＝登录态还有效，不在＝已失效，自动重登。"
-            "留空就不做检查（失效了也能用，只是发现不了）。"
+            "只有登录之后才会出现的元素（如后台左侧菜单）；留空＝不做体检。"
+            "细节见右上角 ?"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#888888;")
