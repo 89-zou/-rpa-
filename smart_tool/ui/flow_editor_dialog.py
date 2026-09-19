@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 from smart_tool.core import blocks, project_store, step_executor
 from smart_tool.core.project_store import ProjectStore, Step
 from smart_tool.ui.flow_canvas import ACTION_META, step_summary
+from smart_tool.ui.help_tip import help_row
 from smart_tool.ui.step_editor_dialog import StepEditDialog
 
 CARD_H = 56          # 卡片固定高度，避免列表项显示不全
@@ -36,6 +37,36 @@ LOOP_INDENT = 22     # 每层缩进像素
 SUMMARY_MAX = 78     # 摘要最大字符数（手动截断，不依赖字体度量）
 #: 能展开 / 收起的块（分支不支持：它藏在条件里，跟着条件一起收）
 COLLAPSIBLE_KINDS = ("loop", "condition", "group")
+
+#: 【?】里的完整说明（界面上只留一句摘要，其余收进弹窗）
+FLOW_EDITOR_HELP = (
+    "列表从上到下就是执行顺序；双击某行可以编辑它。\n"
+    "\n"
+    "【结构节点】\n"
+    "「循环开始 / 循环结束」「条件 / 分支 / 条件结束」「组合 / 组合结束」都是成对的\n"
+    "结构节点：新增时系统一起创建，配置只有一份——点配对的另一端，编辑的也是同一个块。\n"
+    "块可以互相嵌套（循环里放条件、分支里放循环都行），按缩进分层显示。\n"
+    "\n"
+    "【展开 / 收起】\n"
+    "块标记左边的 ▾ / ▸ 点一下就能收起或展开（循环、条件、组合都支持），\n"
+    "收起时那一行会写着「（已收起 N 个步骤）」。\n"
+    "\n"
+    "【合并成组合】\n"
+    "按住 Ctrl / Shift 多选几行 → 右键 →「合并选中节点」，起个名字：\n"
+    "画布上就只显示这一张卡片了。取消组合、改名、展开也在同一个右键菜单里。\n"
+    "注意：只能合并挨着的几行，而且不能把「循环 / 条件」从中间切开——\n"
+    "要么整个块一起选上，要么只选它里面的步骤（组合可以嵌在块里面）。\n"
+    "\n"
+    "【标记「登录用」】\n"
+    "把「打开登录页 → 填账号 → 填密码 → 点登录」这几步收成一个组合，\n"
+    "右键把它标记为「登录用」：运行时带着有效登录态就整块跳过，不用每次重登。\n"
+    "要配合【项目管理…】→【登录态】使用（那边要配好登录态和「登录后才有的元素」）。\n"
+    "\n"
+    "【增删改】\n"
+    "每个循环体、每个分支、每个组合的末尾都有一行「＋ 点击创建新节点」，\n"
+    "点它新增的节点会留在那个块里面。删除块的标记＝整块删掉（会先问一次）；\n"
+    "块里的普通步骤只删自己。所有改动立即保存，不需要手动存。"
+)
 
 
 def _branch_text(steps: List[Step], index: int) -> str:
@@ -188,20 +219,8 @@ class FlowEditorDialog(QDialog):
     # ------------------------------
     def _init_ui(self):
         root = QVBoxLayout(self)
-
-        tip = QLabel(
-            "列表从上到下就是执行顺序；双击某行可编辑。\n"
-            "「循环开始/结束」「条件/分支/条件结束」「组合/组合结束」都是系统一起创建的"
-            "结构节点，设置只有一份（点配对的另一端也是编辑同一个块）；块可以嵌套，按缩进分层。\n"
-            "块标记左边的 ▾ / ▸ 可以展开 / 收起（循环、条件、组合都行）；"
-            "按住 Ctrl / Shift 多选几行 → 右键 →「合并选中节点」把它们收成一个组合并起名。\n"
-            "组合的右键菜单里还能标记「登录用」：运行时带着有效登录态就整块跳过，"
-            "不用再登一遍（配合【项目管理…】→【登录态】使用）。\n"
-            "每个块末尾都有「＋ 点击创建新节点」；所有改动立即保存。"
-        )
-        tip.setWordWrap(True)
-        tip.setStyleSheet("color:#777777;")
-        root.addWidget(tip)
+        root.addWidget(help_row("列表从上到下就是执行顺序；双击某行可编辑。",
+                                "流程编辑", FLOW_EDITOR_HELP))
 
         self.list_widget = QListWidget()
         self.list_widget.setSelectionMode(
