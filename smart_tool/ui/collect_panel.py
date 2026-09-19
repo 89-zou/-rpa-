@@ -44,7 +44,9 @@ HINT = (
     "· 列表模式下，字段的定位是在「当前行」里找（写 //h2 就是这一行里的 h2）；"
     "采到的数据会变成 {{变量}}（JSON 数组），配「循环」节点逐行遍历，"
     "循环里用 {{loop.item.字段}}。\n"
-    "· 所有数据都会追加到项目的 data/records.jsonl，点主界面【数据…】可以查看 / 导出。"
+    "· 所有数据都会追加到项目的 data/records.jsonl，点主界面【数据…】可以查看 / 导出。\n"
+    "· XPath 小坑：@class='a' 是「class 整个等于 a」，元素写的是 "
+    "class=\"star-rating Three\" 就匹配不上，要用 //p[contains(@class,'star-rating')]。"
 )
 
 
