@@ -51,6 +51,11 @@ NAV_TIMEOUT_DEFAULT_S = 120
 CLICK_TIMEOUT_MS = 20000
 # 采集节点下载图片 / 附件的等待上限（毫秒）
 DOWNLOAD_TIMEOUT_MS = 30000
+# 采集节点「取一个字段」的等待上限（毫秒）。
+# 它本该是「等这个元素出现」，但列表采集是「每行 × 每字段」都要查一次，
+# 用默认的 30 秒会被行数放大成灾难（20 行错一个字段＝10 分钟，看着像卡死），
+# 所以压到 3 秒：正常页面够用，写错了也能很快报出来。
+COLLECT_TIMEOUT_MS = 3000
 # 每个步骤之间的最小缓冲（秒）。站点慢的时候连点太密会丢事件
 # （典型：点了发布，但页面正好在自己刷新，这一下点击就被吃掉了）
 STEP_GAP_SECONDS = 1.0
@@ -1179,22 +1184,24 @@ class StepExecutor:
         self.log(f"  列表采集：{row_xpath} 命中 {total} 行")
         if total == 0:
             self.log("  一行都没命中：确认页面已经加载出来、定位也写对了。")
-        problems: Dict[str, List] = {}
+        stats: Dict[str, Any] = {"problems": {}, "skip": set()}
         records: List[Dict] = []
         for i in range(total):
             records.append(self._collect_record(step, fields, rows.nth(i),
-                                                i + 1, label, problems))
+                                                i + 1, label, stats))
+            if total > 20 and (i + 1) % 20 == 0:
+                self.log(f"    已采 {i + 1}/{total} 行…")
         if var:
             self.variables[var] = json.dumps(records, ensure_ascii=False)
         self.log(f"  采集完成：{len(records)} 条记录 → data/{datastore.RECORDS_NAME}"
                  + (f"；变量 {{{{{var}}}}} 可配「循环」逐行遍历" if var else ""))
-        for name, (count, reason) in problems.items():
+        for name, (count, reason) in stats["problems"].items():
             self.log(f"    字段「{name}」有 {count} 条没取到（{reason}）")
 
     def _collect_record(self, step: Step, fields: List[Dict[str, str]], row,
                         index: int, label: Any,
-                        problems: Optional[Dict[str, List]]) -> Dict:
-        """采一条记录并写盘。"""
+                        stats: Optional[Dict[str, Any]]) -> Dict:
+        """采一条记录并写盘；stats 是列表模式的汇总（problems / skip）。"""
         record: Dict[str, Any] = {
             "_time": datastore.now_text(),
             "_url": self._current_url(),
@@ -1202,18 +1209,37 @@ class StepExecutor:
         }
         for item in fields:
             name = str(item.get("name") or "").strip()
+            if stats is not None and name in stats["skip"]:
+                record[name] = ""
+                continue
             try:
                 value = self._collect_value(item, row, index)
             except Exception as e:
                 value = ""
-                if problems is not None:
-                    slot = problems.setdefault(name, [0, _first_line(e)])
-                    slot[0] += 1
-                else:
-                    self.log(f"    字段「{name}」没取到：{_first_line(e)}")
+                self._collect_problem(name, _first_line(e), stats)
             record[name] = value
         datastore.append_record(self.project_dir, record)
         return record
+
+    def _collect_problem(self, name: str, reason: str,
+                         stats: Optional[Dict[str, Any]]):
+        """某个字段没取到：第一次立刻写日志，连续失败 3 行就不再试它了。
+
+        列表采集是「每行 × 每字段」都要查一次，一个定位写错就会被行数放大
+        （1000 行 × 3 秒＝50 分钟），所以：第一条立刻告诉你，之后不再空耗。
+        """
+        if stats is None:
+            self.log(f"    字段「{name}」没取到：{reason}")
+            return
+        problems = stats["problems"]
+        slot = problems.setdefault(name, [0, reason])
+        slot[0] += 1
+        if slot[0] == 1:
+            self.log(f"    字段「{name}」没取到：{reason}")
+        elif slot[0] >= 3 and name not in stats["skip"]:
+            stats["skip"].add(name)
+            self.log(f"    字段「{name}」连续 3 行都没取到，后面的行不再试它"
+                     "（先检查定位写对没有）")
 
     def _locator_for(self, locator: str, row):
         """列表模式在「当前行」里找（Playwright 的嵌套 XPath 就是元素内定位）。"""
@@ -1235,19 +1261,20 @@ class StepExecutor:
             raise ValueError("没填定位（XPath）")
         el = target.first
         if kind == "text":
-            return (el.inner_text() or "").strip()
+            return (el.inner_text(timeout=COLLECT_TIMEOUT_MS) or "").strip()
         if kind == "html":
-            return el.inner_html()
+            return el.inner_html(timeout=COLLECT_TIMEOUT_MS)
         if kind == "attr":
             if not extra:
                 raise ValueError("取属性时要填属性名（如 src / title）")
-            return el.get_attribute(extra) or ""
+            return el.get_attribute(extra, timeout=COLLECT_TIMEOUT_MS) or ""
         if kind == "link":
-            href = el.get_attribute(extra or "href") or ""
+            href = el.get_attribute(extra or "href",
+                                    timeout=COLLECT_TIMEOUT_MS) or ""
             return urljoin(self._current_url(), href) if href else ""
         if kind in ("image", "file"):
             attr = extra or ("src" if kind == "image" else "href")
-            src = el.get_attribute(attr) or ""
+            src = el.get_attribute(attr, timeout=COLLECT_TIMEOUT_MS) or ""
             if not src:
                 raise ValueError(f"这个元素没有 {attr} 属性")
             return self._download(urljoin(self._current_url(), src), item, index)
@@ -1262,7 +1289,7 @@ class StepExecutor:
             target = self._locator_for(locator, row)
             if target is None:
                 raise ValueError("截元素要填定位；想截整页就在「附加」里写「整页」")
-            data = target.first.screenshot()
+            data = target.first.screenshot(timeout=COLLECT_TIMEOUT_MS)
         elif extra in ("整页", "全页", "page", "full"):
             data = self._page.screenshot(full_page=True)
             stem += "_整页"
