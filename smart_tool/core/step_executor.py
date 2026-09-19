@@ -574,7 +574,7 @@ class StepExecutor:
         self._auth_using = False        # 这一轮是不是带着登录态在跑
         self._auth_checked = False      # 体检过了没有（只查第一次打开的网页）
         self._auth_expired = False      # 体检不通过 → 别把坏的状态存回去
-        # 显示编号：组合节点不占编号（显示成 2-4 这种范围），所以日志里不能直接用
+        # 显示编号：组合是 2-4 这样的范围、结束标记没有编号，所以日志里不能直接用
         # step.id，否则跟画布上看到的数字对不上
         self._labels = {id(s): n for s, n
                         in zip(steps, blocks.step_numbers(steps)) if n}

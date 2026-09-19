@@ -37,6 +37,8 @@ MARKERS = (LOOP_START, LOOP_END, COND_START, COND_END, BRANCH,
            GROUP_START, GROUP_END)
 # 成对标记的「结束端」：画布上不画卡片（流程编辑里能看到）
 END_MARKERS = tuple(END_KINDS)
+#: 不占「顺序编号」的结构标记：结束端（循环/条件/组合结束）只是收尾，组合开始也只是壳
+NO_NUMBER = (GROUP_START,) + END_MARKERS
 # 可以套虚线框、能整块拖动的块类型（组合不套框：它本身就是一张卡片）
 REGION_KINDS = ("loop", "condition")
 
@@ -326,15 +328,17 @@ def inner_count(sp: Span) -> int:
 def step_numbers(steps: List[Step]) -> List[str]:
     """每个步骤对外显示的编号（列表，和 steps 一一对应；空字符串＝不显示编号）。
 
-    **组合不占编号**：它就是它里面那几步的「壳」，所以显示成范围（如 `2-4`），
-    后面的节点接着这个范围往下数（下一个是 5）。
-    其它结构标记（循环开始/结束、条件、分支）跟真正的步骤一样占编号——
-    它们在画布上本来就各是一张卡片。
+    **结构标记的结束端不占编号**（循环结束 / 条件结束 / 组合结束）：它们只是块的
+    收尾，不参与列表上「1、2、3…」的顺序编号，后面的节点接着往下数。
+    组合本身也只是它里面那几步的「壳」，所以显示成范围（如 `2-4`）。
+
+    注意：这里只管「显示出来的编号」。`Step.id` 是每一行的身份（画布、选中、
+    改某一步都靠它），必须唯一且随行号走，不能跳号。
     """
     labels = [""] * len(steps)
     n = 0
     for i, s in enumerate(steps):
-        if s.action in (GROUP_START, GROUP_END):
+        if s.action in NO_NUMBER:
             continue
         n += 1
         labels[i] = str(n)
@@ -355,7 +359,7 @@ def number_of(steps: List[Step], index: int) -> str:
 
 
 def last_number(steps: List[Step]) -> str:
-    """显示编号里最大的那个数字（写「编号 1~N」用；组合的范围不参与）。"""
+    """显示编号里最大的那个数字（写「编号 1~N」用；组合的范围、结束标记都不参与）。"""
     return next((n for n in reversed(step_numbers(steps)) if n.isdigit()), "")
 
 
