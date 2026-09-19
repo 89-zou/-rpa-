@@ -1,10 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller 打包配置：小邹RPA（Windows，onedir）。
+"""PyInstaller 打包配置：小邹RPA（Windows，**单文件 exe**）。
 
-为什么用 onedir 而不是 onefile：
-    · onefile 每次启动都要把自己解压到临时目录（400MB 解压要好几秒），而且那个
-      临时目录退出就删 —— 安装向导"把程序复制到安装目录"时源目录会变得不可控；
-    · onedir 出来的就是一个文件夹，正好符合"复制到 Program Files / 直接删文件夹卸载"。
+单文件的代价：每次启动都要先把 375MB 解开到 %TEMP%\\_MEIxxxxx（几秒钟，期间没有任何
+界面），所以启动会比 onedir 版慢一些；好处是只有一个 exe，发给别人/拷 U 盘最省事。
+（想要秒开就改成 onedir：把下面 EXE 里的 a.binaries / a.datas 换成用 COLLECT 收，
+参考 git 历史里的 onedir 版本。）
 
 打了什么进去：
     · smart_tool 全部代码 + assets（logo、海报、演示项目模板）；
@@ -14,7 +14,7 @@
 
 怎么用：
     powershell -ExecutionPolicy Bypass -File packaging\\build.ps1
-    产物：dist\\小邹RPA\\小邹RPA.exe
+    产物：dist\\小邹RPA.exe（就这一个文件）
 """
 from pathlib import Path
 
@@ -75,23 +75,16 @@ pyz = PYZ(a.pure)                        # noqa: F821
 exe = EXE(                               # noqa: F821
     pyz,
     a.scripts,
+    a.binaries,                          # 单文件：依赖和资源全塞进 exe
+    a.datas,
     [],
-    exclude_binaries=True,
     name=NAME,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,                           # UPX 压缩过的 exe 容易被杀软误报
+    runtime_tmpdir=None,                 # 运行时解压到 %TEMP%\_MEIxxxxx
     console=False,                       # GUI 程序：不弹黑窗
     disable_windowed_traceback=False,
     icon=str(icon_path) if icon_path else None,
-)
-
-coll = COLLECT(                          # noqa: F821
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=False,
-    name=NAME,
 )

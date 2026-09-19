@@ -18,19 +18,34 @@ def _ps_quote(text: str) -> str:
 
 
 def _run_ps(script: str) -> tuple:
-    """跑一段 PowerShell，返回 (成功?, 输出)。"""
+    """跑一段 PowerShell，返回 (成功?, 输出)。
+
+    两个讲究：
+    · 先让 PowerShell 用 UTF-8 输出（中文系统默认按 GBK 输出，Python 按 UTF-8 解
+      会在读取线程里直接抛 UnicodeDecodeError，调用方那边就卡住了）；
+    · 再加 errors="replace" 兜底：万一还是有不认识的字节，替换掉就行，别让整个
+      建快捷方式的流程崩掉。
+    """
     if sys.platform != "win32":
         return False, "只有 Windows 支持创建快捷方式"
+    script = ("[Console]::OutputEncoding = [Text.Encoding]::UTF8\n"
+              "$OutputEncoding = [Text.Encoding]::UTF8\n") + script
     try:
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError) as e:
         return False, f"调用 PowerShell 失败：{e}"
     if proc.returncode != 0:
         return False, (proc.stderr or proc.stdout or "").strip()[:300]
+    # PowerShell 里普通报错不会让返回码变成非 0（比如 $s.Save() 抛 COMException 时
+    # 返回码照样是 0），所以 stderr 有东西就当失败把原文带回去，别报"没报错"
+    err = (proc.stderr or "").strip()
+    if err:
+        return False, err[:300]
     return True, (proc.stdout or "").strip()
 
 
