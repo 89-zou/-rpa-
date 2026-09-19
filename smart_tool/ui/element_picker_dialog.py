@@ -8,6 +8,7 @@
 捕获结果通过信号回主线程。捕获完自动重新装填选择器，可以连着抓多个。
 """
 import queue
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -15,11 +16,12 @@ from typing import Optional
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QVBoxLayout,
+    QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QInputDialog, QLabel,
+    QLineEdit, QMessageBox, QPushButton, QVBoxLayout,
 )
 
 from smart_tool.core.element_picker import PICKER_JS, next_shot_path
+from smart_tool.core.project_store import ProjectStore
 
 NAV_TIMEOUT_MS = 120_000
 POLL_MS = 200
@@ -359,3 +361,55 @@ def drop_capture_image(project_dir, data: dict) -> None:
         (Path(project_dir) / rel).unlink()
     except OSError:
         pass
+
+
+def guess_locator_name(data: dict, taken=None) -> str:
+    """从捕获结果的元素描述里猜一个名字（给它个像样的默认值，不用现想）。
+
+    desc 长这样：`<a>#menu-posts “文章”`、`<input>#user_login`、`<div.item> “书”`。
+    优先用元素上的文字，其次用 id；重名就往后加 2、3…
+    """
+    desc = str((data or {}).get("desc") or "")
+    m = re.search(r"[“\"](.+?)[”\"]", desc)
+    base = re.sub(r"\s+", "", m.group(1)) if m else ""
+    if not base:
+        m = re.search(r"#([A-Za-z0-9_-]+)", desc)
+        base = m.group(1) if m else ""
+    base = base[:12] or "元素"
+    name, i = base, 2
+    while taken and name in taken:
+        name = f"{base}{i}"
+        i += 1
+    return name
+
+
+def save_captured_locator(parent, project_dir, data: dict) -> str:
+    """把这次捕获到的 XPath 存进项目的「元素定位」，返回变量名（没存返回 ""）。
+
+    - 同一个 XPath 已经存过 → 不再重复问，直接复用原来那个名字
+    - 名字留空或取消 → 不存（只填在当前这个字段里）
+    """
+    xpath = (data or {}).get("xpath") or ""
+    xpath = xpath.strip()
+    if not xpath:
+        return ""
+    store = ProjectStore(Path(project_dir))
+    locators = store.load_locators()
+    for name, value in locators.items():
+        if value.strip() == xpath:
+            return name
+    name, ok = QInputDialog.getText(
+        parent, "存成「元素定位」",
+        "要不要把这次抓到的元素存下来？\n"
+        "存了以后，任何「定位路径」里写 {{名字}} 就能复用它，"
+        "改一处全项目都跟着变。\n"
+        "（留空 = 不存，只填在当前这个字段里）\n\n"
+        f"XPath：{xpath[:150]}",
+        text=guess_locator_name(data, locators),
+    )
+    name = (name or "").strip()
+    if not ok or not name:
+        return ""
+    locators[name] = xpath
+    store.save_locators(locators)
+    return name

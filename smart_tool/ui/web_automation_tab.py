@@ -406,17 +406,17 @@ class WebAutomationTab(QWidget):
     # 变量来源检查
     # ------------------------------
     def available_variables(self) -> List[str]:
-        """当前项目可用的变量：自定义变量 + 读取节点产出的 + 循环运行时。"""
+        """当前项目可用的变量：元素定位 + 自定义变量 + 读取节点产出的 + 循环运行时。"""
         return available_variables(
             self._steps,
-            self._current_store.load_variables() if self._current_store else {},
+            self._current_store.load_all_variables() if self._current_store else {},
         )
 
     def _check_variables_before_run(self) -> bool:
         """运行前检查变量是否有来源，避免"跑起来才发现正文是空的"。"""
         problems = check_variables(
             self._steps,
-            project_variables=(self._current_store.load_variables()
+            project_variables=(self._current_store.load_all_variables()
                                if self._current_store else {}),
         )
         if not problems:
@@ -448,7 +448,7 @@ class WebAutomationTab(QWidget):
             return
         dlg = FlowEditorDialog(
             self._current_store.dir, self._steps, self,
-            project_variables=self._current_store.load_variables(),
+            project_variables=self._current_store.load_all_variables(),
             scene=self._scene,
         )
         dlg.exec()
@@ -732,7 +732,7 @@ class WebAutomationTab(QWidget):
             return
         # 运行前把画布上的位置等落盘
         self._current_store.save(self._steps)
-        variables = self._current_store.load_variables()
+        variables = self._current_store.load_all_variables()
         self.btn_run.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self._worker = ExecutorWorker(

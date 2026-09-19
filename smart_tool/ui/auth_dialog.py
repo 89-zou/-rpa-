@@ -268,7 +268,7 @@ class AuthDialog(QDialog):
     def _refresh_var_combo(self):
         """「插入变量 ▾」：本项目的变量（自定义 + 读取/采集节点产出的）。"""
         names = (step_executor.available_variables(
-            self.steps, self.store.load_variables()) if self.store else [])
+            self.steps, self.store.load_all_variables()) if self.store else [])
         self.var_combo.blockSignals(True)
         self.var_combo.clear()
         self.var_combo.addItem("插入变量 ▾", "")
@@ -320,9 +320,11 @@ class AuthDialog(QDialog):
         count = data.get("count", 1)
         # 体检只要 XPath，捕获时顺手存下的元素截图这里用不上，删掉别在 img/ 里堆废图
         drop_capture_image(self.store.dir, data)
+        saved = save_captured_locator(self, self.store.dir, data)
         self.state_label.setText(
             f"已捕获：{data.get('desc') or '元素'} → {xpath}"
             + ("" if count == 1 else f"（命中 {count} 个，最好换个更准的）")
+            + (f"；已存成元素定位 {{{{{saved}}}}}" if saved else "")
         )
         self.state_label.setStyleSheet("color:#0f766e;")
 

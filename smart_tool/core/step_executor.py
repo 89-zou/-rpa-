@@ -163,6 +163,9 @@ def step_var_fields(step: Step) -> List[str]:
              step.resume_url, step.resume_element, step.prompt,
              step.loop_expr, step.cond_expr,
              step.win_title, step.keys]
+    # 定位也可以是变量（如 {{登录框}}：元素定位存在变量清单里）
+    if step.locator is not None and step.locator.type != "image":
+        texts.append(step.locator.value)
     # 「读取数据」的路径可以写日期变量，如 D:\输出数据\{{年}}\{{月}}
     path = (step.data_cfg or {}).get("path")
     if isinstance(path, str):
@@ -896,8 +899,12 @@ class StepExecutor:
     # 定位辅助
     # ------------------------------
     def _resolve_xpath(self, locator: Locator):
-        """XPath → Playwright 定位器。"""
-        return self._page.locator(f"xpath={locator.value}")
+        """XPath → Playwright 定位器。
+
+        XPath 里可以写 {{变量}}：捕获到的元素存成「元素定位」后（见变量清单），
+        这里写 {{登录框}} 就能复用，改一处全项目都跟着变。
+        """
+        return self._page.locator(f"xpath={self._resolve_value(locator.value)}")
 
     def _resolve_image_path(self, locator: Locator) -> Path:
         """截图相对路径（相对项目目录）→ 绝对路径。"""
@@ -1722,19 +1729,22 @@ class StepExecutor:
         url_and_element 要求两个字段都配置且同时满足——这是防误判的关键：
         仅 URL 跳转（重定向中间页）或仅元素残留都不会触发恢复。
         """
-        url_ok = self._url_matches(step.resume_url) if step.resume_url else False
-        elem_ok = self._element_present(step.resume_element) if step.resume_element else False
+        # 恢复条件里也能写 {{变量}}（元素定位同样适用）
+        pattern = self._resolve_value(step.resume_url or "").strip()
+        element = self._resolve_value(step.resume_element or "").strip()
+        url_ok = self._url_matches(pattern) if pattern else False
+        elem_ok = self._element_present(element) if element else False
 
         if cond == "url_changed":
-            if not step.resume_url:
+            if not pattern:
                 return False, "未配置 resume_url"
-            return url_ok, f"URL 已包含 {step.resume_url}"
+            return url_ok, f"URL 已包含 {pattern}"
         if cond == "element_present":
-            if not step.resume_element:
+            if not element:
                 return False, "未配置 resume_element"
-            return elem_ok, f"元素已出现 {step.resume_element}"
+            return elem_ok, f"元素已出现 {element}"
         if cond == "url_and_element":
-            if not (step.resume_url and step.resume_element):
+            if not (pattern and element):
                 return False, "双重信号需同时配置 resume_url 与 resume_element"
             if url_ok and elem_ok:
                 return True, "URL 与目标元素均已就绪"
@@ -1747,7 +1757,7 @@ class StepExecutor:
     def _wait_after(self, step: Step):
         if not step.wait_after:
             return
-        target = (step.wait_target or "").strip()
+        target = self._resolve_value(step.wait_target or "").strip()
         if self.desktop:
             self._wait_after_desktop(step.wait_after, target)
             return

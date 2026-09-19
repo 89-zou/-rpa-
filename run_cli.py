@@ -29,7 +29,7 @@ def main():
         return
 
     steps = store.load_steps()
-    variables = store.load_variables()
+    variables = store.load_all_variables()
     real = store.load_real_mouse()
     scene = store.load_scene()
     print(f"加载项目 [{name}]，共 {len(steps)} 步。"
