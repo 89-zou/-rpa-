@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
 from playwright.sync_api import (
@@ -155,6 +155,96 @@ VAR_PATTERN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 LOOP_VARS = ("loop.item", "loop.index")
 # 运行时才有的变量前缀（{{loop.item.字段}} / {{loop.index}}）
 LOOP_PREFIX = "loop."
+#: 脚本里没写 return 时，兜底塞回去的那个「locals 快照」的标记键
+_LOCALS_KEY = "__script_locals__"
+
+
+def _param_name(name: str) -> str:
+    """把变量名变成一个能当形参用的标识符（loop.item.标题 → loop_item_标题）。
+
+    中文是合法的 Python / JS 标识符，所以只替换点、横杠这类字符。
+    """
+    out = re.sub(r"\W", "_", str(name or "").strip(), flags=re.UNICODE)
+    out = out.strip("_") or "arg"
+    return f"_{out}" if out[0].isdigit() else out
+
+
+def _indent_code(code: str) -> str:
+    """把整段代码缩进一层（塞进函数体里）。
+
+    顺手把行首的 Tab 换成 4 个空格：不然「Tab 缩进的 if 块」套进函数后
+    会变成空格+Tab 混用，Python 直接报 TabError。
+    """
+    fixed = "\n".join(
+        re.sub(r"^\t+", lambda m: "    " * len(m.group(0)), line)
+        for line in str(code or "").split("\n")
+    )
+    return "\n".join(("    " + line) if line.strip() else line
+                     for line in fixed.split("\n"))
+
+
+def _script_line(err: Exception, step_id: int) -> str:
+    """从异常里找出「用户脚本的第几行」（我们包了一层函数，行号要减 1）。"""
+    tb = err.__traceback__
+    line = None
+    filename = f"<脚本节点{step_id}>"
+    while tb is not None:
+        if tb.tb_frame.f_code.co_filename == filename:
+            line = tb.tb_lineno
+        tb = tb.tb_next
+    return f"（第 {max(1, line - 1)} 行）" if line else ""
+
+
+def _to_var_text(value: Any) -> str:
+    """变量统一存文本。
+
+    列表 / 字典转成 JSON：这样「脚本返回一个列表 → 循环遍历它」能直接用
+    （直接用 str() 会得到 Python 的单引号写法，循环解析不了）。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple, dict)):
+        try:
+            data = list(value) if isinstance(value, tuple) else value
+            return json.dumps(data, ensure_ascii=False)
+        except (TypeError, ValueError):
+            pass
+    return str(value)
+
+
+def _short_text(value: Any, limit: int = 120) -> str:
+    """日志里显示返回值：太长就截断。"""
+    text = _to_var_text(value)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def parse_script_params(raw: str) -> List[Tuple[str, str]]:
+    """解析「入口参数」文本 → [(变量名, 形参名), …]。
+
+    写法：`账号`（变量名当形参名）或 `标题=text`（变量名=形参名），逗号分隔。
+    留空＝不设入口参数。编辑框做语法检查时也用这个，保证和执行时一致。
+    """
+    out: List[Tuple[str, str]] = []
+    for chunk in str(raw or "").replace("，", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        var, sep, param = chunk.partition("=")
+        var = var.strip()
+        param = param.strip() if sep else var
+        if var:
+            out.append((var, _param_name(param or var)))
+    return out
+
+
+def build_script_source(code: str, params: List[Tuple[str, str]]) -> str:
+    """把用户代码包成一个函数（执行与编辑时的语法检查共用同一份）。"""
+    names = ", ".join(p for _v, p in params)
+    return (f"def __run__({names}):\n"
+            f"{_indent_code(code)}\n"
+            f"    return {{'{_LOCALS_KEY}': locals()}}\n")
 
 
 def step_var_fields(step: Step) -> List[str]:
@@ -215,7 +305,11 @@ def collect_variables(steps: List[Step]) -> List[str]:
 
 
 def produced_variables(steps: List[Step]) -> Dict[str, Step]:
-    """会产出变量的节点 → 那个节点（「读取数据」与「采集数据」）。"""
+    """会产出变量的节点 → 那个节点。
+
+    「读取数据」「采集数据」按配置产出；「自由代码」按它填的「返回写到」算
+    （这样运行前的变量检查不会把它当成"没有来源"）。
+    """
     out: Dict[str, Step] = {}
     for s in steps:
         if s.action == "read_data":
@@ -224,6 +318,10 @@ def produced_variables(steps: List[Step]) -> Dict[str, Step]:
                 out[name] = s
         elif s.action == "collect":
             for name in collect_outputs(s):
+                out.setdefault(name, s)
+        elif s.action == "script":
+            name = (s.script_output or "").strip()
+            if name:
                 out.setdefault(name, s)
     return out
 
@@ -936,53 +1034,99 @@ class StepExecutor:
     # ------------------------------
     # 自由代码节点（script）
     # ------------------------------
-    def _script_scope(self, step: Step) -> Dict[str, str]:
-        """按 script_vars 过滤传入脚本的变量；未指定则传全部。"""
-        raw = (step.script_vars or "").replace("，", ",")
-        names = [n.strip() for n in raw.split(",") if n.strip()]
-        if not names:
-            return dict(self.variables)
-        return {n: self.variables.get(n, "") for n in names}
+    def _script_scope(self, step: Step,
+                      params: Optional[List[Tuple[str, str]]] = None):
+        """脚本能看到的变量。
+
+        填了入口参数就只传那几个（脚本里用形参名拿）；留空＝全部变量可见
+        （老写法 vars["账号"] 照样能用）。
+        """
+        if params:
+            return {v: self.variables.get(v, "") for v, _p in params}
+        return dict(self.variables)
+
+    def _script_params(self, step: Step) -> List[Tuple[str, str]]:
+        """这个脚本的入口参数（见 parse_script_params）。"""
+        return parse_script_params(step.script_vars or "")
 
     def _run_script(self, step: Step):
-        """执行自由代码节点；脚本对 vars 的修改会写回流程变量。"""
+        """自由代码节点：把它当成一个函数来跑。
+
+        - 入口参数：脚本里直接用形参名（`账号` / `标题=text`），省得写 vars["..."]
+        - 返回值：脚本里 `return 值` 会写到「返回写到」那个变量；
+          没填的话，返回字典＝每个键写成一个变量，其余只打进日志
+        - 老写法一样有效：改 vars["x"]、或者 `result = {...}`（Python）
+        """
         code = step.script_code or ""
         if not code.strip():
             self.log("  脚本为空，跳过。")
             return
         lang = (step.script_lang or "python").lower()
-        scope = self._script_scope(step)
+        params = self._script_params(step)
+        scope = self._script_scope(step, params)
+        args = {p: scope.get(v, "") for v, p in params}
         timeout = max(1, int(step.script_timeout or 30))
         label = "JavaScript" if lang == "javascript" else "Python"
-        self.log(f"  执行 {label} 脚本，传入变量 {len(scope)} 个")
+        detail = ("，入口参数：" + "、".join(args)) if args else "，没有入口参数"
+        self.log(f"  执行 {label} 脚本{detail}")
 
         if lang == "javascript":
-            updated, logs = self._exec_js(code, scope, timeout)
+            updated, logs, returned = self._exec_js(
+                step, code, scope, params, args, timeout)
         else:
-            updated, logs = self._exec_python(step, code, scope, timeout)
+            updated, logs, returned = self._exec_python(
+                step, code, scope, params, args, timeout)
 
         for line in logs:
             self.log(f"  [脚本] {line}")
 
         changed = []
         for k, v in updated.items():
-            text = "" if v is None else str(v)
-            if self.variables.get(k) != text:
+            text = _to_var_text(v)
+            if self.variables.get(str(k)) != text:
                 changed.append(str(k))
             self.variables[str(k)] = text
+
+        # 返回值
+        out_var = (step.script_output or "").strip()
+        if returned is not None:
+            if out_var:
+                self._set_var(out_var, returned, changed)
+                self.log(f"  脚本返回 → {out_var} = {_short_text(returned)}")
+            elif isinstance(returned, dict):
+                for k, v in returned.items():
+                    self._set_var(str(k), v, changed)
+                self.log("  脚本返回一字典 → "
+                         + "、".join(str(k) for k in returned))
+            else:
+                self.log(f"  [脚本] 返回：{_short_text(returned)}"
+                         "（没填「返回写到」，只记在这里）")
+        elif out_var:
+            self.log(f"  提示：脚本没有 return，{out_var} 这次没写入。")
+
         if changed:
-            self.log(f"  脚本更新变量：{', '.join(sorted(changed))}")
+            self.log(f"  脚本更新变量：{', '.join(sorted(set(changed)))}")
+
+    def _set_var(self, name: str, value: Any, changed: Optional[List[str]] = None):
+        text = _to_var_text(value)
+        if self.variables.get(name) != text and changed is not None:
+            changed.append(name)
+        self.variables[name] = text
 
     def _exec_python(self, step: Step, code: str, scope: Dict[str, str],
+                     params: List[Tuple[str, str]], args: Dict[str, str],
                      timeout: int):
-        """进程内 exec。可用对象：vars（可修改）/ log / page / current_url / project_dir。
+        """进程内 exec；代码整体缩进塞进一个函数里，所以 return 能正常用。
 
+        返回值：(更新后的 vars, 日志, 脚本 return 的值｜None)。
         注意：Python 脚本无法强制中断，超时只提示（请自行避免死循环）。
         """
+        src = build_script_source(code, params)
         try:
-            compiled = compile(code, f"<脚本节点{step.id}>", "exec")
+            compiled = compile(src, f"<脚本节点{step.id}>", "exec")
         except SyntaxError as e:
-            raise ValueError(f"Python 脚本语法错误（第 {e.lineno} 行）：{e.msg}")
+            line = max(1, int(e.lineno or 1) - 1)    # 减去包在外面的那一行
+            raise ValueError(f"Python 脚本语法错误（第 {line} 行）：{e.msg}")
 
         logs: List[str] = []
         ns: Dict[str, Any] = {
@@ -994,39 +1138,53 @@ class StepExecutor:
         }
         started = time.monotonic()
         exec(compiled, ns)          # noqa: S102 - 运行用户自己的本地脚本
+        try:
+            returned = ns["__run__"](**args)
+        except Exception as e:
+            raise ValueError(f"Python 脚本出错{_script_line(e, step.id)}："
+                             f"{type(e).__name__}: {e}") from e
         used = time.monotonic() - started
         if used > timeout:
             self.log(f"  提示：脚本耗时 {used:.1f}s，已超过设定 {timeout}s")
 
         out = dict(ns.get("vars") or {})
-        # 脚本可写 result = {...} 直接输出一组新变量
-        result = ns.get("result")
+        locals_snapshot = {}
+        if isinstance(returned, dict) and set(returned) == {_LOCALS_KEY}:
+            locals_snapshot = returned.get("__script_locals__") or {}
+            returned = None         # 脚本没写 return，这只是我们兜底塞进去的
+        # 老写法：脚本可写 result = {...} 直接输出一组新变量
+        result = locals_snapshot.get("result")
         if isinstance(result, dict):
             out.update({str(k): v for k, v in result.items()})
-        return out, logs
+        return out, logs, returned
 
-    def _exec_js(self, code: str, scope: Dict[str, str], timeout: int):
-        """在页面上下文执行 JS（可直接操作 DOM）。返回 (更新后的 vars, 日志)。"""
+    def _exec_js(self, step: Step, code: str, scope: Dict[str, str],
+                 params: List[Tuple[str, str]], args: Dict[str, str],
+                 timeout: int):
+        """在页面上下文执行 JS（可直接操作 DOM）。返回 (vars, 日志, 返回值)。"""
         if self._page is None:
             raise RuntimeError("JavaScript 节点需要浏览器页面，但浏览器未启动")
+        names = ", ".join(p for _v, p in params)
         wrapper = (
             "(arg) => {\n"
             "  const logs = [];\n"
             "  const log = (m) => logs.push(String(m));\n"
             "  const vars = arg.vars;\n"
             "  const url = arg.url;\n"
-            "  let ret;\n"
-            "  ret = (function(){\n"
+            "  const ret = (function(" + names + "){\n"
             + code +
-            "\n  }).call(null);\n"
-            "  return { vars: vars, logs: logs, ret: ret };\n"
+            "\n  }).apply(null, arg.args);\n"
+            "  return { vars: vars, logs: logs,"
+            " ret: ret === undefined ? null : ret };\n"
             "}"
         )
         old_timeout = DEFAULT_PAGE_TIMEOUT_MS
         self._page.set_default_timeout(timeout * 1000)
         try:
             res = self._page.evaluate(
-                wrapper, {"vars": dict(scope), "url": self._current_url()}
+                wrapper,
+                {"vars": dict(scope), "url": self._current_url(),
+                 "args": [args.get(p, "") for _v, p in params]},
             )
         except Exception as e:
             raise RuntimeError(f"JavaScript 脚本执行失败：{e}")
@@ -1036,12 +1194,7 @@ class StepExecutor:
         res = res or {}
         out = dict(res.get("vars") or {})
         logs = [str(x) for x in (res.get("logs") or [])]
-        ret = res.get("ret")
-        if isinstance(ret, dict):
-            out.update({str(k): v for k, v in ret.items()})
-        elif ret is not None:
-            logs.append(f"返回值：{ret}")
-        return out, logs
+        return out, logs, res.get("ret")
 
     # ------------------------------
     # 动作（桌面场景）
