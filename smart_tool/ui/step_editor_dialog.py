@@ -703,7 +703,7 @@ class StepEditDialog(QDialog):
         # 被删除的分支行号（原下标），保存时由调用方据此删掉分支标记
         self._dropped_branches: list = []
 
-        # --- 自由代码节点（script）：当成一个函数用 ---
+        # --- 自由代码节点（script）：写一个真正的函数，系统自动调用它 ---
         self.script_lang_combo = QComboBox()
         for key, label in SCRIPT_LANGS:
             self.script_lang_combo.addItem(label, key)
@@ -1032,7 +1032,7 @@ class StepEditDialog(QDialog):
             params = (f.get("params") or "").strip()
             tip = f"{f['name']}（{lang}）"
             if params:
-                tip += f"\n入口参数：{params}"
+                tip += f"\n形参：{params}"
             if (f.get("desc") or "").strip():
                 tip += f"\n{f['desc'].strip()}"
             self.call_func_combo.addItem(f"{f['name']}（{lang}）", f["name"])
