@@ -696,7 +696,7 @@ class StepEditDialog(QDialog):
         bb = QHBoxLayout(branch_btns)
         bb.setContentsMargins(0, 0, 0, 0)
         self.btn_add_branch = QPushButton("＋ 添加分支")
-        self.btn_add_branch.clicked.connect(lambda: self._add_branch_row())
+        self.btn_add_branch.clicked.connect(self._on_add_branch)
         bb.addWidget(self.btn_add_branch)
         self.btn_del_branch = QPushButton("－ 删除选中分支")
         self.btn_del_branch.clicked.connect(self._remove_branch_row)
@@ -1098,10 +1098,29 @@ class StepEditDialog(QDialog):
         self.cond_expr_edit.setFocus()
         self.cond_var_combo.setCurrentIndex(0)
 
-    def _add_branch_row(self, name: str = "", op: str = "",
-                        value: str = "", origin: int = -1) -> int:
-        """加一行分支；origin 是它在原清单里的下标（新建的为 -1）。"""
+    def _branch_op_at(self, row: int) -> str:
+        """某一行的判断方式（空串＝兜底）。"""
+        combo = self.branch_table.cellWidget(row, 1)
+        return (combo.currentData() if isinstance(combo, QComboBox) else "") or ""
+
+    def _on_add_branch(self):
+        """点【＋ 添加分支】：新行插在最后一个「兜底」之前。
+
+        兜底必须留在最后（它无条件成立），而分支顺序现在还不能拖动调整，
+        所以要由这里保证新增的分支不会被兜底挡住。
+        """
         row = self.branch_table.rowCount()
+        if (self.cond_mode_combo.currentData() != "expr" and row > 0
+                and not self._branch_op_at(row - 1)):
+            row -= 1
+        self._add_branch_row(f"分支 {row + 1}", op="contains", at=row)
+
+    def _add_branch_row(self, name: str = "", op: str = "",
+                        value: str = "", origin: int = -1,
+                        at: Optional[int] = None) -> int:
+        """加一行分支；origin 是它在原清单里的下标（新建的为 -1）。"""
+        last = self.branch_table.rowCount()
+        row = last if at is None else max(0, min(int(at), last))
         self.branch_table.insertRow(row)
         name_item = QTableWidgetItem(name)
         name_item.setData(Qt.ItemDataRole.UserRole, origin)
