@@ -1,0 +1,3 @@
+# 打包用依赖（和运行依赖一样，外加 PyInstaller）
+-r ../requirements.txt
+pyinstaller>=6.0

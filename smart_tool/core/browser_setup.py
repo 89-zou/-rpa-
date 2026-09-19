@@ -99,8 +99,8 @@ def hint() -> str:
     """没装浏览器时给用户看的提示（中文，能照着做）。"""
     return (
         "还没装浏览器内核（Chromium），跑流程时启动不了浏览器。\n"
-        "   最简单的办法：运行【安装向导】（桌面/开始菜单里的「小邹RPA 安装向导」），\n"
-        "   它会在「环境构建」这一步自动下载；源码运行时可以执行：\n"
-        "       .venv\\Scripts\\python -m smart_tool.setup_wizard\n"
+        "   最简单的办法：跑一次安装向导，它会在「环境构建」这一步自动下载：\n"
+        "       小邹RPA.exe --setup                                  （打包版）\n"
+        "       .venv\\Scripts\\python -m smart_tool.setup_wizard      （源码运行）\n"
         f"   下载后会装在：{browsers_dir()}"
     )

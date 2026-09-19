@@ -20,3 +20,8 @@ projects/
 
 # 临时验证脚本目录（跑完就删）
 projects/_verify_*/
+
+# 打包产物（几百 MB，不入库；要打包就跑 packaging/build.ps1）
+dist/
+build/
+packaging/*.ico
