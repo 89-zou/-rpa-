@@ -1160,8 +1160,8 @@ class StepExecutor:
             if var:
                 value = record.get(name, "")
                 self.variables[f"{var}.{name}"] = "" if value is None else str(value)
-        self.log(f"  采集完成：1 条记录 → data/{datastore.RECORDS_NAME}"
-                 + (f"；变量 {{{{ {var}.字段 }}}}" if var else ""))
+        tip = "；变量 {{" + var + ".字段}} 可以引用" if var else ""
+        self.log(f"  采集完成：1 条记录 → data/{datastore.RECORDS_NAME}" + tip)
 
     def _collect_list(self, step: Step, fields: List[Dict[str, str]],
                       var: str, label: Any):
@@ -1292,7 +1292,8 @@ class StepExecutor:
             data = target.first.screenshot(timeout=COLLECT_TIMEOUT_MS)
         elif extra in ("整页", "全页", "page", "full"):
             data = self._page.screenshot(full_page=True)
-            stem += "_整页"
+            if "整页" not in stem and "全页" not in stem:
+                stem += "_整页"
         else:
             data = self._page.screenshot(clip=self._parse_area(extra))
         return datastore.save_bytes(self.project_dir, stem, ".png", data)
@@ -1342,12 +1343,21 @@ class StepExecutor:
         等多久由这一步的「打开超时」决定（默认 NAV_TIMEOUT_DEFAULT_S 秒）。
         """
         secs = int(step.nav_timeout or NAV_TIMEOUT_DEFAULT_S)
+        url = self._resolve_value(step.url or "").strip()
+        missing = [n for n in VAR_PATTERN.findall(url) if n not in self.variables]
+        if missing or not url:
+            names = "、".join(f"{{{{{n}}}}}" for n in missing)
+            raise ValueError(
+                f"「打开网页」的网址现在填不出有效地址：{url or '（空）'}\n"
+                + (f"    变量 {names} 还没有值（循环里的 {{loop.item.字段}} 只能在循环体里用）。"
+                   if missing else "    请双击这一步填写网址。")
+            )
         try:
-            self._page.goto(step.url, wait_until="domcontentloaded",
+            self._page.goto(url, wait_until="domcontentloaded",
                             timeout=secs * 1000)
         except PlaywrightTimeout as e:
             raise TimeoutError(
-                f"打开网页超过 {secs}s 还没响应：{step.url}\n"
+                f"打开网页超过 {secs}s 还没响应：{url}\n"
                 f"   当前页面：{self._current_url() or '（空白页）'}\n"
                 f"   可以双击这一步，把「打开超时」调大（现在 {secs} 秒）。"
             ) from e
