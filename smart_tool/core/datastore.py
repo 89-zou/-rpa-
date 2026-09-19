@@ -6,7 +6,8 @@
 - 每条记录统一带 `_time` / `_url` / `_step` 三个下划线开头的元信息，
   这样不会跟用户自己起的字段名（标题、正文…）撞车
 
-导出 CSV 用 utf-8-sig：Excel 双击打开不会乱码。
+导出两种格式：CSV（utf-8-sig，Excel 双击打开不乱码）与 .xlsx（Excel 原生，
+长文本不乱行、表头冻结、列宽自动撑开）。
 """
 import csv
 import json
@@ -190,6 +191,69 @@ def _cell(value):
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False)
     return "" if value is None else value
+
+
+def export_xlsx(project_dir, target) -> int:
+    """导出成 Excel 原生格式 .xlsx，返回写了多少行。
+
+    比 CSV 强的地方：长文本（文章正文）不会串行、单元格里换行照原样，
+    表头冻结、列宽按内容撑开，中文数字对得齐。
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    records = read_records(project_dir, limit=None)
+    cols = columns(records)
+    target = Path(target)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "采集数据"
+    ws.append(cols)
+    bold = Font(bold=True)
+    widths = [_text_width(c) for c in cols]
+    for c in range(1, len(cols) + 1):
+        ws.cell(row=1, column=c).font = bold
+    for r in records:
+        values = [_xlsx_cell(r.get(c)) for c in cols]
+        ws.append(values)
+        for i, v in enumerate(values):
+            if isinstance(v, str) and v:
+                widths[i] = max(widths[i], _text_width(_first_line(v)))
+    ws.freeze_panes = "A2"
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = min(w + 2, COL_MAX_WIDTH)
+    wb.save(str(target))
+    return len(records)
+
+
+#: 单元格文本上限（Excel 限制 32767 字符）
+CELL_MAX_CHARS = 32767
+#: 列宽上限（超过就没法看了，长内容靠点进单元格看）
+COL_MAX_WIDTH = 60
+#: Excel 不接受的字符（除 \t \n \r 之外的控制字符）
+_CTRL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _xlsx_cell(value):
+    """把值收拾成 Excel 能放进去的样子。"""
+    text = _cell(value)
+    if not isinstance(text, str) or not text:
+        return text
+    text = _CTRL_CHARS.sub("", text)
+    if len(text) > CELL_MAX_CHARS:
+        text = text[:CELL_MAX_CHARS - 12] + "…（已截断）"
+    return text
+
+
+def _first_line(text: str) -> str:
+    return text.split("\n", 1)[0]
+
+
+def _text_width(text: str) -> int:
+    """大致算显示宽度：中文算 2 个字符。"""
+    return sum(2 if ord(ch) > 127 else 1 for ch in text)
 
 
 def now_text() -> str:

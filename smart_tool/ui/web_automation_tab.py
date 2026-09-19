@@ -18,8 +18,6 @@ from smart_tool.core.project_store import (
 from smart_tool.core.step_executor import (
     PauseHandle, StepExecutor, available_variables, check_variables,
 )
-from smart_tool.ui.auth_dialog import AuthDialog
-from smart_tool.ui.data_dialog import DataDialog
 from smart_tool.ui.flow_canvas import (
     ACTION_META, DEFAULT_PLACEHOLDER, LAYOUT_VERSION, NO_PROJECT_PLACEHOLDER,
     FlowCanvas, step_summary,
@@ -144,26 +142,11 @@ class WebAutomationTab(QWidget):
         proj_layout.addWidget(self.btn_load)
         self.btn_manage = QPushButton("项目管理…")
         self.btn_manage.setToolTip(
-            "项目列表与变量清单都在这里管（「读取数据」节点负责变量从哪来）"
+            "项目列表、变量清单、图片库、登录态、采集数据都在这里管\n"
+            "（先选一个项目，右边就是它的配置）"
         )
         self.btn_manage.clicked.connect(self._open_project_manager)
         proj_layout.addWidget(self.btn_manage)
-        self.btn_auth = QPushButton("登录态…")
-        self.btn_auth.setToolTip(
-            "登录一次、以后直接用：运行时会带上这里保存的 cookie / localStorage，\n"
-            "不用每次都重新登录；失效了会自动重登一遍并把新的存回来。\n"
-            "（登录那几步要在【流程编辑】里标记为「登录用」，才会被跳过）"
-        )
-        self.btn_auth.clicked.connect(self._open_auth_dialog)
-        proj_layout.addWidget(self.btn_auth)
-        self.btn_data = QPushButton("数据…")
-        self.btn_data.setToolTip(
-            "看「采集数据」节点采到了什么（存在项目的 data/ 里）：\n"
-            "records.jsonl＝结构化数据，files/＝图片、附件、截图。\n"
-            "可以导出成 Excel 能打开的 CSV。"
-        )
-        self.btn_data.clicked.connect(self._open_data_dialog)
-        proj_layout.addWidget(self.btn_data)
         layout.addLayout(proj_layout)
 
         # 编辑按钮条
@@ -372,33 +355,8 @@ class WebAutomationTab(QWidget):
             self._current_store.save(self._steps,
                                      layout_version=LAYOUT_VERSION)
 
-    def _open_auth_dialog(self):
-        """打开【登录态…】：选运行时用哪个、看有效期、导入/删除/改名。"""
-        if not self._require_project():
-            return
-        if self._worker is not None:
-            QMessageBox.warning(self, "提示", "执行进行中，请先停止再改登录态。")
-            return
-        dlg = AuthDialog(self._current_store, self._steps, self)
-        dlg.exec()
-        if dlg.changed:
-            cfg = self._current_store.load_auth()
-            self._append_log(
-                f"登录态设置已保存："
-                + (f"运行时使用「{cfg['name']}」"
-                   if cfg["name"] else "不使用登录态")
-                + ("；登录态失效会自动重登并续期。" if cfg["name"] else "")
-            )
-            self._update_edit_buttons()
-
-    def _open_data_dialog(self):
-        """打开【数据…】：看采集结果、导出 CSV。"""
-        if not self._require_project():
-            return
-        DataDialog(self._current_store, self).exec()
-
     def _open_project_manager(self):
-        """打开【项目管理】：项目列表 + 变量清单。"""
+        """打开【项目管理】：项目列表 + 变量清单 + 图片库 + 登录态 + 采集数据。"""
         if self._worker is not None:
             QMessageBox.warning(self, "提示", "执行进行中，请先停止再管理项目。")
             return
@@ -436,10 +394,6 @@ class WebAutomationTab(QWidget):
         self.btn_load.setEnabled(self._worker is None)
         self.btn_run.setEnabled(self._worker is None and editable)
         self.chk_real_mouse.setEnabled(self._worker is None)
-        # 登录态是浏览器专属：桌面场景用不上
-        self.btn_auth.setEnabled(editable and self._scene != "desktop")
-        self.btn_auth.setVisible(self._scene != "desktop")
-        self.btn_data.setEnabled(self._current_store is not None)
 
     def _require_project(self) -> bool:
         if not self._current_store:
@@ -896,7 +850,7 @@ class WebAutomationTab(QWidget):
             if total:
                 self._append_log(
                     f"采集到的数据：data/{datastore.RECORDS_NAME} 共 {total} 条"
-                    "（点【数据…】查看 / 导出 CSV）")
+                    "（在【项目管理…】→【采集数据】里查看 / 导出 Excel）")
 
     def _on_pause(self, prompt: str, step_id: int):
         num = self._step_labels.get(step_id, step_id)

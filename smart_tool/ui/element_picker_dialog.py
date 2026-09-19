@@ -331,3 +331,31 @@ class ElementPickerDialog(QDialog):
             except OSError:
                 pass
         self._shots.clear()
+
+
+def pick_element(parent, url: str, project_dir) -> Optional[dict]:
+    """开捕获窗口让用户点一个元素，返回它的信息（取消返回 None）。
+
+    返回值就是 ElementPickerDialog.result_data：
+    `{"xpath":…, "image":"img/xxx.png", "count":命中几个, "desc":元素描述}`。
+    给「不想要元素截图、只要一个 XPath」的地方用（比如登录态体检、采集行定位）。
+    """
+    dlg = ElementPickerDialog(url, Path(project_dir), parent)
+    if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+        return None
+    return dlg.result_data
+
+
+def drop_capture_image(project_dir, data: dict) -> None:
+    """「只要 XPath、不要元素截图」的地方收尾用：把那张图删掉。
+
+    捕获器只会留下最后一张截图（其余都自己清了），但很多地方（登录态体检、
+    采集行定位）根本用不上它，留着只会在项目 img/ 里堆废图。
+    """
+    rel = (data or {}).get("image") or ""
+    if not rel:
+        return
+    try:
+        (Path(project_dir) / rel).unlink()
+    except OSError:
+        pass

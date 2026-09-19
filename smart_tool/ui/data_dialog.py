@@ -11,7 +11,7 @@
 import json
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices
@@ -33,19 +33,47 @@ REFRESH_MS = 1500
 class DataDialog(QDialog):
     """采集结果面板。"""
 
-    def __init__(self, store: ProjectStore, parent=None):
+    def __init__(self, store: ProjectStore = None, parent=None,
+                 embedded: bool = False):
         super().__init__(parent)
-        self.setWindowTitle("数据（采集结果）")
-        self.setMinimumSize(860, 560)
+        self.setWindowTitle("采集数据（采集结果）")
         self.store = store
         self._records: List[Dict] = []
         self._stamp = (0, 0.0)
+        self._embedded = embedded
         self._init_ui()
+        if embedded:
+            # 作为【项目管理】里的一个页签用：不当独立窗口，也不要自己的「关闭」
+            self.setWindowFlags(Qt.WindowType.Widget)
+            self.btn_close.setVisible(False)
+        else:
+            self.setMinimumSize(860, 560)
         self.refresh(force=True)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._on_tick)
-        self.timer.start(REFRESH_MS)
+        if self.store is not None:
+            self.timer.start(REFRESH_MS)
+
+    def set_project(self, store: Optional[ProjectStore]):
+        """换项目（项目管理里切换左边列表时调）。"""
+        self.store = store
+        self._stamp = (0, 0.0)
+        self.refresh(force=True)
+        if store is None:
+            self.timer.stop()
+        elif self.chk_auto.isChecked():
+            self.timer.start(REFRESH_MS)
+
+    def keyPressEvent(self, event):
+        """嵌在【项目管理】里当页签时，Esc 别自己咽掉（否则页签会变空白）。
+
+        QDialog 默认把 Esc 当「关闭窗口」＝hide()，交给外面的对话框处理才对。
+        """
+        if self._embedded and event.key() == Qt.Key.Key_Escape:
+            event.ignore()
+            return
+        super().keyPressEvent(event)
 
     # ------------------------------
     # UI
@@ -56,7 +84,8 @@ class DataDialog(QDialog):
         tip = QLabel(
             "「采集数据」节点采到的东西都在这里：数据存在项目目录的 data/ 下——\n"
             "records.jsonl＝结构化数据（每行一条）；files/＝图片、附件、截图。\n"
-            "表格里双击一格：如果那一格是 files/… 的文件，就用系统程序打开它。"
+            "表格里双击一格：如果那一格是 files/… 的文件，就用系统程序打开它。\n"
+            "导出可以选 Excel（.xlsx，长文本不乱行）或 CSV（.csv，几乎什么软件都能开）。"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#555555;")
@@ -80,10 +109,17 @@ class DataDialog(QDialog):
         self.btn_folder = QPushButton("打开 data 文件夹")
         self.btn_folder.clicked.connect(self._open_folder)
         btns.addWidget(self.btn_folder)
-        self.btn_export = QPushButton("导出 CSV…")
-        self.btn_export.setToolTip("导出成 Excel 能直接打开的 CSV（utf-8-sig，中文不乱码）")
-        self.btn_export.clicked.connect(self._export)
+        self.btn_export = QPushButton("导出 Excel…")
+        self.btn_export.setToolTip(
+            "导出成 Excel 原生格式 .xlsx：表头冻结、列宽自动撑开，\n"
+            "长文本（文章正文）不会乱行")
+        self.btn_export.clicked.connect(self._export_xlsx)
         btns.addWidget(self.btn_export)
+        self.btn_export_csv = QPushButton("导出 CSV…")
+        self.btn_export_csv.setToolTip(
+            "导出成 CSV（utf-8-sig，中文不乱码）：通用格式，各种软件都能开")
+        self.btn_export_csv.clicked.connect(self._export_csv)
+        btns.addWidget(self.btn_export_csv)
         self.btn_clear = QPushButton("清空记录")
         self.btn_clear.setToolTip("只清 records.jsonl；files/ 里的图片文件不动")
         self.btn_clear.clicked.connect(self._clear)
@@ -120,11 +156,21 @@ class DataDialog(QDialog):
             self.timer.stop()
 
     def _on_tick(self):
+        if self.store is None:
+            return
         if datastore.records_stamp(self.store.dir) != self._stamp:
             self.refresh(force=True)
 
     def refresh(self, force: bool = False):
         """重新读记录并铺表格（文件没变就不做）。"""
+        if self.store is None:
+            self._records = []
+            self.summary.setText("还没有选项目")
+            self.path_label.setText("")
+            self.table.clear()
+            self.table.setRowCount(0)
+            self.table.setColumnCount(0)
+            return
         stamp = datastore.records_stamp(self.store.dir)
         if not force and stamp == self._stamp:
             return
@@ -185,7 +231,24 @@ class DataDialog(QDialog):
         folder.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
-    def _export(self):
+    def _export_xlsx(self):
+        if not self._records:
+            QMessageBox.information(self, "没有数据", "现在还没有采集到任何记录。")
+            return
+        default = f"采集数据_{time.strftime('%Y%m%d_%H%M')}.xlsx"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出成 Excel（.xlsx）", default, "Excel 工作簿 (*.xlsx)")
+        if not path:
+            return
+        try:
+            n = datastore.export_xlsx(self.store.dir, Path(path))
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"{type(e).__name__}: {e}")
+            return
+        QMessageBox.information(self, "导出完成",
+                                f"已导出 {n} 条记录到：\n{path}")
+
+    def _export_csv(self):
         if not self._records:
             QMessageBox.information(self, "没有数据", "现在还没有采集到任何记录。")
             return

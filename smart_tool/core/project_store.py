@@ -355,7 +355,7 @@ class ProjectStore:
         self._write(data)
         if not name:
             return
-        # 顺手把 auth 目录建出来：用户先去【登录态…】里看一眼也有地方放
+        # 顺手把 auth 目录建出来：用户在【项目管理…】里点【登录态】也有地方放
         (self.dir / "auth").mkdir(parents=True, exist_ok=True)
 
     @property

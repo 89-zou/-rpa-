@@ -541,7 +541,7 @@ class StepExecutor:
                      f"（{auth_store.describe_path(self._auth_path)}）")
             if not self._auth_check_locator:
                 self.log("   注意：没配「登录后才有的元素」，没法自动发现登录态失效。"
-                         "建议去【登录态…】里填一个（比如后台菜单的 XPath）。")
+                         "建议去【项目管理…】→【登录态】里填一个（比如后台菜单的 XPath）。")
         elif self._auth_path:
             self.log(f"登录态「{self._auth_name}」还没保存过："
                      "这次会走完整流程，跑完自动存一份，以后直接登录。")

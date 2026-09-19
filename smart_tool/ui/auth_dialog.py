@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-"""登录态管理窗口：登录一次，以后直接复用 cookie / localStorage。
+"""登录态管理：登录一次，以后直接复用 cookie / localStorage。
 
 里面干三件事：
 1. 选运行时用哪个登录态（名字可以现起——第一次运行会自动创建这个文件）
 2. 填「登录后才有的元素」（XPath）——执行器靠它判断登录态还有没有效
+   （可以直接输入、从「本项目已用过的定位」下拉里挑、或用【捕获元素…】点一下抓）
 3. 管理已有登录态文件：看保存时间与有效期、导入、改名、删除、打开文件夹
 
 改动即时保存（和这个工具里其它窗口一致），关掉即生效。
+它平时以页签形式出现在【项目管理…】里（embedded=True），也能当独立窗口用。
 """
 import time
 from pathlib import Path
@@ -16,14 +18,16 @@ from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QFileDialog, QHBoxLayout,
-    QHeaderView, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QHeaderView, QInputDialog, QLabel, QMessageBox, QPushButton,
     QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
-from smart_tool.core import auth_store, blocks
+from smart_tool.core import auth_store, blocks, step_executor
 from smart_tool.core.project_store import ProjectStore, Step
+from smart_tool.ui.element_picker_dialog import drop_capture_image, pick_element
 
 NO_AUTH_TEXT = "（不使用登录态）"
+XPATH_PLACEHOLDER = "（下拉＝本项目已用过的定位）"
 
 
 def _fmt_time(stamp: Optional[float]) -> str:
@@ -32,18 +36,73 @@ def _fmt_time(stamp: Optional[float]) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp))
 
 
+def xpath_choices(steps: List[Step]) -> List[str]:
+    """本项目里已经写过的 XPath（定位 / 等待目标 / 采集的行与字段）。
+
+    体检用的元素往往就是流程里某个「登录后才出现」的定位，
+    与其重新敲一遍，不如从下拉里挑；挑不到再自己写 / 用【捕获元素…】。
+    """
+    out: List[str] = []
+
+    def add(text: str):
+        text = (text or "").strip()
+        if text and text not in out:
+            out.append(text)
+
+    for s in steps or []:
+        loc = s.locator
+        if loc is not None and loc.value and loc.type != "image":
+            add(loc.value)
+        if s.wait_target and s.action != "collect":
+            add(s.wait_target)
+        if s.resume_element:
+            add(s.resume_element)
+        add(s.collect_row)
+        for f in s.collect_fields or []:
+            if isinstance(f, dict):
+                add(f.get("locator", ""))
+    return out
+
+
 class AuthDialog(QDialog):
     """登录态管理。"""
 
-    def __init__(self, store: ProjectStore, steps: List[Step], parent=None):
+    def __init__(self, store: Optional[ProjectStore] = None,
+                 steps: Optional[List[Step]] = None, parent=None,
+                 embedded: bool = False):
         super().__init__(parent)
         self.setWindowTitle("登录态（cookie / localStorage）")
-        self.setMinimumSize(720, 520)
         self.store = store
         self.steps = list(steps or [])
         self.changed = False
+        self._loading = False
+        self._embedded = embedded
         self._init_ui()
+        if embedded:
+            # 作为【项目管理】里的一个页签用：不当独立窗口，也不要自己的「关闭」
+            self.setWindowFlags(Qt.WindowType.Widget)
+            self.btn_close.setVisible(False)
+        else:
+            self.setMinimumSize(720, 520)
         self.refresh()
+
+    def set_project(self, store: Optional[ProjectStore],
+                    steps: Optional[List[Step]] = None):
+        """换项目（项目管理里切换左边列表时调）。"""
+        self.store = store
+        self.steps = list(steps or [])
+        self.refresh()
+
+    def keyPressEvent(self, event):
+        """嵌在【项目管理】里当页签时，Esc 别自己咽掉。
+
+        QDialog 默认把 Esc 当「关闭窗口」＝hide()——在页签里就成了空白页，
+        所以直接放行，让外面的对话框去处理（关掉整个项目管理）。
+        """
+        if self._embedded and event.key() == Qt.Key.Key_Escape:
+            event.ignore()
+            return
+        super().keyPressEvent(event)
 
     # ------------------------------
     # UI
@@ -79,13 +138,30 @@ class AuthDialog(QDialog):
         row.addWidget(self.state_label, 1)
         root.addLayout(row)
 
-        # 体检用的元素
+        # 体检用的元素：可以直接写、从「用过的定位」下拉挑、插入变量、或捕获
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("登录后才有的元素："))
-        self.check_edit = QLineEdit()
-        self.check_edit.setPlaceholderText('XPath，例如 //*[@id="menu-posts"]')
-        self.check_edit.editingFinished.connect(self._save_config)
+        self.check_edit = QComboBox()          # 可编辑：既能下拉选，也能直接敲
+        self.check_edit.setEditable(True)
+        self.check_edit.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.check_edit.lineEdit().setPlaceholderText(
+            'XPath，例如 //*[@id="menu-posts"]')
+        self.check_edit.activated.connect(self._on_xpath_picked)
+        self.check_edit.lineEdit().editingFinished.connect(self._save_config)
         row2.addWidget(self.check_edit, 1)
+
+        self.var_combo = QComboBox()
+        self.var_combo.setToolTip("把变量插到光标处（XPath 里也能用，如 //*[@id=\"{{菜单id}}\"]）")
+        self.var_combo.activated.connect(self._insert_variable)
+        row2.addWidget(self.var_combo)
+
+        self.btn_capture = QPushButton("捕获元素…")
+        self.btn_capture.setToolTip(
+            "打开浏览器，在页面上点一下「登录后才出现」的那个元素（比如后台左侧菜单），\n"
+            "XPath 自动填进来，不用自己写。"
+        )
+        self.btn_capture.clicked.connect(self._capture)
+        row2.addWidget(self.btn_capture)
         root.addLayout(row2)
         hint = QLabel(
             "填一个「只有登录之后才会出现」的元素（比如后台左侧菜单）。"
@@ -143,14 +219,16 @@ class AuthDialog(QDialog):
     # ------------------------------
     def refresh(self):
         """按磁盘上的实际内容重建列表与提示（不触发保存）。"""
-        cfg = self.store.load_auth()
-        states = auth_store.list_states(self.store.dir)
+        states = auth_store.list_states(self.store.dir) if self.store else []
+        self._loading = True
 
         self.combo.blockSignals(True)
         self.combo.clear()
         self.combo.addItem(NO_AUTH_TEXT)
         for st in states:
             self.combo.addItem(st.name)
+        cfg = self.store.load_auth() if self.store else {"name": "",
+                                                         "check_locator": ""}
         idx = self.combo.findText(cfg["name"]) if cfg["name"] else 0
         if idx >= 0:
             self.combo.setCurrentIndex(idx)
@@ -158,10 +236,14 @@ class AuthDialog(QDialog):
             self.combo.setEditText(cfg["name"])    # 名字还没落成文件，先显示着
         self.combo.blockSignals(False)
 
-        self.check_edit.blockSignals(True)
-        if not self.check_edit.text().strip():
-            self.check_edit.setText(cfg["check_locator"])
-        self.check_edit.blockSignals(False)
+        # 登录后才有的元素：下拉里是本项目已用过的定位，也能直接敲 / 捕获
+        self.check_edit.clear()
+        self.check_edit.addItem(XPATH_PLACEHOLDER)
+        for xp in xpath_choices(self.steps):
+            self.check_edit.addItem(xp)
+        self.check_edit.setEditText(cfg["check_locator"])
+        self._refresh_var_combo()
+        self._loading = False
 
         self.table.setRowCount(0)
         for st in states:
@@ -179,9 +261,84 @@ class AuthDialog(QDialog):
 
         self._update_state_label(states)
         self._update_buttons()
+        for w in (self.combo, self.check_edit, self.var_combo, self.btn_capture,
+                  self.btn_import):
+            w.setEnabled(self.store is not None)
+
+    def _refresh_var_combo(self):
+        """「插入变量 ▾」：本项目的变量（自定义 + 读取/采集节点产出的）。"""
+        names = (step_executor.available_variables(
+            self.steps, self.store.load_variables()) if self.store else [])
+        self.var_combo.blockSignals(True)
+        self.var_combo.clear()
+        self.var_combo.addItem("插入变量 ▾", "")
+        for n in names:
+            self.var_combo.addItem(f"{{{{{n}}}}}", n)
+        self.var_combo.blockSignals(False)
+
+    def _insert_variable(self, index: int):
+        """把选中的变量插到 XPath 输入框的光标处。"""
+        name = self.var_combo.itemData(index)
+        self.var_combo.setCurrentIndex(0)
+        if not name:
+            return
+        self.check_edit.lineEdit().insert(f"{{{{{name}}}}}")
+        self.check_edit.setFocus()
+
+    def _on_xpath_picked(self, index: int):
+        """从下拉里挑了一条「本项目用过的定位」。"""
+        if index <= 0:
+            return
+        self.check_edit.setEditText(self.check_edit.itemText(index))
+        self._save_config()
+
+    def _capture(self):
+        """捕获元素：点一下页面上的元素，XPath 自动填进来。"""
+        if self.store is None:
+            return
+        url = self._default_url()
+        if not url:
+            QMessageBox.information(
+                self, "先加一个「打开网页」",
+                "这个项目里还没有「打开网页」节点，捕获器不知道该打开哪个网址。\n"
+                "可以在【流程编辑…】里加一步「打开网页」，或者直接手工填 XPath。",
+            )
+            return
+        try:
+            data = pick_element(self, url, self.store.dir)
+        except Exception as e:
+            QMessageBox.critical(self, "捕获失败", f"{type(e).__name__}: {e}")
+            return
+        if not data:
+            return
+        xpath = (data.get("xpath") or "").strip()
+        if not xpath:
+            QMessageBox.information(self, "没抓到 XPath", "换个元素再点一下试试。")
+            return
+        self.check_edit.setEditText(xpath)
+        self._save_config()
+        count = data.get("count", 1)
+        # 体检只要 XPath，捕获时顺手存下的元素截图这里用不上，删掉别在 img/ 里堆废图
+        drop_capture_image(self.store.dir, data)
+        self.state_label.setText(
+            f"已捕获：{data.get('desc') or '元素'} → {xpath}"
+            + ("" if count == 1 else f"（命中 {count} 个，最好换个更准的）")
+        )
+        self.state_label.setStyleSheet("color:#0f766e;")
+
+    def _default_url(self) -> str:
+        """捕获器默认打开的网址：项目里第一个「打开网页」。"""
+        for s in self.steps:
+            if s.action == "navigate" and s.url and "{{" not in s.url:
+                return s.url
+        return ""
 
     def _update_state_label(self, states: List[auth_store.AuthState]):
         """当前选中的登录态是什么情况 + 缺什么配置。"""
+        if self.store is None:
+            self.state_label.setText("先在左边选中一个项目")
+            self.state_label.setStyleSheet("color:#888888;")
+            return
         name = self._selected_name()
         if not name:
             self.state_label.setText("不用登录态：每次都会走完整登录流程")
@@ -228,8 +385,10 @@ class AuthDialog(QDialog):
         self._save_config()
 
     def _save_config(self):
+        if self._loading or self.store is None:
+            return
         name = self._selected_name()
-        locator = self.check_edit.text().strip()
+        locator = self.check_edit.currentText().strip()
         old = self.store.load_auth()
         if old["name"] == name and old["check_locator"] == locator:
             return
@@ -257,7 +416,7 @@ class AuthDialog(QDialog):
             return
         if not self._selected_name():
             self.store.save_auth(auth_store.safe_name(name),
-                                 self.check_edit.text().strip())
+                                 self.check_edit.currentText().strip())
             self.changed = True
         self.refresh()
 
@@ -276,7 +435,7 @@ class AuthDialog(QDialog):
             return
         if self.store.load_auth()["name"] == old:
             self.store.save_auth(auth_store.safe_name(name),
-                                 self.check_edit.text().strip())
+                                 self.check_edit.currentText().strip())
             self.changed = True
         self.refresh()
 
