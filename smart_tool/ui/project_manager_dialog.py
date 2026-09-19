@@ -20,18 +20,19 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QFont, QPixmap
+from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QFileDialog, QFormLayout,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QPlainTextEdit, QPushButton, QTableWidget, QTableWidgetItem,
+    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
     QTabWidget, QVBoxLayout, QWidget,
 )
 
-from smart_tool.core import data_sources, project_store, step_executor
+from smart_tool.core import data_sources, free_code, project_store, step_executor
 from smart_tool.core.data_sources import DataSourceConfig
 from smart_tool.core.project_store import ProjectStore, Step, list_projects
 from smart_tool.ui.auth_dialog import AuthDialog
+from smart_tool.ui.code_editor import CodeEditor
 from smart_tool.ui.data_dialog import DataDialog
 from smart_tool.ui.help_tip import help_row
 from smart_tool.ui.step_editor_dialog import StepEditDialog
@@ -78,26 +79,41 @@ IMAGES_HELP = (
     "但别只靠图——图对分辨率 / 缩放敏感，换台机器可能就匹配不上了。"
 )
 
+FUNC_PLACEHOLDER = (
+    "# 写一个完整的函数（和「自由代码」节点同一套写法）\n"
+    "def 清洗标题(#价格表=D:/data/价格表.xlsx):\n"
+    "    标题 = @原始标题.strip()      # 读变量清单（直接写 标题 也行）\n"
+    "    @结果 = 标题 + '（已处理）'    # 等号左边＝写回变量清单\n"
+    "    return 标题"
+)
+
 FUNCS_HELP = (
     "函数＝写一次、到处调用的一段代码。流程里用「调用函数」节点引用它，\n"
     "改这里的代码，所有调用它的地方一起变（不用满流程去找）。\n"
     "\n"
-    "【什么时候用】同一段处理要在多个地方做（清洗标题、算价格、补零、\n"
-    "失败重试…），或者流程里塞了太多「自由代码」节点看着乱的时候。\n"
-    "只在一个地方用的话，直接用「自由代码」节点更省事。\n"
+    "【和「自由代码」节点是一个写法】代码框里写一个完整的函数：\n"
     "\n"
-    "【入口参数】写形参名，逗号分隔（如 `单价, 倍数`）。\n"
-    "调用那边按 `形参名=值` 传（值可以写 {{变量}}）；没传的形参＝空文本。\n"
+    "    def 清洗标题(#价格表=D:/data/价格表.xlsx, 后缀='（已处理）'):\n"
+    "        标题 = @原始标题.strip()      # 读变量清单（直接写 标题 也行）\n"
+    "        @结果 = 标题 + 后缀           # 等号左边是 @名字 → 写回变量清单\n"
+    "        /封面 = 'D:/图片/封面.png'    # 等号左边是 /图片名 → 存回图片库\n"
+    "        return 标题\n"
     "\n"
-    "【代码】和「自由代码」节点一样：\n"
-    "· 用形参名拿参数；return 的东西就是「调用函数」节点的返回值；\n"
-    "· vars / log() / page / current_url / project_dir 都能用；\n"
-    "· Python 超时会真的掐断（JS 里同步死循环拦不住）。\n"
+    "【@名字】变量清单里的变量：等号左边＝写回，其它位置＝读取。\n"
+    "【/图片名】图片库里的图片：读＝得到 img/图片名.xxx 的绝对路径；\n"
+    "  等号左边＝把图片存回图片库（图片路径 / bytes / dataURL 都行）。\n"
+    "【#文件名=路径】写在参数表里：调用方传路径，或者直接用签名里写的那个。\n"
+    "  形参不用另外填，直接从签名括号里自动读出来。\n"
     "\n"
-    "【语言】Python 在本机跑、JS 在网页里跑（JS 需要浏览器页面）。\n"
+    "【还能拿到什么】log('...') 写日志、page（网页场景的浏览器页面对象）、\n"
+    "current_url / project_dir。执行超时、报错行号的处理和自由代码节点一样。\n"
     "\n"
-    "注意：函数改名后，已经用到它的「调用函数」节点会被一起改成新名字，\n"
-    "所以放心改。删函数则会让那些节点报「找不到函数」，需要重新选一个。"
+    "【什么时候用】同一段处理要在多个地方做（清洗标题、算价格、失败重试…），\n"
+    "或者流程里塞了太多「自由代码」节点看着乱的时候。\n"
+    "只在一个地方用的话，直接用「自由代码」节点更省事（它保存时会自动进这里）。\n"
+    "\n"
+    "注意：函数改名后，已经用到它的「调用函数」节点会被一起改成新名字。\n"
+    "删函数则会让那些节点报「找不到函数」，需要重新选一个。"
 )
 
 # 变量行类型（存在「来源」列的 UserRole 里，用来区分增删改行为）
@@ -324,9 +340,11 @@ class ProjectManagerDialog(QDialog):
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         self.func_name = QLineEdit()
-        self.func_name.setPlaceholderText("如：清洗标题（调用节点里按这个名字找）")
-        self.func_name.editingFinished.connect(self._save_functions)
-        form.addRow("函数名：", self.func_name)
+        self.func_name.setReadOnly(True)
+        self.func_name.setToolTip(
+            "函数名＝代码里 def / function 后面的那个名字。\n"
+            "在下面的代码框里改名字就等于改名（流程里的「调用函数」会一起跟着改）。")
+        form.addRow("函数名（自动）：", self.func_name)
 
         self.func_lang = QComboBox()
         self.func_lang.addItem("Python（本机执行）", "python")
@@ -335,9 +353,12 @@ class ProjectManagerDialog(QDialog):
         form.addRow("语言：", self.func_lang)
 
         self.func_params = QLineEdit()
-        self.func_params.setPlaceholderText("形参名，逗号分隔，如：单价, 倍数（留空＝没有参数）")
-        self.func_params.editingFinished.connect(self._save_functions)
-        form.addRow("入口参数：", self.func_params)
+        self.func_params.setReadOnly(True)
+        self.func_params.setToolTip(
+            "形参不用另外填：直接从函数签名的括号里读出来。\n"
+            "· #名字=路径 → 文件参数（调用方传路径，或直接用签名里写的那个）\n"
+            "· 普通名字（可带默认值）→ 普通参数")
+        form.addRow("形参（自动）：", self.func_params)
 
         self.func_desc = QLineEdit()
         self.func_desc.setPlaceholderText("选填：一句话说明它干什么，调用的时候鼠标停上去能看到")
@@ -345,16 +366,9 @@ class ProjectManagerDialog(QDialog):
         form.addRow("说明：", self.func_desc)
         right.addLayout(form)
 
-        self.func_code = QPlainTextEdit()
-        self.func_code.setPlaceholderText(
-            "# 例：\n"
-            "#   标题 = 标题.strip()\n"
-            "#   return 标题 + '（已处理）'"
-        )
-        self.func_code.setMinimumHeight(150)
-        mono = QFont("Consolas")
-        mono.setStyleHint(QFont.StyleHint.Monospace)
-        self.func_code.setFont(mono)
+        self.func_code = CodeEditor()
+        self.func_code.setPlaceholderText(FUNC_PLACEHOLDER)
+        self.func_code.setMinimumHeight(160)
         self.func_code.textChanged.connect(self._on_func_code_changed)
         right.addWidget(QLabel("函数代码："))
         right.addWidget(self.func_code, 1)
@@ -430,30 +444,59 @@ class ProjectManagerDialog(QDialog):
         self._func_row = row
         self._loading_func = True
         has = f is not None
-        for w in (self.func_name, self.func_params, self.func_desc,
+        for w in (self.func_name, self.func_desc,
                   self.func_lang, self.func_code, self.func_save_btn):
             w.setEnabled(has)
         self.func_name.setText((f or {}).get("name", ""))
         idx = self.func_lang.findData((f or {}).get("lang", "python"))
         self.func_lang.setCurrentIndex(max(0, idx))
-        self.func_params.setText((f or {}).get("params", ""))
         self.func_desc.setText((f or {}).get("desc", ""))
         self.func_code.setPlainText((f or {}).get("code", ""))
         self._loading_func = False
+        self._refresh_func_params()
+
+    def _func_spec(self):
+        """按当前代码解析出函数（形参从签名里读；路径可以由调用方给，所以不算错）。"""
+        return free_code.analyze(self.func_code.toPlainText(),
+                                 self.func_lang.currentData() or "python",
+                                 (), (), require_func=False,
+                                 require_file_paths=False)
+
+    def _refresh_func_params(self):
+        """把「函数名 / 形参」两行按代码刷新（都只读展示）。"""
+        fc = self._func_spec()
+        if fc.main is None:
+            self.func_name.setText("")
+            self.func_params.setText(
+                "。".join(fc.errors) if fc.errors else "（代码里还没有函数定义）")
+            return
+        self.func_name.setText(fc.main.name)
+        parts = []
+        for p in fc.main.params:
+            if p.kind == free_code.KIND_FILE:
+                parts.append(f"#{p.name}" + (f"＝{p.default}" if p.default else "（缺路径）"))
+            else:
+                parts.append(p.name + (f"＝{p.default}" if p.has_default else ""))
+        self.func_params.setText("，".join(parts) or "（没有形参）")
 
     def _on_func_code_changed(self):
         if self._loading_func:
             return
+        self._refresh_func_params()     # 形参是跟着代码走的，顺手刷新
         self._func_timer.start()
 
     def _collect_function(self) -> bool:
         """把右边表单写回 self._funcs；返回有没有改动。"""
         if self._loading_func or not (0 <= self._func_row < len(self._funcs)):
             return False
+        fc = self._func_spec()
+        names = ", ".join(fc.main.param_names) if fc.main else ""
         new = {
-            "name": self.func_name.text().strip(),
+            # 名字跟着代码走；代码里暂时没函数就先用原来的名字（别把条目弄丢）
+            "name": (fc.main.name if fc.main
+                     else str(self._funcs[self._func_row].get("name") or "")),
             "lang": self.func_lang.currentData() or "python",
-            "params": self.func_params.text().strip(),
+            "params": names,
             "desc": self.func_desc.text().strip(),
             "code": self.func_code.toPlainText(),
         }
@@ -516,7 +559,7 @@ class ProjectManagerDialog(QDialog):
         while name in names:
             name, i = f"{base}{i}", i + 1
         self._funcs.append({"name": name, "lang": "python", "params": "",
-                            "code": "", "desc": ""})
+                            "code": f"def {name}():\n    pass\n", "desc": ""})
         self._store.save_functions(self._funcs)
         self._saved_funcs = [dict(f) for f in self._funcs]
         self._loading_func = True
@@ -1033,7 +1076,8 @@ class ProjectManagerDialog(QDialog):
         dlg = StepEditDialog(
             self._store.dir, old, self,
             variable_names=step_executor.available_variables(
-                steps, self._store.load_all_variables()),
+                steps, self._store.load_all_variables(),
+                step_executor.library_written_vars(self._store.dir)),
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return

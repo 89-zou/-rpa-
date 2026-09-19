@@ -17,6 +17,7 @@ from smart_tool.core.project_store import (
 )
 from smart_tool.core.step_executor import (
     PauseHandle, StepExecutor, available_variables, check_variables,
+    library_written_vars,
 )
 from smart_tool.ui.flow_canvas import (
     ACTION_META, DEFAULT_PLACEHOLDER, LAYOUT_VERSION, NO_PROJECT_PLACEHOLDER,
@@ -405,11 +406,17 @@ class WebAutomationTab(QWidget):
     # ------------------------------
     # 变量来源检查
     # ------------------------------
+    def _library_vars(self) -> List[str]:
+        """函数库里各函数写回的变量（「调用函数」节点的产出）。"""
+        return library_written_vars(
+            self._current_store.dir if self._current_store else None)
+
     def available_variables(self) -> List[str]:
         """当前项目可用的变量：元素定位 + 自定义变量 + 读取节点产出的 + 循环运行时。"""
         return available_variables(
             self._steps,
             self._current_store.load_all_variables() if self._current_store else {},
+            self._library_vars(),
         )
 
     def _check_variables_before_run(self) -> bool:
@@ -418,6 +425,7 @@ class WebAutomationTab(QWidget):
             self._steps,
             project_variables=(self._current_store.load_all_variables()
                                if self._current_store else {}),
+            extra_names=self._library_vars(),
         )
         if not problems:
             return True

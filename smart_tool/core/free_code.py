@@ -78,6 +78,8 @@ class Function:
     name: str
     params: List[Param] = field(default_factory=list)
     signature: str = ""             # 原文里的签名（报错提示用）
+    line_start: int = 1             # 在用户原文里占第几行到第几行（含）
+    line_end: int = 1
 
     @property
     def param_names(self) -> List[str]:
@@ -118,7 +120,7 @@ class FreeCode:
         ast.fix_missing_locations(tree)
         return tree
 
-    def js_body(self, args: Dict[str, str], variables: Sequence[str] = (),
+    def js_body(self, variables: Sequence[str] = (),
                 timeout_ms: int = 30000) -> str:
         """生成网页里执行的 JS（用户在代码框里写的函数 + 自动调用）。"""
         main = self.main
@@ -179,17 +181,21 @@ class FreeCode:
 # ============================================================
 def analyze(code: str, lang: str = "python",
             variables: Sequence[str] = (), images: Sequence[str] = (),
-            require_func: bool = True) -> FreeCode:
+            require_func: bool = True,
+            require_file_paths: bool = True) -> FreeCode:
     """解析用户代码：找函数、认引用、做预处理。
 
     返回的 FreeCode.errors 是中文错误提示（空＝没问题）。
+
+    require_file_paths：`#文件` 没写路径算不算错。
+    自由代码节点算（没有调用方给它传路径），函数库里的函数不算（调用方给）。
     """
     lang = "javascript" if str(lang).lower().startswith("java") else "python"
     fc = FreeCode(lang=lang)
     if not (code or "").strip():
         return fc
     fc.source, fc.refs, files, fc.errors = _scan(
-        code, lang, set(variables or ()), set(images or ()))
+        code, lang, set(variables or ()), set(images or ()), require_file_paths)
     fc.funcs = _read_functions(fc.source, lang, files, fc.errors)
 
     if require_func and not fc.funcs:
@@ -238,6 +244,18 @@ def auto_args(fc: FreeCode, resolve=None) -> Dict[str, str]:
     return out
 
 
+def function_source(original: str, fn: Function) -> str:
+    """从用户原文里切出这个函数那一段（存进函数库时用，保留 @名字 写法）。
+
+    切的是**原文**（不是预处理后的代码），所以进函数库的代码还是原样可读，
+    而且只有这一个函数——别处调用它时不会误跑到同代码框里的另一个函数。
+    """
+    lines = (original or "").split("\n")
+    start = max(0, int(fn.line_start) - 1)
+    end = max(start + 1, int(fn.line_end))
+    return "\n".join(lines[start:end]).strip("\n")
+
+
 def parse_call_args(raw: str) -> List[Tuple[str, str]]:
     """「调用函数」节点的实参文本 → [(形参名, 值), …]。
 
@@ -260,9 +278,79 @@ def parse_call_args(raw: str) -> List[Tuple[str, str]]:
 # ============================================================
 # 内部：扫描 + 预处理
 # ============================================================
+# JS 里「等号左边的 @名字 / /图片名」：扫描时先记成写标记，最后统一改写成写回调用
+_JS_WRITE_RE = re.compile(
+    r"(?m)^([ \t]*)(__w_(?:var|img)_\d+__)[ \t]*(\+=|-=|\*=|/=|=)(?!=)(.*)$")
+
+
+def _is_js_assign(code: str, i: int) -> bool:
+    """这个位置后面紧跟着赋值吗（`=` / `+=` …，不是 `==`）。"""
+    return bool(re.match(r"[ \t]*(\+=|-=|\*=|/=|=)(?!=)", code[i:]))
+
+
+def _strip_js_comment(line: str) -> str:
+    """去掉行尾的 // 注释（字符串里的 // 不算，比如 https://）。"""
+    out, i, n = [], 0, len(line)
+    while i < n:
+        ch = line[i]
+        if ch in "\"'`":
+            j = _skip_string(line, i, ch)
+            out.append(line[i:j])
+            i = j
+            continue
+        if line[i:i + 2] == "//":
+            break
+        if line[i:i + 2] == "/*":
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _unbalanced(expr: str) -> bool:
+    """括号/花括号数量是不是对不上（对不上说明写回跨了行）。"""
+    depth, i, n = 0, 0, len(expr)
+    while i < n:
+        ch = expr[i]
+        if ch in "\"'`":
+            i = _skip_string(expr, i, ch)
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        i += 1
+    return depth != 0
+
+
+def _js_writes(source: str, refs: Dict[str, Tuple[str, str]],
+               errors: List[str]) -> str:
+    """把 JS 里「等号左边」的引用改写成写回调用（一行一个）。"""
+    def repl(m) -> str:
+        indent, holder, op, rest = m.group(1), m.group(2), m.group(3), m.group(4)
+        kind, name = refs[holder]
+        key = json.dumps(name, ensure_ascii=False)
+        expr = _strip_js_comment(rest).strip()
+        semi = ""
+        if expr.endswith(";"):
+            expr, semi = expr[:-1].rstrip(), ";"
+        if not expr or _unbalanced(expr):
+            errors.append(
+                f"「{name}」这一行写回要写在一行里（@名字 = 一行表达式），"
+                "多行的话请先算出来再赋给它")
+            return m.group(0)
+        if op != "=":
+            get = "__img_path__" if kind == KIND_IMG else "__get_var__"
+            expr = f"{get}({key}) {op[0]} ({expr})"
+        func = "__save_img__" if kind == KIND_IMG else "__set_var__"
+        return f"{indent}{func}({key}, {expr}){semi}"
+
+    return _JS_WRITE_RE.sub(repl, source)
+
+
 def _scan(code: str, lang: str, known_vars: Set[str],
-          known_imgs: Set[str]) -> Tuple[str, Dict[str, Tuple[str, str]],
-                                          Dict[str, str], List[str]]:
+          known_imgs: Set[str], require_paths: bool = True
+          ) -> Tuple[str, Dict[str, Tuple[str, str]], Dict[str, str], List[str]]:
     """逐字符走一遍：跳过字符串与注释，把引用换成占位符。
 
     返回 (改写后的代码, {占位符: (kind, 名字)}, {文件形参: 路径}, 错误列表)。
@@ -360,8 +448,10 @@ def _scan(code: str, lang: str, known_vars: Set[str],
                 if m:
                     name = m.group(1)
                     files[name] = ""
-                    errors.append(
-                        f"文件参数「#{name}」没写路径：写成 #{name}=D:/目录/文件.xlsx")
+                    if require_paths:
+                        errors.append(
+                            f"文件参数「#{name}」没写路径：写成 "
+                            f"#{name}=D:/目录/文件.xlsx")
                     out.append(f"{name}={_quote('', lang)}")
                     i += m.end()
                     prev_char, prev_word = ")", ""
@@ -371,10 +461,15 @@ def _scan(code: str, lang: str, known_vars: Set[str],
                     name, end = _take_name(code, i + 1, known_vars if kind == KIND_VAR
                                            else known_imgs)
                     if name:
-                        placeholder = cache.get((kind, name))
+                        # JS 里「等号左边」＝写回：先记成写标记，最后统一改写
+                        is_write = (lang == "javascript"
+                                    and _is_js_assign(code, end))
+                        key = (kind, name, is_write)
+                        placeholder = cache.get(key)
                         if placeholder is None:
-                            placeholder = f"__{kind}_{len(cache)}__"
-                            cache[(kind, name)] = placeholder
+                            tag = "w" if is_write else "r"
+                            placeholder = f"__{tag}_{kind}_{len(cache)}__"
+                            cache[key] = placeholder
                             refs[placeholder] = (kind, name)
                         out.append(placeholder)
                         i = end
@@ -388,7 +483,16 @@ def _scan(code: str, lang: str, known_vars: Set[str],
             prev_char, prev_word = c, ""
         i += 1
 
-    return "".join(out), refs, files, errors
+    text = "".join(out)
+    if lang == "javascript":
+        text = _js_writes(text, refs, errors)   # 等号左边的引用 → 写回调用
+        for holder, (kind, name) in refs.items():
+            if not holder.startswith("__r_"):   # 剩下的都是读取
+                continue
+            func = "__img_path__" if kind == KIND_IMG else "__get_var__"
+            text = text.replace(
+                holder, f"{func}({json.dumps(name, ensure_ascii=False)})")
+    return text, refs, files, errors
 
 
 def _skip_string(code: str, i: int, quote: str) -> int:
@@ -509,8 +613,11 @@ def _python_func(node, files: Dict[str, str]) -> Function:
                 has_default=d is not None))
     if args.vararg or args.kwonlyargs:
         pass                    # *args / 关键字参数不参与自动调用，忽略即可
+    start = min([int(node.lineno)] + [int(d.lineno) for d in node.decorator_list])
     return Function(name=node.name, params=params,
-                    signature=f"def {node.name}(...)")
+                    signature=f"def {node.name}(...)",
+                    line_start=start,
+                    line_end=int(getattr(node, "end_lineno", node.lineno)))
 
 
 def _js_functions(source: str, files: Dict[str, str]) -> List[Function]:
@@ -533,9 +640,46 @@ def _js_functions(source: str, files: Dict[str, str]) -> List[Function]:
                     params.append(Param(name=pname, kind="plain",
                                         default=pdefault.strip(),
                                         has_default=bool(sep)))
+            start, end = _js_func_span(source, m)
             out.append(Function(name=name, params=params,
-                                signature=f"function {name}(...)"))
+                                signature=f"function {name}(...)",
+                                line_start=source.count("\n", 0, start) + 1,
+                                line_end=source.count("\n", 0, end) + 1))
     return out
+
+
+def _js_func_span(source: str, m) -> Tuple[int, int]:
+    """从签名匹配处往后，找出整个函数（含大括号函数体）的起止位置。"""
+    n = len(source)
+    i = m.end()
+    while i < n and source[i].isspace():
+        i += 1
+    if i >= n or source[i] != "{":
+        # 箭头函数直接写表达式（没大括号）：算到这一行结束
+        k = source.find("\n", m.start())
+        return m.start(), (n if k < 0 else k)
+    depth, j = 0, i
+    while j < n:
+        ch = source[j]
+        if ch in "\"'`":
+            j = _skip_string(source, j, ch)
+            continue
+        if source[j:j + 2] == "//":
+            k = source.find("\n", j)
+            j = n if k < 0 else k
+            continue
+        if source[j:j + 2] == "/*":
+            k = source.find("*/", j + 2)
+            j = n if k < 0 else k + 2
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return m.start(), j + 1
+        j += 1
+    return m.start(), n
 
 
 def _split_params(raw: str) -> List[str]:

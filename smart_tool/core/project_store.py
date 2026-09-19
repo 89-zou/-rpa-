@@ -75,16 +75,12 @@ class Step:
     resume_timeout: int = 300             # 等待人工操作的最长秒数
     # 画布坐标 [x, y]（自由拖拽画布用；None 表示首次加载时自动排版）
     pos: Optional[List[float]] = None
-    # ---- script 专用：自由代码节点（当成一个函数用）----
-    # script_vars   ：入口参数。写法 `账号` 或 `标题=text`（变量名=形参名），
-    #                 逗号分隔；留空＝不设参数（脚本里用 vars 拿全部变量）
-    # script_output ：返回值写到哪个流程变量（脚本里 return 什么就写什么）；
-    #                 留空＝不写变量，只把返回值打进日志
+    # ---- script 专用：自由代码节点（写一个真正的函数，系统自动调用它）----
+    # script_code ：完整的函数定义。语法见 core/free_code.py：
+    #               #文件=路径 写在签名里；@名字 读写变量清单；/图片名 读写图片库
     script_lang: str = "python"           # python | javascript
     script_code: str = ""
-    script_output: str = ""
     script_timeout: int = 30              # 秒；到点中断（卡在等外部返回时拦不住）
-    script_vars: str = ""                 # 逗号分隔的变量名；空=传入全部变量
     # ---- call 专用：调用「函数库」里的函数（项目管理→函数库，一处定义多处调用）----
     # func_name ：函数名
     # func_args ：实参，写法 `形参名=值`（值可写 {{变量}} 或字面量），逗号分隔
@@ -168,17 +164,11 @@ class Step:
             d["script_lang"] = self.script_lang
             d["script_code"] = self.script_code
             d["script_timeout"] = self.script_timeout
-            if self.script_vars:
-                d["script_vars"] = self.script_vars
-            if self.script_output:
-                d["script_output"] = self.script_output
         if self.action == "call":
             d["func_name"] = self.func_name
             d["script_timeout"] = self.script_timeout
             if self.func_args:
                 d["func_args"] = self.func_args
-            if self.script_output:
-                d["script_output"] = self.script_output
         if self.action == "read_data":
             d["output_var"] = self.output_var
             d["data_cfg"] = dict(self.data_cfg or {})
@@ -240,9 +230,7 @@ class Step:
             pos=pos,
             script_lang=d.get("script_lang", "python"),
             script_code=d.get("script_code", ""),
-            script_output=d.get("script_output", ""),
             script_timeout=int(d.get("script_timeout", 30)),
-            script_vars=d.get("script_vars", ""),
             func_name=d.get("func_name", ""),
             func_args=d.get("func_args", ""),
             output_var=d.get("output_var", ""),

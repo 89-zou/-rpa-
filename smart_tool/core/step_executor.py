@@ -4,13 +4,15 @@
 纯 Python 实现，不依赖 PyQt6，可在命令行或 QThread 中运行。
 """
 import ast
+import base64
 import fnmatch
 import json
 import re
+import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urljoin
 
 from playwright.sync_api import (
@@ -18,7 +20,8 @@ from playwright.sync_api import (
 )
 
 from smart_tool.core import (
-    auth_store, blocks, datastore, desktop, image_locator, project_store,
+    auth_store, blocks, datastore, desktop, free_code, image_locator,
+    project_store,
 )
 from smart_tool.core import real_mouse as real_mouse_mod
 from smart_tool.core.blocks import Block
@@ -156,44 +159,23 @@ VAR_PATTERN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 LOOP_VARS = ("loop.item", "loop.index")
 # 运行时才有的变量前缀（{{loop.item.字段}} / {{loop.index}}）
 LOOP_PREFIX = "loop."
-#: 脚本里没写 return 时，兜底塞回去的那个「locals 快照」的标记键
-_LOCALS_KEY = "__script_locals__"
+# 图片库里认这些后缀（脚本里 /名字 找的就是它们）
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"}
 
 
-def _param_name(name: str) -> str:
-    """把变量名变成一个能当形参用的标识符（loop.item.标题 → loop_item_标题）。
-
-    中文是合法的 Python / JS 标识符，所以只替换点、横杠这类字符。
-    """
-    out = re.sub(r"\W", "_", str(name or "").strip(), flags=re.UNICODE)
-    out = out.strip("_") or "arg"
-    return f"_{out}" if out[0].isdigit() else out
-
-
-def _indent_code(code: str) -> str:
-    """把整段代码缩进一层（塞进函数体里）。
-
-    顺手把行首的 Tab 换成 4 个空格：不然「Tab 缩进的 if 块」套进函数后
-    会变成空格+Tab 混用，Python 直接报 TabError。
-    """
-    fixed = "\n".join(
-        re.sub(r"^\t+", lambda m: "    " * len(m.group(0)), line)
-        for line in str(code or "").split("\n")
-    )
-    return "\n".join(("    " + line) if line.strip() else line
-                     for line in fixed.split("\n"))
-
-
-def _script_line(err: Exception, step_id: int) -> str:
-    """从异常里找出「用户脚本的第几行」（我们包了一层函数，行号要减 1）。"""
-    tb = err.__traceback__
-    line = None
-    filename = f"<脚本节点{step_id}>"
-    while tb is not None:
-        if tb.tb_frame.f_code.co_filename == filename:
-            line = tb.tb_lineno
-        tb = tb.tb_next
-    return f"（第 {max(1, line - 1)} 行）" if line else ""
+def _image_ext_of(data: bytes) -> str:
+    """按文件头猜图片格式（脚本把 bytes 存回图片库时用）。"""
+    if data.startswith(b"\x89PNG"):
+        return ".png"
+    if data.startswith(b"\xff\xd8"):
+        return ".jpg"
+    if data.startswith(b"GIF8"):
+        return ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data.startswith(b"BM"):
+        return ".bmp"
+    return ".png"
 
 
 def _to_var_text(value: Any) -> str:
@@ -221,58 +203,6 @@ def _short_text(value: Any, limit: int = 120) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
-def parse_script_params(raw: str) -> List[Tuple[str, str]]:
-    """解析「入口参数」文本 → [(变量名, 形参名), …]。
-
-    写法：`账号`（变量名当形参名）或 `标题=text`（变量名=形参名），逗号分隔。
-    留空＝不设入口参数。编辑框做语法检查时也用这个，保证和执行时一致。
-    """
-    out: List[Tuple[str, str]] = []
-    for chunk in str(raw or "").replace("，", ",").split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        var, sep, param = chunk.partition("=")
-        var = var.strip()
-        param = param.strip() if sep else var
-        if var:
-            out.append((var, _param_name(param or var)))
-    return out
-
-
-def parse_func_params(raw: str) -> List[str]:
-    """函数的形参表（逗号分隔的名字，`单价, 倍数`）→ ["单价", "倍数"]。"""
-    return [chunk.strip() for chunk in str(raw or "").replace("，", ",").split(",")
-            if chunk.strip()]
-
-
-def parse_call_args(raw: str) -> List[Tuple[str, str]]:
-    """「调用函数」节点的实参 → [(形参名, 值), …]。
-
-    写法 `形参名=值`，值可写 {{变量}} 或字面量，逗号分隔（如 `单价={{价格}}, 倍数=2`）。
-    只写名字没写 `=` 的，当作「把同名变量传进去」。
-    """
-    out: List[Tuple[str, str]] = []
-    for chunk in str(raw or "").replace("，", ",").split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        name, sep, value = chunk.partition("=")
-        name = name.strip()
-        if not name:
-            continue
-        out.append((name, value.strip() if sep else f"{{{{{name}}}}}"))
-    return out
-
-
-def build_script_source(code: str, params: List[Tuple[str, str]]) -> str:
-    """把用户代码包成一个函数（执行与编辑时的语法检查共用同一份）。"""
-    names = ", ".join(p for _v, p in params)
-    return (f"def __run__({names}):\n"
-            f"{_indent_code(code)}\n"
-            f"    return {{'{_LOCALS_KEY}': locals()}}\n")
-
-
 class _ScriptTimeout(BaseException):
     """脚本超时的内部信号。
 
@@ -295,7 +225,7 @@ class _LoopGuard(ast.NodeTransformer):
     def _tick(self, node) -> ast.Expr:
         call = ast.Expr(value=ast.Call(
             func=ast.Name(id="__tick__", ctx=ast.Load()),
-            args=[ast.Constant(value=max(1, int(node.lineno) - 1))],   # 减掉包裹层那一行
+            args=[ast.Constant(value=max(1, int(node.lineno)))],
             keywords=[]))
         return ast.copy_location(call, node)
 
@@ -314,7 +244,8 @@ def step_var_fields(step: Step) -> List[str]:
              step.resume_url, step.resume_element, step.prompt,
              step.loop_expr, step.cond_expr,
              step.win_title, step.keys, step.text,
-             step.func_args]        # 调用函数：实参里可写 {{变量}}
+             step.func_args,           # 调用函数：实参里可写 {{变量}}
+             step.script_code]         # 自由代码：#文件的路径里可写 {{变量}}
     # 定位也可以是变量（如 {{登录框}}：元素定位存在变量清单里）
     if step.locator is not None and step.locator.type != "image":
         texts.append(step.locator.value)
@@ -366,11 +297,36 @@ def collect_variables(steps: List[Step]) -> List[str]:
     return found
 
 
-def produced_variables(steps: List[Step]) -> Dict[str, Step]:
+def library_written_vars(project_dir) -> List[str]:
+    """函数库里所有函数写回的变量名。
+
+    「调用函数」节点本身看不出会产出什么变量（代码在函数库里），
+    所以界面上做变量检查 / 变量下拉时把它一起传进去。
+    """
+    if not project_dir:
+        return []
+    out: List[str] = []
+    try:
+        store = project_store.ProjectStore(Path(project_dir))
+        for f in store.load_functions():
+            for name in free_code.written_vars(str(f.get("code") or ""),
+                                               str(f.get("lang") or "python")):
+                if name not in out:
+                    out.append(name)
+    except Exception:
+        pass                    # 函数库读不出来不算致命，别拦住界面
+    return out
+
+
+def produced_variables(steps: List[Step],
+                       extra_names: Optional[Sequence[str]] = None
+                       ) -> Dict[str, Step]:
     """会产出变量的节点 → 那个节点。
 
-    「读取数据」「采集数据」按配置产出；「自由代码」和「调用函数」按它填的
-    「返回写到」算（这样运行前的变量检查不会把它当成"没有来源"）。
+    「读取数据」「采集数据」按配置产出；「自由代码」按代码里 `@名字 = 值`
+    写回的名字算（这样运行前的变量检查不会把它当成"没有来源"）。
+    extra_names：函数库里的函数写回的变量名（「调用函数」节点用得到，
+    但要读函数库才知道，所以由调用方传进来）。
     """
     out: Dict[str, Step] = {}
     for s in steps:
@@ -381,9 +337,11 @@ def produced_variables(steps: List[Step]) -> Dict[str, Step]:
         elif s.action == "collect":
             for name in collect_outputs(s):
                 out.setdefault(name, s)
-        elif s.action in ("script", "call"):
-            name = (s.script_output or "").strip()
-            if name:
+        elif s.action == "script":
+            for name in free_code.written_vars(s.script_code or "", s.script_lang):
+                out.setdefault(name, s)
+        elif s.action == "call":
+            for name in (extra_names or ()):
                 out.setdefault(name, s)
     return out
 
@@ -404,15 +362,17 @@ def produced_loop_fields(node: Step) -> List[str]:
 
 
 def available_variables(steps: List[Step],
-                        project_variables: Optional[dict] = None) -> List[str]:
+                        project_variables: Optional[dict] = None,
+                        extra_names: Optional[Sequence[str]] = None) -> List[str]:
     """步骤里可以插入的变量名（变量下拉 / 提示用）。
 
-    顺序：自定义变量 → 读取 / 采集节点产出的变量 → 运行时变量
+    顺序：自定义变量 → 读取 / 采集 / 自由代码产出的变量 → 运行时变量
     （{{loop.index}} 与各产出节点的 {{loop.item.字段}}）。
     """
     names: List[str] = list(project_variables or {})
-    produced = produced_variables(steps)
+    produced = produced_variables(steps, extra_names)
     names.extend(produced)
+    names.extend(extra_names or ())
     names.extend(LOOP_VARS)
     for node in produced.values():
         names.extend(f"loop.item.{f}" for f in produced_loop_fields(node))
@@ -440,19 +400,21 @@ def loop_fields(steps: List[Step], start: Step) -> List[str]:
 
 
 def check_variables(steps: List[Step],
-                    project_variables: Optional[dict] = None) -> List[str]:
+                    project_variables: Optional[dict] = None,
+                    extra_names: Optional[Sequence[str]] = None) -> List[str]:
     """运行前检查变量是否有来源，返回问题清单（空 = 没问题）。
 
-    现在的变量只有三种来源：
+    变量的来源：
     1. 项目变量（手工加的账号密码之类）；
-    2. 「读取数据」节点产出的列表变量（循环用它遍历）；
-    3. 循环体内自动有的 {{loop.item}} / {{loop.item.字段}} / {{loop.index}}。
+    2. 「读取数据」/「采集数据」节点产出的列表变量（循环用它遍历）；
+    3. 「自由代码」里 `@名字 = 值` 写回的变量（extra_names：函数库里的函数写回的）；
+    4. 循环体内自动有的 {{loop.item}} / {{loop.item.字段}} / {{loop.index}}。
 
     重点盯「跑起来才发现是空的」：循环外引用了 loop.*、字段名写错、
     变量根本没来源。
     """
     proj_vars = set(project_variables or ())
-    produced = produced_variables(steps)
+    produced = produced_variables(steps, extra_names)
 
     # 每个循环块里能用的 loop.* 名字（按步骤 id 记）
     scope_by_id: Dict[int, set] = {}
@@ -1109,90 +1071,21 @@ class StepExecutor:
         return value
 
     # ------------------------------
-    # 自由代码节点（script）
+    # 自由代码节点（script）：写一个真正的函数，系统自动调用它
     # ------------------------------
-    def _script_scope(self, step: Step,
-                      params: Optional[List[Tuple[str, str]]] = None):
-        """脚本能看到的变量。
-
-        填了入口参数就只传那几个（脚本里用形参名拿）；留空＝全部变量可见
-        （老写法 vars["账号"] 照样能用）。
-        """
-        if params:
-            return {v: self.variables.get(v, "") for v, _p in params}
-        return dict(self.variables)
-
-    def _script_params(self, step: Step) -> List[Tuple[str, str]]:
-        """这个脚本的入口参数（见 parse_script_params）。"""
-        return parse_script_params(step.script_vars or "")
-
     def _run_script(self, step: Step):
-        """自由代码节点：把它当成一个函数来跑。
+        """跑用户写的函数（语法见 core/free_code.py）。
 
-        - 入口参数：脚本里直接用形参名（`账号` / `标题=text`），省得写 vars["..."]
-        - 返回值：脚本里 `return 值` 会写到「返回写到」那个变量；
-          没填的话，返回字典＝每个键写成一个变量，其余只打进日志
-        - 老写法一样有效：改 vars["x"]、或者 `result = {...}`（Python）
+        · 参数：#文件=路径 写在函数签名里（路径可以写 {{变量}}）
+        · 读变量：直接写变量名，或者 @名字
+        · 写回变量：@名字 = 值；存回图片库：/图片名 = 图片
         """
         code = step.script_code or ""
         if not code.strip():
-            self.log("  脚本为空，跳过。")
+            self.log("  代码为空，跳过。")
             return
-        lang = (step.script_lang or "python").lower()
-        params = self._script_params(step)
-        scope = self._script_scope(step, params)
-        args = {p: scope.get(v, "") for v, p in params}
-        timeout = max(1, int(step.script_timeout or 30))
-        label = "JavaScript" if lang == "javascript" else "Python"
-        detail = ("，入口参数：" + "、".join(args)) if args else "，没有入口参数"
-        self.log(f"  执行 {label} 脚本{detail}")
-
-        if lang == "javascript":
-            updated, logs, returned = self._exec_js(
-                step, code, scope, params, args, timeout)
-        else:
-            updated, logs, returned = self._exec_python(
-                step, code, scope, params, args, timeout)
-
-        self._finish_script(step, scope, updated, logs, returned, "脚本")
-
-    def _finish_script(self, step: Step, scope: Dict[str, str],
-                       updated: Dict[str, Any], logs: List[str],
-                       returned: Any, tag: str):
-        """脚本 / 函数跑完的收尾：打日志、写回变量、处理返回值、写「返回写到」。"""
-        for line in logs:
-            self.log(f"  [{tag}] {line}")
-
-        changed = []
-        for k, v in updated.items():
-            text = _to_var_text(v)
-            if self.variables.get(str(k)) != text:
-                changed.append(str(k))
-            # 脚本「产出」的变量：新造的，或者改过值的。
-            # 记下来是为了让它在循环里跨轮保留（入口参数原样传回去的不算）。
-            if str(k) not in scope or _to_var_text(scope.get(str(k))) != text:
-                self._script_written.add(str(k))
-            self.variables[str(k)] = text
-
-        # 返回值
-        out_var = (step.script_output or "").strip()
-        if returned is not None:
-            if out_var:
-                self._set_var(out_var, returned, changed)
-                self.log(f"  {tag}返回 → {out_var} = {_short_text(returned)}")
-            elif isinstance(returned, dict):
-                for k, v in returned.items():
-                    self._set_var(str(k), v, changed)
-                self.log(f"  {tag}返回一字典 → "
-                         + "、".join(str(k) for k in returned))
-            else:
-                self.log(f"  [{tag}] 返回：{_short_text(returned)}"
-                         "（没填「返回写到」，只记在这里）")
-        elif out_var:
-            self.log(f"  提示：{tag}没有 return，{out_var} 这次没写入。")
-
-        if changed:
-            self.log(f"  {tag}更新变量：{', '.join(sorted(set(changed)))}")
+        self._run_free_code(step, code, (step.script_lang or "python").lower(),
+                            {}, kind="script")
 
     # ------------------------------
     # 调用函数（函数库里的函数，一处定义多处调用）
@@ -1211,9 +1104,8 @@ class StepExecutor:
     def _run_call(self, step: Step):
         """调用「函数库」里的一个函数。
 
-        - 实参写法 `形参名=值`（值可写 {{变量}} 或字面量）；没写的形参＝空文本
-        - 函数里 return 的值写到「返回写到」那个变量（和自由代码节点一致）
-        - 函数里照样能用 vars / log / page，等于把那段代码搬到这里执行
+        实参写法 `形参名=值`（值可写 {{变量}} 或字面量）；没写的形参用函数
+        签名里的默认值（文件参数＝签名里写的那个路径）。
         """
         name = (step.func_name or "").strip()
         if not name:
@@ -1231,68 +1123,91 @@ class StepExecutor:
         if not code.strip():
             self.log(f"  函数「{name}」还没有代码，跳过。")
             return
-        lang = str(func.get("lang") or "python").lower()
-        params = [(p, _param_name(p)) for p in parse_func_params(func.get("params"))]
-        valid = {p for p, _ in params}
+        given = dict(free_code.parse_call_args(step.func_args or ""))
+        self._run_free_code(step, code, str(func.get("lang") or "python").lower(),
+                            given, kind="call")
 
-        given = dict(parse_call_args(step.func_args or ""))
+    def _run_free_code(self, step: Step, code: str, lang: str,
+                       given: Dict[str, str], kind: str):
+        """跑一段用户代码（自由代码节点 / 函数库里的函数）。
+
+        given：调用方给的实参（形参名 → 值，可写 {{变量}}）；自由代码节点没有
+        调用方，所以是空的——文件参数按签名里写的路径走。
+        """
+        fc = free_code.analyze(code, lang, list(self.variables), self._image_names(),
+                               require_file_paths=(kind == "script"))
+        if fc.errors:
+            raise ValueError("代码有问题：\n    " + "\n    ".join(fc.errors))
+        main = fc.main
+        who = (f"函数「{main.name}」" if kind == "call" else f"自由代码 {main.name}")
+
+        valid = set(main.param_names)
         unknown = [k for k in given if k not in valid]
         if unknown:
             raise ValueError(
-                f"函数「{name}」没有这些参数：{'、'.join(unknown)}。\n"
-                f"   它的入口参数是：{'、'.join(valid) or '（没有）'}"
-                "——在【项目管理…】→【函数库】里可以改。"
-            )
-        # 形参名 → 实际值（实参支持 {{变量}} 和字面量）；没传的按空文本
-        args = {p2: self._resolve_value(given.get(p1, "")) for p1, p2 in params}
-        scope = dict(self.variables)      # 函数里 vars[...] 照样能读全局变量
+                f"{who}没有这些参数：{'、'.join(unknown)}。\n"
+                f"   它的形参是：{'、'.join(valid) or '（没有）'}"
+                "——形参写在函数签名的括号里。")
+        args = free_code.auto_args(fc, resolve=self._resolve_value)
+        args.update({k: self._resolve_value(v) for k, v in given.items()})
+        for p in main.params:           # 文件参数没给路径：提一句，省得后面莫名其妙
+            if p.kind == free_code.KIND_FILE and not str(args.get(p.name) or "").strip():
+                self.log(f"  提示：文件参数「{p.name}」这次没有路径"
+                         "（函数里用到它就会报错）")
+
+        summary = "、".join(f"{k}={'（空）' if v == '' else _short_text(v, 40)}"
+                            for k, v in args.items())
+        self.log(f"  执行 {who}" + (f"：{summary}" if summary else ""))
+
         timeout = max(1, int(step.script_timeout or 30))
-
-        label = "JavaScript" if lang == "javascript" else "Python"
-        detail = ("，实参：" + "、".join(f"{k}={v}" for k, v in args.items())
-                  ) if args else "，没有参数"
-        self.log(f"  调用函数「{name}」（{label}）{detail}")
-
+        before = dict(self.variables)
         if lang == "javascript":
-            updated, logs, returned = self._exec_js(
-                step, code, scope, params, args, timeout)
+            returned, logs, js_vars, out_imgs = self._exec_free_js(
+                step, fc, args, timeout, who)
+            for k, v in js_vars.items():
+                if before.get(str(k)) != _to_var_text(v):
+                    self._write_var(str(k), v)
+            for img_name, value in out_imgs.items():
+                if value in (None, "", b""):
+                    continue
+                try:
+                    self._save_image_and_log(img_name, value)
+                except Exception as e:
+                    self.log(f"  图片「{img_name}」存回去失败：{e}")
         else:
-            updated, logs, returned = self._exec_python(
-                step, code, scope, params, args, timeout)
-        self._finish_script(step, scope, updated, logs, returned, "函数")
+            returned, logs = self._exec_free_python(step, fc, args, timeout, who)
 
-    def _set_var(self, name: str, value: Any, changed: Optional[List[str]] = None):
-        text = _to_var_text(value)
-        if self.variables.get(name) != text and changed is not None:
-            changed.append(name)
-        self._script_written.add(name)      # 脚本产出的：循环里要跨轮保留
-        self.variables[name] = text
+        for line in logs:
+            self.log(f"  [脚本] {line}")
+        if returned is not None:
+            self.log(f"  {who}返回：{_short_text(returned)}")
+        changed = [k for k, v in self.variables.items() if before.get(k) != v]
+        if changed:
+            self.log(f"  写回变量：{'、'.join(changed)}")
 
-    def _exec_python(self, step: Step, code: str, scope: Dict[str, str],
-                     params: List[Tuple[str, str]], args: Dict[str, str],
-                     timeout: int):
-        """进程内 exec；代码整体缩进塞进一个函数里，所以 return 能正常用。
+    # ------------------------------
+    # 自由代码 / 函数的执行
+    # ------------------------------
+    def _exec_free_python(self, step: Step, fc, args: Dict[str, str],
+                          timeout: int, who: str):
+        """本机跑用户写的 Python 函数：返回 (返回值, 日志)。
 
-        返回值：(更新后的 vars, 日志, 脚本 return 的值｜None)。
-
-        超时：编译前会给每个循环 / 函数体插一句「到点没」的检查，
-        所以死循环、超长循环会在超时那一刻被打断（进程内执行，page 照样能用）。
+        超时：编译前给每个循环体 / 函数体开头插一句「到点没」的检查，
+        所以死循环会在超时那一刻被打断（进程内执行，page 照样能用）。
         例外：卡在 time.sleep(600) 或浏览器调用这种「等外部返回」的写法上，
-        只能等它自己返回——所以页面上等元素请用 page.xxx(..., timeout=毫秒)。
+        只能等它自己返回——所以页面上等元素请写 page.xxx(..., timeout=毫秒)。
         """
-        who = "函数" if step.action == "call" else "脚本"
-        src = build_script_source(code, params)
-        filename = f"<脚本节点{step.id}>"
+        logs: List[str] = []
+        filename = f"<{who}>"
         try:
-            tree = ast.parse(src, filename)
+            tree = fc.python_tree(args)
         except SyntaxError as e:
-            line = max(1, int(e.lineno or 1) - 1)    # 减去包在外面的那一行
-            raise ValueError(f"Python {who}语法错误（第 {line} 行）：{e.msg}")
+            raise ValueError(
+                f"Python 代码语法错误（第 {int(e.lineno or 1)} 行）：{e.msg}") from None
         tree = _LoopGuard().visit(tree)
         ast.fix_missing_locations(tree)
         compiled = compile(tree, filename, "exec")
 
-        logs: List[str] = []
         deadline = time.monotonic() + timeout
 
         def __tick__(line: int):
@@ -1300,7 +1215,12 @@ class StepExecutor:
                 raise _ScriptTimeout(line)
 
         ns: Dict[str, Any] = {
-            "vars": dict(scope),
+            **self.variables,           # 变量直接当名字用（中文当标识符没问题）
+            "__args__": dict(args),
+            "__get_var__": self._get_var,
+            "__set_var__": self._write_var,
+            "__img_path__": self._image_path_or_raise,
+            "__save_img__": self._save_image_and_log,
             "log": lambda m: logs.append(str(m)),
             "page": self._page,
             "current_url": self._current_url(),
@@ -1308,87 +1228,175 @@ class StepExecutor:
             "__tick__": __tick__,
         }
         started = time.monotonic()
-        exec(compiled, ns)          # noqa: S102 - 运行用户自己的本地脚本
         try:
-            returned = ns["__run__"](**args)
+            exec(compiled, ns)          # noqa: S102 - 运行用户自己的代码
         except _ScriptTimeout as e:
             raise ValueError(
-                f"Python {who}超时：超过设定的 {timeout} 秒，已在第 {e.line} 行"
-                "附近中断。\n"
+                f"{who}超时：超过设定的 {timeout} 秒，已在第 {e.line} 行附近中断。\n"
                 "    （循环里的等待请用 page.xxx(..., timeout=毫秒)；"
                 "time.sleep 这种系统等待没法中断，只能等它自己醒）"
             ) from None
         except Exception as e:
-            raise ValueError(f"Python {who}出错{_script_line(e, step.id)}："
-                             f"{type(e).__name__}: {e}") from e
+            raise ValueError(
+                f"{who}出错{self._error_line(e, filename)}："
+                f"{type(e).__name__}: {e}{self._error_hint(e)}") from e
         used = time.monotonic() - started
         if used > timeout:
             self.log(f"  提示：{who}耗时 {used:.1f}s，已超过设定 {timeout}s"
                      "（卡在等外部返回的调用上时没法中断）")
+        return ns.get("__ret__"), logs
 
-        out = dict(ns.get("vars") or {})
-        locals_snapshot = {}
-        if isinstance(returned, dict) and set(returned) == {_LOCALS_KEY}:
-            locals_snapshot = returned.get("__script_locals__") or {}
-            returned = None         # 脚本没写 return，这只是我们兜底塞进去的
-        # 老写法：脚本可写 result = {...} 直接输出一组新变量
-        result = locals_snapshot.get("result")
-        if isinstance(result, dict):
-            out.update({str(k): v for k, v in result.items()})
-        return out, logs, returned
+    def _exec_free_js(self, step: Step, fc, args: Dict[str, str],
+                      timeout: int, who: str):
+        """在页面里跑用户写的 JS 函数。
 
-    def _exec_js(self, step: Step, code: str, scope: Dict[str, str],
-                 params: List[Tuple[str, str]], args: Dict[str, str],
-                 timeout: int):
-        """在页面上下文执行 JS（可直接操作 DOM）。返回 (vars, 日志, 返回值)。"""
+        返回 (返回值, 日志, 页面里的变量快照, 要存回图片库的东西)。
+        """
         if self._page is None:
-            raise RuntimeError("JavaScript 节点需要浏览器页面，但浏览器未启动")
-        names = ", ".join(p for _v, p in params)
-        # 超时用「赛跑」实现：脚本那边（可能是 await 一个不返回的 Promise）
-        # 跟一个到点就失败的计时器比谁先结束。同步死循环会把页面卡死，那种拦不住。
-        wrapper = (
-            "async (arg) => {\n"
-            "  const logs = [];\n"
-            "  const log = (m) => logs.push(String(m));\n"
-            "  const vars = arg.vars;\n"
-            "  const url = arg.url;\n"
-            "  let timer = null;\n"
-            "  const limit = new Promise((_ok, bad) => {\n"
-            "    timer = setTimeout(() => bad(new Error('__SCRIPT_TIMEOUT__')),\n"
-            "                       arg.timeout);\n"
-            "  });\n"
-            "  let ret;\n"
-            "  try {\n"
-            "    ret = await Promise.race([\n"
-            "      Promise.resolve().then(() =>\n"
-            "        (async function(" + names + "){\n"
-            + code +
-            "\n      }).apply(null, arg.args)),\n"
-            "      limit,\n"
-            "    ]);\n"
-            "  } finally { clearTimeout(timer); }\n"
-            "  return { vars: vars, logs: logs,\n"
-            "           ret: ret === undefined ? null : ret };\n"
-            "}"
-        )
+            raise RuntimeError(f"{who}是 JavaScript，需要浏览器页面，但浏览器没启动")
+        body = fc.js_body(variables=list(self.variables), timeout_ms=timeout * 1000)
         try:
-            res = self._page.evaluate(
-                wrapper,
-                {"vars": dict(scope), "url": self._current_url(),
-                 "timeout": timeout * 1000,
-                 "args": [args.get(p, "") for _v, p in params]},
-            )
+            res = self._page.evaluate(body, {
+                "vars": dict(self.variables),
+                "args": dict(args),
+                "imgs": self._image_map(),
+                "url": self._current_url(),
+                "project_dir": str(self.project_dir) if self.project_dir else "",
+            })
         except Exception as e:
             if "__SCRIPT_TIMEOUT__" in str(e):
                 raise ValueError(
-                    f"JavaScript 脚本超时：超过设定的 {timeout} 秒，已中断。"
-                ) from None
-            raise RuntimeError(f"JavaScript 脚本执行失败：{e}")
-
+                    f"{who}超时：超过设定的 {timeout} 秒，已中断。"
+                    "（同步死循环会把页面卡死，那种拦不住）") from None
+            raise RuntimeError(f"{who}执行失败：{e}") from e
         res = res or {}
-        out = dict(res.get("vars") or {})
         logs = [str(x) for x in (res.get("logs") or [])]
-        return out, logs, res.get("ret")
+        return (res.get("ret"), logs, dict(res.get("vars") or {}),
+                dict(res.get("imgs") or {}))
+
+    # ---- 变量 / 图片 的读写小工具（脚本里 @名字 / /图片 用）----
+    def _get_var(self, name: str) -> str:
+        return self.variables.get(str(name), "")
+
+    def _write_var(self, name: str, value: Any) -> str:
+        """写回变量清单（脚本里 `@名字 = 值` 走这里）。"""
+        text = _to_var_text(value)
+        self._script_written.add(str(name))     # 脚本产出的：循环里跨轮保留
+        self.variables[str(name)] = text
+        return text
+
+    def _image_names(self) -> List[str]:
+        """图片库里所有图片的名字（不含扩展名与带扩展名两种都算）。"""
+        return list(self._image_map())
+
+    def _image_map(self) -> Dict[str, str]:
+        """图片名 → 绝对路径（脚本里 /名字 用它，也整批传给 JS）。"""
+        out: Dict[str, str] = {}
+        if not self.project_dir:
+            return out
+        img_dir = Path(self.project_dir) / "img"
+        if not img_dir.is_dir():
+            return out
+        for p in sorted(img_dir.iterdir()):
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
+                out.setdefault(p.stem, str(p))
+                out.setdefault(p.name, str(p))
+        return out
+
+    def _image_path_or_raise(self, name: str) -> str:
+        path = self._image_map().get(str(name or "").strip())
+        if not path:
+            raise ValueError(
+                f"图片库里没有「{name}」这张图。\n"
+                f"   把图片放进项目 img/ 目录（文件名用 {name}.png），"
+                "或者在【项目管理…】→【图片库】里导入。")
+        return path
+
+    def _save_image_and_log(self, name: str, value: Any) -> str:
+        """脚本里 `/名字 = 图片` 走这里：存好并打一行日志。"""
+        rel = self._save_image(name, value)
+        self.log(f"  图片已存回图片库：{rel}")
+        return rel
+
+    def _save_image(self, name: str, value: Any) -> str:
+        """把图片存回图片库（img/名字.xxx），返回相对路径。"""
+        if not self.project_dir:
+            raise ValueError("这个脚本没有项目目录，存不回图片库。")
+        key = str(name or "").strip()
+        if not key:
+            raise ValueError("存图片时要写名字：`/名字 = 图片`")
+        img_dir = Path(self.project_dir) / "img"
+        img_dir.mkdir(parents=True, exist_ok=True)
+
+        def target(ext: str) -> Path:
+            if Path(key).suffix.lower() in IMAGE_EXTS:
+                return img_dir / key
+            return img_dir / f"{key}{ext}"
+
+        if isinstance(value, (str, Path)):
+            text = str(value).strip()
+            if text.startswith("data:image/"):          # JS 里截图回来常是这种
+                head, _, b64 = text.partition(",")
+                ext = ".png"
+                for key_name, e in (("jpeg", ".jpg"), ("jpg", ".jpg"),
+                                    ("png", ".png"), ("gif", ".gif"),
+                                    ("webp", ".webp")):
+                    if key_name in head.lower():
+                        ext = e
+                        break
+                path = target(ext)
+                path.write_bytes(base64.b64decode(b64))
+                return f"img/{path.name}"
+            src = Path(text)
+            if not src.is_absolute():
+                src = Path(self.project_dir) / src
+            if src.is_file():
+                path = target(src.suffix.lower() or ".png")
+                shutil.copyfile(src, path)
+                return f"img/{path.name}"
+            raise ValueError(f"要存回图片库的「{text}」不是一个存在的图片文件。")
+        if isinstance(value, (bytes, bytearray)):
+            data = bytes(value)
+            path = target(_image_ext_of(data))
+            path.write_bytes(data)
+            return f"img/{path.name}"
+        try:                                            # 装了 Pillow 才支持图片对象
+            from PIL.Image import Image as _PilImage
+            if isinstance(value, _PilImage):
+                path = target(".png")
+                value.save(path)
+                return f"img/{path.name}"
+        except ImportError:
+            pass
+        raise ValueError(
+            "存回图片库的图片只能是：图片文件路径、图片字节（bytes），"
+            "或者 Base64 / dataURL 文本。")
+
+    @staticmethod
+    def _error_line(err: Exception, filename: str) -> str:
+        """报错带行号（只认用户代码那个文件里的行）。"""
+        tb, line = err.__traceback__, None
+        while tb is not None:
+            if tb.tb_frame.f_code.co_filename == filename:
+                line = tb.tb_lineno
+            tb = tb.tb_next
+        return f"（第 {line} 行）" if line else ""
+
+    @staticmethod
+    def _error_hint(err: Exception) -> str:
+        """新手最容易踩的几个坑，顺手提示一下。"""
+        msg = str(err)
+        if "builtin_function_or_method" in msg:
+            return ("\n    （旧写法 vars[\"变量名\"] 已经不支持了："
+                    "读变量直接写名字，写回用 @名字 = 值）")
+        if isinstance(err, TypeError) and "str" in msg and "int" in msg:
+            return "\n    （变量清单里的值都是文本，要算数先 int(...) / float(...)）"
+        if isinstance(err, NameError):
+            return ("\n    （这个名字没定义：要读变量清单里的变量，"
+                    "直接写名字或 @名字）")
+        if isinstance(err, KeyError):
+            return "\n    （字典里没有这个键，先确认一下读到的内容）"
+        return ""
 
     # ------------------------------
     # 动作（桌面场景）

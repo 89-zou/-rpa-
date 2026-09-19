@@ -249,14 +249,13 @@ def step_summary(s: Step, branch_text: str = "") -> List[str]:
             if line.strip():
                 first = line.strip()
                 break
-        return [f"{lang} 脚本：{first[:40]}" if first else f"{lang} 脚本（未填代码）"]
+        return [f"{lang} 函数：{first[:40]}" if first else f"{lang} 函数（未填代码）"]
     if s.action == "call":
         head = (f"调用：{(s.func_name or '').strip()}" if (s.func_name or "").strip()
                 else "（还没选函数）")
         tail = (f"参数：{(s.func_args or '').strip()}" if (s.func_args or "").strip()
-                else "不传参数")
-        var = (s.script_output or "").strip()
-        return [head, tail + (f"　→ {{{{{var}}}}}" if var else "")]
+                else "不传参数，按函数里的默认值走")
+        return [head, tail]
     return []
 
 

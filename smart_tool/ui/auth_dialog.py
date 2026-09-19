@@ -294,7 +294,9 @@ class AuthDialog(QDialog):
     def _refresh_var_combo(self):
         """「插入变量 ▾」：本项目的变量（自定义 + 读取/采集节点产出的）。"""
         names = (step_executor.available_variables(
-            self.steps, self.store.load_all_variables()) if self.store else [])
+            self.steps, self.store.load_all_variables(),
+            step_executor.library_written_vars(self.store.dir))
+            if self.store else [])
         self.var_combo.blockSignals(True)
         self.var_combo.clear()
         self.var_combo.addItem("插入变量 ▾", "")
