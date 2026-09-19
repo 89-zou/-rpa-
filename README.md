@@ -63,7 +63,7 @@
 需要 **Windows 10/11**、**Python 3.11+**（开发用的是 3.13）。
 
 ```bat
-git clone <你的仓库地址> smart_tool
+git clone https://github.com/89-zou/-rpa-.git smart_tool
 cd smart_tool
 
 :: 1) 建虚拟环境、装依赖（一定要装在项目里的 .venv，别装全局）
@@ -198,7 +198,7 @@ powershell -ExecutionPolicy Bypass -File packaging\build.ps1
 **Quick start (Windows, Python 3.11+)**
 
 ```bat
-git clone <your-repo-url> smart_tool
+git clone https://github.com/89-zou/-rpa-.git smart_tool
 cd smart_tool
 py -3 -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
