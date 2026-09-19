@@ -26,6 +26,9 @@ from PyQt6.QtWidgets import (
 )
 
 from smart_tool.core.project_store import Locator, Step
+from smart_tool.core.step_executor import (
+    build_script_source, parse_script_params,
+)
 from smart_tool.ui.collect_panel import CollectPanel
 from smart_tool.ui.desktop_picker import DesktopPickerDialog
 from smart_tool.ui.element_picker_dialog import (
@@ -81,33 +84,60 @@ COND_MODES = [
 SCRIPT_LANGS = [("python", "Python（本地执行）"),
                 ("javascript", "JavaScript（在网页里执行）")]
 
-# 脚本节点可用的对象说明（放在【?】里）
+# 脚本节点说明（放在【?】里）
 SCRIPT_HINT_PY = (
-    "在本地执行 Python 代码，能读写流程变量。\n"
+    "把它当成一个函数来用：上面「入口参数」是形参，脚本里 return 的是返回值。\n"
     "\n"
-    "可用对象：\n"
-    "  vars        —— 当前变量字典（可读写，改完自动写回流程变量）\n"
+    "【入口参数】写 `账号` 或 `标题=text`（变量名=形参名），逗号分隔。\n"
+    "脚本里直接用形参名：\n"
+    "    标题 = 标题.strip()\n"
+    "    首次见到 = 账号\n"
+    "留空＝不设参数表，这时脚本里用 vars[\"变量名\"] 拿（老写法一直有效）。\n"
+    "\n"
+    "【返回值】脚本里 return 什么，就写到「返回写到」那个变量。\n"
+    "· 返回单个值（文本/数字/列表/字典都行）：写到那一个变量；\n"
+    "· 没填「返回写到」时：返回字典＝每个键写成一个变量；返回别的值＝只打进日志；\n"
+    "· 列表 / 字典会自动存成 JSON，所以「脚本返回一个列表 → 循环遍历它」能直接用。\n"
+    "\n"
+    "【还能拿到什么】\n"
+    "  vars        —— 全部（或你声明的）流程变量，可读可写\n"
     "  log()       —— 输出一行日志到运行窗口\n"
-    "  page        —— Playwright 页面对象，可直接操作浏览器\n"
+    "  page        —— Playwright 页面对象，可直接操作浏览器（网页场景）\n"
     "  current_url / project_dir —— 当前网址、项目目录\n"
     "\n"
-    "输出新变量：脚本里写 result = {\"新变量\": 值}，\n"
-    "（也可以直接改 vars[\"某个变量\"]，改完同样会写回。）\n"
+    "【这是个完整的本机 Python】没有沙箱：能 import 库、读写文件、发网络请求。\n"
+    "要用什么就在脚本里自己 import（外面的 import 带不进来）。\n"
     "\n"
-    "注意：Python 脚本无法强制中断，请自行避免死循环；\n"
-    "「超时」只用于提示，到点了也不会硬停。"
+    "【报错】脚本抛异常会让这一步失败、流程停下（出错信息带行号）。\n"
+    "「某条数据不规整就跳过」这类场景，自己在脚本里 try/except 包一层。\n"
+    "\n"
+    "【注意】Python 脚本无法强制中断：死循环会让流程卡在这一步，\n"
+    "「执行超时」只做事后提示，不会真把它掐掉。"
 )
 SCRIPT_HINT_JS = (
-    "在网页里执行 JavaScript，直接操作 DOM。\n"
+    "在网页里执行 JavaScript，直接操作 DOM。同样当函数用：入口参数是形参、\n"
+    "return 是返回值。\n"
     "\n"
-    "可用对象：\n"
-    "  vars  —— 当前变量对象（如 vars[\"标题\"]，改完自动写回流程变量）\n"
+    "【入口参数】写法同 Python（`账号` 或 `标题=text`）。\n"
+    "\n"
+    "【返回值】脚本里 return 的值写到「返回写到」那个变量；\n"
+    "返回对象（{a: 1}）且没填「返回写到」时，每个键写成一个变量。\n"
+    "注意 return 之后代码就不执行了。\n"
+    "\n"
+    "【还能拿到什么】\n"
+    "  vars  —— 变量对象（vars[\"标题\"]，改了会自动写回流程变量）\n"
     "  log() —— 输出一行日志到运行窗口\n"
     "  url   —— 当前网址\n"
     "\n"
-    "例：vars[\"页数\"] = document.querySelectorAll(\".item\").length;\n"
+    "例：\n"
+    "    const n = document.querySelectorAll('.item').length;\n"
+    "    vars['条数'] = n;\n"
+    "    return n * 2;\n"
     "\n"
-    "注意：脚本在页面里跑，刷新页面就没了；要跨步骤传值就用 vars。"
+    "【注意】\n"
+    "· JS 跑在页面里，刷新页面就没了；要跨步骤留值就放到 vars 里。\n"
+    "· 桌面场景没有浏览器页面，JS 节点用不了（用 Python）。\n"
+    "· 取到的文本是页面原始文本，该 trim() 就 trim()。"
 )
 
 #: 【?】里的说明（界面上只留一句摘要）
@@ -625,7 +655,7 @@ class StepEditDialog(QDialog):
         # 被删除的分支行号（原下标），保存时由调用方据此删掉分支标记
         self._dropped_branches: list = []
 
-        # --- 自由代码节点（script）---
+        # --- 自由代码节点（script）：当成一个函数用 ---
         self.script_lang_combo = QComboBox()
         for key, label in SCRIPT_LANGS:
             self.script_lang_combo.addItem(label, key)
@@ -633,9 +663,11 @@ class StepEditDialog(QDialog):
 
         self.script_code = QPlainTextEdit()
         self.script_code.setPlaceholderText(
-            "# 在此写脚本，例如：\n"
-            "# vars[\"标题\"] = vars[\"file.parent_name\"].strip()\n"
-            "# log(\"已生成标题：\" + vars[\"标题\"])"
+            "# 把这个节点当成一个函数：上面传参进来，下面 return 出去\n"
+            "# 例如：\n"
+            "#   标题 = 标题.strip()\n"
+            "#   log('处理完：' + 标题)\n"
+            "#   return 标题 + '（已处理）'"
         )
         self.script_code.setMinimumHeight(190)
         mono = QFont("Consolas")
@@ -644,7 +676,7 @@ class StepEditDialog(QDialog):
         form.addRow("脚本代码：", self.script_code)
 
         self.script_hint = help_row(
-            "本地执行 Python 代码，能读变量、也能造新变量。",
+            "当成一个函数用：上面传参、下面 return 返回。",
             "Python 脚本", SCRIPT_HINT_PY)
         self.script_help_btn = self.script_hint.findChild(HelpButton)
         form.addRow("", self.script_hint)
@@ -657,14 +689,31 @@ class StepEditDialog(QDialog):
         script_layout = QHBoxLayout(script_row)
         script_layout.setContentsMargins(0, 0, 0, 0)
         self.script_vars = QLineEdit()
-        self.script_vars.setPlaceholderText("留空=传入全部变量；也可只写 row.标题, row.正文")
+        self.script_vars.setPlaceholderText(
+            "变量名，或用 变量名=形参名 改名，如：账号, 标题=text")
+        self.script_vars.setToolTip(
+            "脚本的入口参数（相当于函数参数表），逗号分隔：\n"
+            "· 直接写变量名 → 脚本里用同名变量拿它；\n"
+            "· 写 变量名=形参名 → 脚本里用形参名拿它（如 标题=text，脚本里用 text）。\n"
+            "留空＝不设参数表，脚本里用 vars[\"变量名\"] 拿（老写法照样能用）。"
+        )
         script_layout.addWidget(self.script_vars, 1)
         self.script_var_combo = QComboBox()
         self.script_var_combo.setMinimumWidth(160)
-        self.script_var_combo.setToolTip("选择后追加到传入变量")
+        self.script_var_combo.setToolTip("选择后追加到入口参数")
         self.script_var_combo.activated.connect(self._insert_script_var)
         script_layout.addWidget(self.script_var_combo)
-        form.addRow("传入变量：", script_row)
+        form.addRow("入口参数：", script_row)
+
+        self.script_output = QLineEdit()
+        self.script_output.setPlaceholderText(
+            "变量名；脚本里 return 的值写到它（留空＝不写变量，只打进日志）")
+        self.script_output.setToolTip(
+            "脚本 return 的东西写到哪个流程变量。\n"
+            "留空的话：返回字典＝每个键写成一个变量；返回别的值＝只打进运行日志。\n"
+            "填了它，运行前的「变量没有来源」检查就不会再误报这个变量。"
+        )
+        form.addRow("返回写到：", self.script_output)
 
         self.script_timeout = QSpinBox()
         self.script_timeout.setRange(1, 3600)
@@ -703,7 +752,7 @@ class StepEditDialog(QDialog):
         self._loop_widgets = [self.loop_expr_row, self.loop_hint]
         self._script_widgets = [
             self.script_lang_combo, self.script_code, self.script_hint,
-            script_row, self.script_timeout,
+            script_row, self.script_output, self.script_timeout,
         ]
         self._refresh_var_combos()
 
@@ -899,7 +948,7 @@ class StepEditDialog(QDialog):
         self.loop_expr_var_combo.setCurrentIndex(0)
 
     def _insert_script_var(self, index: int):
-        """把选中的变量追加到「传入变量」列表。"""
+        """把选中的变量追加到「入口参数」列表。"""
         name = self.script_var_combo.itemData(index)
         if not name:
             return
@@ -1207,8 +1256,9 @@ class StepEditDialog(QDialog):
 
         lang_idx = self.script_lang_combo.findData(s.script_lang or "python")
         self.script_lang_combo.setCurrentIndex(max(0, lang_idx))
-        self.script_code.setPlainText(s.script_code or "")
         self.script_vars.setText(s.script_vars or "")
+        self.script_output.setText(s.script_output or "")
+        self.script_code.setPlainText(s.script_code or "")
         self.script_timeout.setValue(s.script_timeout or 30)
         self._on_script_lang_changed()
 
@@ -1353,12 +1403,16 @@ class StepEditDialog(QDialog):
             if not self.script_code.toPlainText().strip():
                 errors.append("自由代码节点必须填写脚本代码")
             elif self.script_lang_combo.currentData() == "python":
-                # Python 脚本先做一次语法检查，避免运行到一半才报错
+                # Python 脚本先做一次语法检查，避免运行到一半才报错。
+                # 用和执行时同一套包装（代码是函数体，所以 return 是合法的）
                 try:
-                    compile(self.script_code.toPlainText(),
-                            "<脚本检查>", "exec")
+                    compile(build_script_source(
+                        self.script_code.toPlainText(),
+                        parse_script_params(self.script_vars.text())),
+                        "<脚本检查>", "exec")
                 except SyntaxError as e:
-                    errors.append(f"Python 脚本语法错误（第 {e.lineno} 行）：{e.msg}")
+                    line = max(1, int(e.lineno or 1) - 1)
+                    errors.append(f"Python 脚本语法错误（第 {line} 行）：{e.msg}")
 
         if errors:
             QMessageBox.warning(self, "内容不完整", "\n".join(f"· {e}" for e in errors))
@@ -1415,6 +1469,7 @@ class StepEditDialog(QDialog):
             step.script_lang = self.script_lang_combo.currentData()
             step.script_code = self.script_code.toPlainText()
             step.script_vars = self.script_vars.text().strip()
+            step.script_output = self.script_output.text().strip()
             step.script_timeout = self.script_timeout.value()
         elif action == "loop_start":
             step.loop_expr = self.loop_expr_edit.text().strip()

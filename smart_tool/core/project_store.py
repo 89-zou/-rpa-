@@ -75,9 +75,14 @@ class Step:
     resume_timeout: int = 300             # 等待人工操作的最长秒数
     # 画布坐标 [x, y]（自由拖拽画布用；None 表示首次加载时自动排版）
     pos: Optional[List[float]] = None
-    # ---- script 专用：自由代码节点 ----
+    # ---- script 专用：自由代码节点（当成一个函数用）----
+    # script_vars   ：入口参数。写法 `账号` 或 `标题=text`（变量名=形参名），
+    #                 逗号分隔；留空＝不设参数（脚本里用 vars 拿全部变量）
+    # script_output ：返回值写到哪个流程变量（脚本里 return 什么就写什么）；
+    #                 留空＝不写变量，只把返回值打进日志
     script_lang: str = "python"           # python | javascript
     script_code: str = ""
+    script_output: str = ""
     script_timeout: int = 30              # 秒（JS 生效；Python 无法强制中断）
     script_vars: str = ""                 # 逗号分隔的变量名；空=传入全部变量
     # ---- read_data 专用：读文件 / 文件夹，产出一个「列表变量」 ----
@@ -160,6 +165,8 @@ class Step:
             d["script_timeout"] = self.script_timeout
             if self.script_vars:
                 d["script_vars"] = self.script_vars
+            if self.script_output:
+                d["script_output"] = self.script_output
         if self.action == "read_data":
             d["output_var"] = self.output_var
             d["data_cfg"] = dict(self.data_cfg or {})
@@ -221,6 +228,7 @@ class Step:
             pos=pos,
             script_lang=d.get("script_lang", "python"),
             script_code=d.get("script_code", ""),
+            script_output=d.get("script_output", ""),
             script_timeout=int(d.get("script_timeout", 30)),
             script_vars=d.get("script_vars", ""),
             output_var=d.get("output_var", ""),
