@@ -103,6 +103,10 @@ class Step:
     win_title: str = ""                  # win_activate：窗口标题里的一小段
     keys: str = ""                       # hotkey：要按的键，如 ctrl+s、enter
     click_times: int = 1                 # click：点几次（2＝双击）
+    # ---- group_start 专用：这个组合是「登录用」的 ----
+    # 运行时如果用的是有效登录态（cookie 还没过期），整个组合直接跳过，
+    # 不用再登一遍；登录态失效时会自动重跑整条流程，那时它照常执行。
+    skip_if_logged_in: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {"id": self.id, "action": self.action}
@@ -160,6 +164,8 @@ class Step:
             d["click_times"] = int(self.click_times)
         if self.pos is not None:
             d["pos"] = [float(self.pos[0]), float(self.pos[1])]
+        if self.skip_if_logged_in:
+            d["skip_if_logged_in"] = True
         return d
 
     @classmethod
@@ -203,6 +209,7 @@ class Step:
             win_title=d.get("win_title", ""),
             keys=d.get("keys", ""),
             click_times=int(d.get("click_times", 1) or 1),
+            skip_if_logged_in=bool(d.get("skip_if_logged_in")),
         )
 
 
@@ -258,6 +265,8 @@ class ProjectStore:
         )
         if old.get("real_mouse"):
             data["real_mouse"] = True     # 项目级开关，别被保存步骤时弄丢
+        if old.get("auth"):
+            data["auth"] = dict(old["auth"])   # 登录态配置同理
         scene_val = normalize_scene(
             scene if scene is not None else old.get("scene"))
         if scene_val == SCENE_DESKTOP:
@@ -298,6 +307,34 @@ class ProjectStore:
     def load_scene(self) -> str:
         """这个项目的场景：web（浏览器）/ desktop（桌面应用）。"""
         return normalize_scene(self.load().get("scene"))
+
+    def load_auth(self) -> Dict[str, str]:
+        """项目级登录态配置。
+
+        - name：运行时用哪个登录态（`auth/<name>.json`）；空＝不用登录态
+        - check_locator：**登录后才会出现的元素**（XPath）。用它做「体检」：
+          带上登录态打开第一个网页后，这个元素在＝还有效；不在＝失效，
+          执行器会自动清掉它、把整条流程重跑一遍（走完整登录步骤）。
+        """
+        raw = self.load().get("auth") or {}
+        return {
+            "name": str(raw.get("name") or ""),
+            "check_locator": str(raw.get("check_locator") or ""),
+        }
+
+    def save_auth(self, name: str, check_locator: str = ""):
+        """只更新登录态配置，其余保持不变。"""
+        data = dict(self.load())
+        name = str(name or "").strip()
+        data["auth"] = {
+            "name": name,
+            "check_locator": str(check_locator or "").strip(),
+        }
+        self._write(data)
+        if not name:
+            return
+        # 顺手把 auth 目录建出来：用户先去【登录态…】里看一眼也有地方放
+        (self.dir / "auth").mkdir(parents=True, exist_ok=True)
 
     @property
     def is_desktop(self) -> bool:

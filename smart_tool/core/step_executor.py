@@ -15,7 +15,7 @@ from playwright.sync_api import (
     Page, TimeoutError as PlaywrightTimeout, sync_playwright,
 )
 
-from smart_tool.core import blocks, desktop, image_locator
+from smart_tool.core import auth_store, blocks, desktop, image_locator
 from smart_tool.core import real_mouse as real_mouse_mod
 from smart_tool.core.blocks import Block
 from smart_tool.core.data_sources import DataSourceConfig, load_rows
@@ -327,6 +327,13 @@ class PauseHandle:
         self.manual_abort = threading.Event()
 
 
+class AuthExpired(Exception):
+    """登录态失效：中断这一轮，清掉登录态把整条流程重跑一遍。
+
+    不是"错误"，所以不会写「步骤出错」，只有 run() 里那一层会接住它。
+    """
+
+
 class StepExecutor:
     """执行一组步骤。"""
 
@@ -343,6 +350,7 @@ class StepExecutor:
         on_state: Optional[Callable[[str], None]] = None,
         real_mouse: bool = False,
         scene: str = "web",
+        auth: Optional[Dict[str, str]] = None,
     ):
         """
         :param project_dir: 项目目录，用于解析 locator.value 中相对路径的截图
@@ -357,6 +365,10 @@ class StepExecutor:
         :param real_mouse: 用 OS 级真实鼠标点击（pyautogui）代替合成事件，
                            给 canvas / 拖拽类站点用。默认关。
         :param scene: web（浏览器）/ desktop（桌面应用：全屏截图定位 + 系统鼠标键盘）。
+        :param auth: 项目级登录态配置 {"name": 用哪个, "check_locator": 登录后才有的元素}。
+                     name 非空时，启动浏览器就带上 `auth/<name>.json` 里的 cookie；
+                     第一个网页打开后做一次体检，失效就清掉重跑一遍（走完整登录），
+                     跑完把最新 cookie 存回去（续期）；第一次会自动创建。
         """
         self.steps = steps
         self.variables = variables or {}
@@ -372,6 +384,15 @@ class StepExecutor:
         self._real_mouse = None
         self._stop = False
         self._page: Optional[Page] = None
+        # ---- 登录态（cookie / localStorage 复用）----
+        auth = auth or {}
+        self._auth_name = str(auth.get("name") or "").strip()
+        self._auth_check_locator = str(auth.get("check_locator") or "").strip()
+        self._auth_path = (auth_store.state_path(self.project_dir, self._auth_name)
+                           if (self.project_dir and self._auth_name) else None)
+        self._auth_using = False        # 这一轮是不是带着登录态在跑
+        self._auth_checked = False      # 体检过了没有（只查第一次打开的网页）
+        self._auth_expired = False      # 体检不通过 → 别把坏的状态存回去
         # 显示编号：组合节点不占编号（显示成 2-4 这种范围），所以日志里不能直接用
         # step.id，否则跟画布上看到的数字对不上
         self._labels = {id(s): n for s, n
@@ -440,7 +461,13 @@ class StepExecutor:
             self.log(f"  处理页面弹窗失败：{str(e).splitlines()[0][:100]}")
 
     def run(self):
-        """启动浏览器并按块树执行步骤（循环 / 条件可互相嵌套）。"""
+        """启动浏览器并按块树执行步骤（循环 / 条件可互相嵌套）。
+
+        登录态：配了就用——启动就把 `auth/<名字>.json` 里的 cookie 带上，
+        第一个网页打开后做一次「体检」（查「登录后才有的元素」在不在）。
+        体检不过＝失效：把整条流程重跑一遍（这一遍不带登录态，会走完整的登录步骤），
+        跑完把最新 cookie 存回去。第一次运行时文件还不存在，会自动创建。
+        """
         nodes = blocks.parse(self.steps)
         if self.desktop:
             self._run_desktop(nodes)
@@ -452,9 +479,31 @@ class StepExecutor:
                 "   紧急情况把鼠标猛地甩到屏幕左上角可急停；"
                 "用不了时会自动退回普通点击。"
             )
+        use_auth = bool(self._auth_path) and self._auth_path.exists()
+        if use_auth:
+            self.log(f"使用登录态「{self._auth_name}」"
+                     f"（{auth_store.describe_path(self._auth_path)}）")
+            if not self._auth_check_locator:
+                self.log("   注意：没配「登录后才有的元素」，没法自动发现登录态失效。"
+                         "建议去【登录态…】里填一个（比如后台菜单的 XPath）。")
+        elif self._auth_path:
+            self.log(f"登录态「{self._auth_name}」还没保存过："
+                     "这次会走完整流程，跑完自动存一份，以后直接登录。")
+        try:
+            self._run_browser(nodes, use_auth=use_auth)
+        except AuthExpired:
+            self.log("登录态已失效 → 清掉它，按流程里的登录步骤重跑一遍。")
+            self._run_browser(nodes, use_auth=False)
+
+    def _run_browser(self, nodes: List[Any], use_auth: bool):
+        """开一个浏览器把流程跑一遍（use_auth＝这一轮带不带登录态）。"""
+        self._auth_using = bool(use_auth)
+        self._auth_checked = False
+        self._auth_expired = False
+        kwargs = {"storage_state": str(self._auth_path)} if use_auth else {}
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=self.headless)
-            context = browser.new_context()
+            context = browser.new_context(**kwargs)
             self._page = context.new_page()
             # 页面弹窗一律「确定」：Playwright 默认是「取消」，
             # 于是「确定要发布/离开吗」被点成了取消，操作会静默失败
@@ -462,9 +511,67 @@ class StepExecutor:
             try:
                 self._run_nodes(nodes)
             finally:
+                self._save_auth(context)
                 self.log("执行结束，关闭浏览器。")
                 browser.close()
                 self._page = None
+
+    # ------------------------------
+    # 登录态：体检 / 续期 / 登录组合跳过
+    # ------------------------------
+    def _maybe_check_auth(self):
+        """带登录态跑的时候，第一次打开网页后查一次「登录后才有的元素」。
+
+        在不在决定后面怎么走：在＝继续（登录那几步会被跳过）；不在＝失效，
+        抛 AuthExpired 让 run() 清掉登录态重跑一遍。
+        """
+        if self._auth_checked or not self._auth_using:
+            return
+        if not self._auth_check_locator:
+            return
+        self._auth_checked = True
+        try:
+            found = self._page.locator(
+                f"xpath={self._auth_check_locator}").count() > 0
+        except Exception as e:
+            self.log(f"  登录态体检出错（当作失效）：{str(e).splitlines()[0][:80]}")
+            found = False
+        if found:
+            self.log("  登录态体检通过：已经是登录状态（登录那几步会自动跳过）。")
+            return
+        self.log(f"  页面上没有「{self._auth_check_locator}」"
+                 "（登录后才有的元素）→ 判定登录态已失效。")
+        self._auth_expired = True
+        raise AuthExpired()
+
+    def _skip_group(self, block: Block) -> bool:
+        """「登录用」的组合：当前用的是有效登录态时整块跳过。"""
+        if not block.start.skip_if_logged_in or not self._auth_using:
+            return False
+        self.log(f"  【{block.start.title or '组合'}】是登录用的组合，"
+                 "当前用的是有效登录态 → 跳过。")
+        return True
+
+    def _save_auth(self, context):
+        """跑完把登录态存回去：第一次是新建，之后是续期（服务端会刷新 cookie）。"""
+        if not self._auth_path or self._auth_expired:
+            return
+        try:
+            state = context.storage_state()
+        except Exception as e:
+            self.log(f"  登录态保存失败：{str(e).splitlines()[0][:100]}")
+            return
+        if not (state or {}).get("cookies"):
+            self.log("  这次没拿到任何 cookie，先不写登录态文件（免得把好的覆盖了）。")
+            return
+        try:
+            self._auth_path.parent.mkdir(parents=True, exist_ok=True)
+            self._auth_path.write_text(
+                json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.log(f"  登录态已更新：{self._auth_name}"
+                     f"（{auth_store.describe_path(self._auth_path)}）")
+        except OSError as e:
+            self.log(f"  登录态保存失败：{e}")
 
     def _run_desktop(self, nodes: List[Any]):
         """桌面场景：不开浏览器，全屏截图定位 + 系统级鼠标键盘。"""
@@ -508,7 +615,10 @@ class StepExecutor:
         elif block.kind == "condition":
             self._run_condition(block)
         else:
-            # 分支、组合：结构壳子，按顺序把里面的节点跑一遍就行
+            # 分支：结构壳子，按顺序跑里面的节点
+            # 组合：如果是「登录用」的组合、而这次登录态还有效，整块跳过
+            if block.kind == "group" and self._skip_group(block):
+                return
             self._run_nodes(block.nodes)
 
     def _run_condition(self, block: Block):
@@ -694,6 +804,8 @@ class StepExecutor:
             if step.action != "delay" and step.wait_seconds and step.wait_seconds > 0:
                 self.log(f"  再固定等 {step.wait_seconds:g}s")
                 time.sleep(float(step.wait_seconds))
+        except AuthExpired:
+            raise                       # 「换条路重跑」，不是步骤出错，别写错误日志
         except Exception as e:
             self.log(f"  步骤出错: {e}")
             raise
@@ -976,6 +1088,8 @@ class StepExecutor:
                 f"   当前页面：{self._current_url() or '（空白页）'}\n"
                 f"   可以双击这一步，把「打开超时」调大（现在 {secs} 秒）。"
             ) from e
+        # 带登录态跑的话，趁第一次打开网页做一次「登录态体检」
+        self._maybe_check_auth()
 
     def _click(self, step: Step):
         if not step.locator:

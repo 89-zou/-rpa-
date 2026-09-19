@@ -195,6 +195,8 @@ class FlowEditorDialog(QDialog):
             "结构节点，设置只有一份（点配对的另一端也是编辑同一个块）；块可以嵌套，按缩进分层。\n"
             "块标记左边的 ▾ / ▸ 可以展开 / 收起（循环、条件、组合都行）；"
             "按住 Ctrl / Shift 多选几行 → 右键 →「合并选中节点」把它们收成一个组合并起名。\n"
+            "组合的右键菜单里还能标记「登录用」：运行时带着有效登录态就整块跳过，"
+            "不用再登一遍（配合【登录态…】使用）。\n"
             "每个块末尾都有「＋ 点击创建新节点」；所有改动立即保存。"
         )
         tip.setWordWrap(True)
@@ -386,6 +388,17 @@ class FlowEditorDialog(QDialog):
         act_rename.setEnabled(group_sp is not None)
         act_rename.triggered.connect(self._rename_group_selected)
         menu.addAction(act_rename)
+        if group_sp is not None:
+            marked = bool(self._steps[group_sp.start].skip_if_logged_in)
+            act_login = QAction(
+                "取消「登录用」标记" if marked else "标记为登录用（登录态有效时跳过）",
+                menu)
+            act_login.setToolTip(
+                "标记后：运行时带着有效登录态就直接跳过这个组合，不用再登一遍；\n"
+                "登录态失效时会自动重跑整条流程，那时它照常执行。")
+            act_login.triggered.connect(
+                lambda: self._toggle_login_group(group_sp.start))
+            menu.addAction(act_login)
         menu.addSeparator()
         if block_sp is not None:
             folded = block_sp.start in self._collapsed
@@ -472,6 +485,21 @@ class FlowEditorDialog(QDialog):
         self._steps[index].title = (
             (name or "").strip() or blocks.DEFAULT_GROUP_NAME)
         self._commit(select_index=index)
+
+    def _toggle_login_group(self, index: int):
+        """把某个组合标记为「登录用」／取消标记。
+
+        标记之后：运行时带着有效登录态就直接跳过它（不用再登一遍）；
+        登录态失效时会自动清掉重跑，那时它照常执行。
+        """
+        step = self._steps[index]
+        step.skip_if_logged_in = not step.skip_if_logged_in
+        self._commit(select_index=index)
+        name = step.title or "组合"
+        self.status_label.setText(
+            f"已自动保存；「{name}」"
+            + ("已标记为登录用：带着有效登录态时会自动跳过它"
+               if step.skip_if_logged_in else "已取消「登录用」标记"))
 
     def _span_of_marker(self, idx: int):
         """idx 正好是某个块的起始/结束标记 → 返回那个块。"""

@@ -110,9 +110,11 @@ def node_height_for(step: Step, lines: Optional[List[str]] = None) -> float:
     return HEADER_H + TYPE_LINE_H + max(1, len(lines)) * BODY_LINE_H + BODY_PAD * 2
 
 
-def group_card_lines(count: int) -> List[str]:
+def group_card_lines(count: int, skip_if_logged_in: bool = False) -> List[str]:
     """组合卡片上的正文：里面收了几步 + 去哪儿展开。"""
-    return [f"组合（{count} 个步骤）", "在【流程编辑…】里展开 / 取消组合"]
+    second = ("登录态有效时自动跳过（登录用）" if skip_if_logged_in
+              else "在【流程编辑…】里展开 / 取消组合")
+    return [f"组合（{count} 个步骤）", second]
 
 
 def step_summary(s: Step, branch_text: str = "") -> List[str]:
@@ -174,7 +176,10 @@ def step_summary(s: Step, branch_text: str = "") -> List[str]:
     if s.action == "condition_end":
         return ["条件体到此结束"]
     if s.action == "group_start":
-        return [s.title or "（未命名组合）", "把连着的一串步骤收成一张卡片"]
+        lines = [s.title or "（未命名组合）",
+                 "登录态有效时自动跳过（登录用）" if s.skip_if_logged_in
+                 else "把连着的一串步骤收成一张卡片"]
+        return lines
     if s.action == "group_end":
         return ["组合到此结束"]
     if s.action == "script":
@@ -827,7 +832,8 @@ class FlowCanvas(QWidget):
         if step.action != blocks.GROUP_START:
             return None
         sp = span_map.get(index)
-        return group_card_lines(blocks.inner_count(sp) if sp else 0)
+        return group_card_lines(blocks.inner_count(sp) if sp else 0,
+                                step.skip_if_logged_in)
 
     def apply_auto_layout(self):
         """对外入口：按当前宽度重排全部节点并刷新画布。"""
