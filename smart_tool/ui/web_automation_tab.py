@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QTextEdit, QVBoxLayout, QWidget,
 )
 
+from smart_tool import paths
 from smart_tool.core import blocks, datastore, real_mouse
 from smart_tool.core.project_store import (
     ProjectStore, Step, list_projects, rename_field_refs,
@@ -118,9 +119,29 @@ class WebAutomationTab(QWidget):
         self._flow_paused = False       # 流程里的「暂停等人工」节点正在等
         self._step_labels: dict = {}    # 步骤 id → 显示编号（组合不占编号）
         self._init_ui()
-        # 启动不自动载入项目：避免读盘/排版拖慢界面，由用户点【载入项目…】
+        # 启动就打开一个项目：优先「安装时指定的默认项目」，没有就找内置演示项目；
+        # 都没有（比如用户把演示项目删了）→ 保持空项目，自己去【新建项目…】。
         self._clear_project()
-        self._append_log("请点【新建项目…】创建，或【载入项目…】选择已有项目。")
+        if not self._open_default_project():
+            self._append_log("请点【新建项目…】创建，或【载入项目…】选择已有项目。")
+
+    def _open_default_project(self) -> bool:
+        """启动时默认载入哪个项目（失败＝保持空项目）。"""
+        try:
+            names = {p.name for p in list_projects()}
+            if not names:
+                return False
+            want = str(paths.load_config().get("default_project")
+                       or paths.DEMO_PROJECT_NAME)
+            if want not in names:
+                return False
+            if self._load_project(want):
+                self._append_log(f"已默认载入项目：{want}（不想要了在【项目管理…】里删掉，"
+                                 "下次启动就是空项目）")
+                return True
+        except Exception as e:                  # 默认项目载入失败不该拦住启动
+            self._append_log(f"默认项目没能载入：{e}")
+        return False
 
     # ------------------------------
     # UI 构建

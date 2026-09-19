@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 """程序入口。
 
-启动顺序：装异常钩子 → 显示启动海报（如果配了）→ 建主窗口（最慢的一步）
-→ 海报上的【进入程序】亮起来 → 用户确认后才显示主窗口。
+启动顺序（用户拿到 exe 后看到的顺序）：
+    第一次运行 → 先弹【安装向导】（选目录、构建环境、建快捷方式）
+    → 显示启动海报（加载完才让点，或者 8 秒后自动进）
+    → 主窗口（默认载入演示项目，删了就是空项目）。
 """
 import sys
 import traceback
 from datetime import datetime
 
 from PyQt6.QtGui import QFont, QIcon
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from smart_tool import paths
 from smart_tool.core import crash_guard
@@ -51,18 +53,37 @@ def install_crash_handler():
     sys.excepthook = hook
 
 
+def run_first_time_setup() -> bool:
+    """第一次运行先弹安装向导（选目录、构建环境、建捷径）。
+
+    用户取消也不拦着——直接标成「已处理过」，用默认目录继续，免得每次启动都弹。
+    """
+    if paths.load_config().get("installed"):
+        return False
+    from smart_tool.setup_wizard import SetupWizard
+
+    wizard = SetupWizard(first_run=True)
+    finished = wizard.exec() == QDialog.DialogCode.Accepted
+    if not finished:
+        paths.save_config(installed=True)
+    return True
+
+
 def main():
     app = QApplication(sys.argv)
     # Windows 下显式指定中文字体，避免回退到无 CJK 字形的字体
     font = QFont("Microsoft YaHei", 9)
     font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
     app.setFont(font)
-    # 窗口/任务栏图标（从 assets/logo.png 生成 .ico，缓存在数据目录）
+    # 窗口/任务栏图标（从 assets/logo.png 生成 .ico，缓存在配置目录）
     icon = paths.icon_file()
     if icon.is_file():
         app.setWindowIcon(QIcon(str(icon)))
     paths.ensure_dirs()
     install_crash_handler()
+
+    # 第一次运行：先把环境装好（数据目录、演示项目、浏览器内核、快捷方式）
+    run_first_time_setup()
 
     # 启动海报：先画出来，再去建主窗口（建窗口最慢，海报上会写进度）
     splash = AdSplash.try_create()
@@ -74,10 +95,10 @@ def main():
     window = MainWindow()
 
     if splash is not None:
-        splash.set_status("加载完成，点【进入程序】开始使用", 100)
+        splash.set_status("加载完成", 100)
         splash.set_ready()
         app.processEvents()
-        splash.exec()               # 等用户点【进入程序】（回车也行）
+        splash.exec()               # 等用户点【进入程序】，或者 8 秒后自动进
 
     window.show()
     sys.exit(app.exec())
