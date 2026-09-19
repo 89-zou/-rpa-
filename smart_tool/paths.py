@@ -23,6 +23,8 @@ from pathlib import Path
 #: 程序名（配置目录、快捷方式、窗口标题都用它）
 APP_NAME = "小邹RPA"
 AUTHOR = "@小邹"
+#: 内置演示项目的名字（安装时会被复制到用户数据目录，程序启动默认打开它）
+DEMO_PROJECT_NAME = "采集示例-登录与采集"
 
 #: 配置目录（用户级，永远可写）
 CONFIG_DIR = Path(os.environ.get("APPDATA") or Path.home()) / APP_NAME
@@ -118,8 +120,18 @@ def ensure_dirs():
 
 
 # ------------------------------
-# 资源：图标 / 海报
+# 资源：图标 / 海报 / 内置演示项目模板
 # ------------------------------
+def templates_dir() -> Path:
+    """内置模板目录（安装时从这儿把演示项目复制到用户数据目录）。"""
+    return ASSETS_DIR / "templates"
+
+
+def demo_template_dir() -> Path:
+    """演示项目模板的目录。"""
+    return templates_dir() / DEMO_PROJECT_NAME
+
+
 def logo_file() -> Path:
     """原始 logo（png，1024×1024 那种方图最合适）。"""
     return ASSETS_DIR / "logo.png"

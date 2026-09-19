@@ -3,19 +3,19 @@
 
 用法（main.py 里）：
 
-    splash = AdSplash.try_create(app)     # 没有海报文件 / 关了开关 → None
+    splash = AdSplash.try_create()          # 没有海报文件 → None
     if splash:
         splash.show(); app.processEvents()      # 先把海报画出来
     window = MainWindow()                       # 这一步最慢
     if splash:
-        splash.set_ready()                      # 加载完 → 按钮可用
-        splash.exec()                           # 等用户点【进入程序】
+        splash.set_ready()                      # 加载完 → 按钮可用 + 开始 8 秒倒计时
+        splash.exec()                           # 等用户点【进入程序】或倒计时结束
     window.show()
 
-海报文件放 `assets/求打赏.jpg`（换成 png 也行）；关掉它的开关在
-`%APPDATA%\\小邹RPA\\config.json` 里的 `show_ad`。
+海报文件放 `assets/求打赏.jpg`（换成 png 也行）。
+加载完成后再等 8 秒自动进入——用户不想等就自己点【进入程序】。
 """
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QDialog, QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton,
@@ -26,6 +26,8 @@ from smart_tool import paths
 
 #: 海报最大显示尺寸（等比缩放，不拉伸）
 MAX_POSTER_W, MAX_POSTER_H = 560, 430
+#: 加载完成后等几秒自动进入（用户点按钮就不用等）
+AUTO_ENTER_SECONDS = 8
 
 
 class AdSplash(QDialog):
@@ -100,6 +102,11 @@ class AdSplash(QDialog):
         if icon.is_file():
             self.setWindowIcon(QIcon(str(icon)))
         self._drag_from = None
+        # 加载完成后自动进入的倒计时（用户点按钮就提前进）
+        self._left = AUTO_ENTER_SECONDS
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._tick)
 
     # ------------------------------
     # 对外：状态 / 就绪
@@ -111,12 +118,26 @@ class AdSplash(QDialog):
             self.progress.setValue(max(0, min(100, int(percent))))
 
     def set_ready(self):
-        """加载完成：启用【进入程序】并聚焦它（回车也能进）。"""
+        """加载完成：启用【进入程序】、聚焦它，并开始 8 秒倒计时。"""
         self.progress.setValue(100)
         self.status_label.setText("加载完成 ✓")
-        self.hint.setText("点【进入程序】开始使用")
         self.enter_btn.setEnabled(True)
         self.enter_btn.setFocus()
+        self._left = AUTO_ENTER_SECONDS
+        self._update_hint()
+        self._timer.start()
+
+    def _update_hint(self):
+        self.hint.setText(
+            f"{self._left} 秒后自动进入（也可以直接点【进入程序】）")
+
+    def _tick(self):
+        self._left -= 1
+        if self._left <= 0:
+            self._timer.stop()
+            self.accept()               # 时间到＝自己进
+            return
+        self._update_hint()
 
     # ------------------------------
     # 无边框窗口：按住图能拖动
@@ -140,10 +161,11 @@ class AdSplash(QDialog):
     # ------------------------------
     @classmethod
     def try_create(cls, parent=None):
-        """海报文件在、开关也开着，才建这个窗口；否则返回 None（直接进程序）。"""
+        """海报文件在就建这个窗口；没有就返回 None（直接进程序）。
+
+        注意：海报页是**不能关掉**的（启动广告），所以这里不看任何开关。
+        """
         try:
-            if not paths.load_config().get("show_ad", True):
-                return None
             poster = paths.poster_file()
             if not poster.is_file():
                 return None

@@ -20,8 +20,8 @@ from playwright.sync_api import (
 )
 
 from smart_tool.core import (
-    auth_store, blocks, datastore, desktop, free_code, image_locator,
-    project_store,
+    auth_store, blocks, browser_setup, datastore, desktop, free_code,
+    image_locator, project_store,
 )
 from smart_tool.core import real_mouse as real_mouse_mod
 from smart_tool.core.blocks import Block
@@ -686,6 +686,9 @@ class StepExecutor:
         self._auth_using = bool(use_auth)
         self._auth_checked = False
         self._auth_expired = False
+        # 打包版不带浏览器内核：先看一眼，别让用户看到 Playwright 那句英文报错
+        if not self.desktop and not browser_setup.is_installed():
+            raise RuntimeError(browser_setup.hint())
         kwargs = {"storage_state": str(self._auth_path)} if use_auth else {}
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=self.headless)
