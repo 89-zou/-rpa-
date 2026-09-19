@@ -428,6 +428,13 @@ def _scan(code: str, lang: str, known_vars: Set[str],
         # ---- 标识符 ----
         if c.isalpha() or c == "_" or c == "$" or ord(c) > 127:
             m = re.match(r"[A-Za-z0-9_$\u4e00-\u9fff]+", code[i:])
+            if m is None:
+                # 非 ASCII 但不属于上面字符集的字符：中文全角标点（，。；""）、
+                # 日文假名、带音标的字母、emoji…… 这些不是「词」，原样当一个
+                # 普通字符输出就行 —— 千万别直接 m.group(0)，会崩在这儿。
+                out.append(c)
+                i, prev_char, prev_word = i + 1, c, ""
+                continue
             word = m.group(0)
             out.append(word)
             i += len(word)
