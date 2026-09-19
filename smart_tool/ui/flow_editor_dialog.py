@@ -20,9 +20,9 @@ from typing import List, Optional, Tuple
 from PyQt6.QtCore import QSize, Qt, QTimer
 from PyQt6.QtGui import QAction, QFont
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QDialog, QFormLayout, QFrame, QHBoxLayout,
-    QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
-    QMessageBox, QPushButton, QVBoxLayout, QWidget,
+    QAbstractItemView, QDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton,
+    QVBoxLayout, QWidget,
 )
 
 from smart_tool.core import blocks, project_store, step_executor
@@ -782,82 +782,92 @@ class FlowEditorDialog(QDialog):
 
 
 class GroupEditDialog(QDialog):
-    """编辑一个组合（画布上双击组合卡片时弹这个）。
+    """画布上的组合卡片：改名字，或者进去编辑里面某个节点。
 
-    【流程编辑】里能做的事这里只挑最常用的三件：改名、标记「登录用」、取消组合。
-    合并（选多个节点收成一个组合）还是得去【流程编辑】里多选——那需要列表。
+    画布上这张卡片只是「一层壳」：能改名字、能打开里面的节点逐个编辑。
+    **结构性改动（合并 / 取消组合 / 删除 / 登录用标记）只在【流程编辑…】里做**——
+    免得在画布上顺手一点就把流程结构改了。
+
+    :param build_items: 无参回调，返回 [(标题, 摘要, 行号), …]（每次刷新都重新问）
+    :param on_edit: 点某一行的「编辑」时调用 on_edit(行号)；返回后弹窗自己刷新
     """
 
-    def __init__(self, step: Step, count: int, number: str, parent=None):
+    def __init__(self, group: Step, number: str, build_items, on_edit,
+                 parent=None):
         super().__init__(parent)
-        self.setWindowTitle("编辑组合")
-        self.setMinimumWidth(460)
-        self._step = step
-        self.want_ungroup = False
+        self.setWindowTitle("组合")
+        self.setMinimumSize(600, 420)
+        self._build_items = build_items
+        self._on_edit = on_edit
 
         root = QVBoxLayout(self)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("组合名："))
+        self.name_edit = QLineEdit(group.title or blocks.DEFAULT_GROUP_NAME)
+        self.name_edit.setPlaceholderText(blocks.DEFAULT_GROUP_NAME)
+        row.addWidget(self.name_edit, 1)
+        root.addLayout(row)
         tip = QLabel(
-            f"这个组合里有 {count} 个步骤"
-            + (f"（编号 {number}）" if number else "")
-            + "。运行时会按顺序把它们跑完，就像收在一张卡片里一样。"
+            "改名字只影响画布上这张卡片显示的文字"
+            + (f"（它占的编号是 {number}）" if number else "")
+            + "；里面的步骤照旧按顺序一个个执行。"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#555555;")
         root.addWidget(tip)
 
-        form = QFormLayout()
-        form.setContentsMargins(0, 8, 0, 0)
-        self.name_edit = QLineEdit(step.title or blocks.DEFAULT_GROUP_NAME)
-        form.addRow("组合名：", self.name_edit)
+        root.addWidget(QLabel("里面的步骤（选中后点【编辑…】，或双击那一行）："))
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self.list_widget.itemDoubleClicked.connect(lambda _i: self._edit_selected())
+        root.addWidget(self.list_widget, 1)
 
-        self.chk_login = QCheckBox("登录态有效时整块跳过（登录用）")
-        self.chk_login.setChecked(bool(step.skip_if_logged_in))
-        self.chk_login.setToolTip(
-            "把「打开登录页 → 填账号 → 点登录」这几步收成一个组合并勾上它：\n"
-            "运行时带着有效的登录态就直接跳过这块，不用每次都登。"
-        )
-        form.addRow("", self.chk_login)
-        root.addLayout(form)
-
-        hint = QLabel(
-            "「登录用」组合要配合【项目管理…】→【登录态】使用："
-            "那边配好登录态和「登录后才有的元素」，这里勾上，登录步骤才会被跳过。"
-        )
-        hint.setWordWrap(True)
+        bottom = QHBoxLayout()
+        self.btn_edit = QPushButton("编辑…")
+        self.btn_edit.setToolTip("打开选中那一步的编辑框（改完立即生效）")
+        self.btn_edit.clicked.connect(self._edit_selected)
+        bottom.addWidget(self.btn_edit)
+        bottom.addStretch()
+        hint = QLabel("合并 / 取消组合 / 删除请在【流程编辑…】里做")
         hint.setStyleSheet("color:#888888;")
-        root.addWidget(hint)
-
-        root.addStretch()
-        btns = QHBoxLayout()
-        self.btn_ungroup = QPushButton("取消组合")
-        self.btn_ungroup.setToolTip("只去掉这层壳，里面的步骤一个都不删")
-        self.btn_ungroup.clicked.connect(self._accept_ungroup)
-        btns.addWidget(self.btn_ungroup)
-        btns.addStretch()
+        bottom.addWidget(hint)
         self.btn_cancel = QPushButton("取消")
         self.btn_cancel.clicked.connect(self.reject)
-        btns.addWidget(self.btn_cancel)
+        bottom.addWidget(self.btn_cancel)
         self.btn_ok = QPushButton("确定")
         self.btn_ok.setDefault(True)
         self.btn_ok.clicked.connect(self.accept)
-        btns.addWidget(self.btn_ok)
-        root.addLayout(btns)
+        bottom.addWidget(self.btn_ok)
+        root.addLayout(bottom)
 
-    def _accept_ungroup(self):
-        reply = QMessageBox.question(
-            self, "取消组合",
-            f"确定取消「{self.name_edit.text().strip() or '组合'}」这层组合吗？\n"
-            "里面的步骤一个都不会删，只是画布上重新变成一张张卡片。",
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+        self._refresh()
+
+    def _refresh(self):
+        """重列表里：里面的步骤可能刚被编辑过（摘要就变了）。"""
+        items = self._build_items()
+        self.list_widget.clear()
+        for title, summary, index in items:
+            item = QListWidgetItem(
+                title if not summary else f"{title}　｜　{summary}")
+            item.setSizeHint(QSize(0, 30))
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            item.setToolTip(f"{title}\n双击这一行（或选中后点【编辑…】）改它")
+            self.list_widget.addItem(item)
+        self.btn_edit.setEnabled(bool(items))
+        if items:
+            self.list_widget.setCurrentRow(0)
+
+    def _edit_selected(self):
+        item = self.list_widget.currentItem()
+        if item is None:
             return
-        self.want_ungroup = True
-        self.accept()
+        index = item.data(Qt.ItemDataRole.UserRole)
+        if index is None:
+            return
+        self._on_edit(int(index))
+        self._refresh()          # 编辑完可能改了摘要 / 名字，重新列一遍
 
     @property
     def group_name(self) -> str:
         return self.name_edit.text().strip() or blocks.DEFAULT_GROUP_NAME
-
-    @property
-    def skip_if_logged_in(self) -> bool:
-        return self.chk_login.isChecked()
