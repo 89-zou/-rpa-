@@ -28,7 +28,9 @@ from PyQt6.QtWidgets import (
 from smart_tool.core.project_store import Locator, Step
 from smart_tool.ui.collect_panel import CollectPanel
 from smart_tool.ui.desktop_picker import DesktopPickerDialog
-from smart_tool.ui.element_picker_dialog import drop_capture_image, pick_element
+from smart_tool.ui.element_picker_dialog import (
+    drop_capture_image, pick_element, save_captured_locator,
+)
 from smart_tool.ui.read_data_panel import ReadDataPanel
 from smart_tool.ui.screen_capture import ScreenCaptureDialog
 
@@ -293,6 +295,15 @@ class StepEditDialog(QDialog):
         self.capture_hint.setWordWrap(True)
         self.capture_hint.setStyleSheet("color: #0f766e;")
         form.addRow("", self.capture_hint)
+
+        self.locator_hint = QLabel(
+            "定位里可以写变量：捕获到的元素可以存成「元素定位」（捕获时会问你要不要存），"
+            "之后任何定位写 {{登录框}} 就能复用它——"
+            "改【项目管理…】→【变量清单】里的那一条，全项目跟着变。"
+        )
+        self.locator_hint.setWordWrap(True)
+        self.locator_hint.setStyleSheet("color: #888;")
+        form.addRow("", self.locator_hint)
 
         self.image_hint = QLabel(
             "直接用截图定位：可以用【捕获元素…】自动生成，"
@@ -578,7 +589,7 @@ class StepEditDialog(QDialog):
         self._navigate_widgets = [self.url_edit, self.nav_timeout]
         self._read_widgets = [self.read_panel]
         self._collect_widgets = [self.collect_panel]
-        self._locator_widgets = [self.locator_type, loc_row]
+        self._locator_widgets = [self.locator_type, loc_row, self.locator_hint]
         self._image_widgets = [self.image_hint, self.preview]
         self._value_widgets = [value_row, self.value_hint]
         self._wait_widgets = [self.wait_combo, self.wait_seconds]
@@ -937,7 +948,10 @@ class StepEditDialog(QDialog):
                 self.locator_type.setCurrentIndex(
                     max(0, self.locator_type.findData("xpath")))
                 warn = "" if count == 1 else f"（命中 {count} 个，建议核对）"
-                self.capture_hint.setText(f"已捕获：{desc} → {xpath}{warn}")
+                saved = save_captured_locator(self, self.project_dir, data)
+                more = (f"　已存成元素定位 {{{{{saved}}}}}（定位里写它就能复用）"
+                        if saved else "")
+                self.capture_hint.setText(f"已捕获：{desc} → {xpath}{warn}{more}")
             if image and not self.fallback_edit.text().strip():
                 self.fallback_edit.setText(image)
         else:

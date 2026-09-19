@@ -266,6 +266,25 @@ class ProjectStore:
     def load_variables(self) -> Dict[str, str]:
         return self.load().get("variables", {})
 
+    def load_locators(self) -> Dict[str, str]:
+        """「元素定位」变量：名字 → XPath（捕获元素时存下来的）。
+
+        它和自定义变量存的是同一个「名字 → 值」的东西，只是单独一组：
+        变量清单里分开展示，运行时一起注入，所以步骤里能直接写 {{登录框}}。
+        """
+        raw = self.load().get("locators", {}) or {}
+        return {str(k).strip(): str(v)
+                for k, v in raw.items() if str(k).strip()}
+
+    def load_all_variables(self) -> Dict[str, str]:
+        """运行时 / 变量下拉真正能用的全部变量＝自定义变量 + 元素定位。
+
+        两者重名时以「元素定位」为准（变量清单里会提示重名）。
+        """
+        merged = dict(self.load_variables())
+        merged.update(self.load_locators())
+        return merged
+
     def load_layout_version(self) -> str:
         """画布排版版本；与当前版本不一致时自动重排为横向布局。"""
         return self.load().get("layout", "") or ""
@@ -289,6 +308,8 @@ class ProjectStore:
             data["real_mouse"] = True     # 项目级开关，别被保存步骤时弄丢
         if old.get("auth"):
             data["auth"] = dict(old["auth"])   # 登录态配置同理
+        if old.get("locators"):
+            data["locators"] = dict(old["locators"])   # 元素定位同理
         scene_val = normalize_scene(
             scene if scene is not None else old.get("scene"))
         if scene_val == SCENE_DESKTOP:
@@ -298,6 +319,14 @@ class ProjectStore:
     def save_variables(self, variables: Dict[str, str]):
         """只更新变量，步骤保持不变。"""
         self.save(self.load_steps(), variables)
+
+    def save_locators(self, locators: Dict[str, str]):
+        """只更新「元素定位」，其余配置保持不变。"""
+        data = dict(self.load())
+        data["locators"] = {str(k).strip(): str(v)
+                            for k, v in (locators or {}).items()
+                            if str(k).strip()}
+        self._write(data)
 
     def load_canvas_edges(self) -> List[list]:
         """画布上手动连的箭头（纯展示，不参与执行）。

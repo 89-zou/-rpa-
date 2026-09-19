@@ -36,7 +36,7 @@ from smart_tool.ui.step_editor_dialog import StepEditDialog
 TAB_VARS, TAB_IMAGES, TAB_AUTH, TAB_DATA = 0, 1, 2, 3
 
 # 变量行类型（存在「来源」列的 UserRole 里，用来区分增删改行为）
-KIND_DATA, KIND_PROJECT = "data", "project"
+KIND_DATA, KIND_PROJECT, KIND_LOCATOR = "data", "project", "locator"
 
 COL_NAME, COL_VALUE, COL_SRC = range(3)
 PLACEHOLDER = "（运行时按项填充）"
@@ -122,16 +122,17 @@ class ProjectManagerDialog(QDialog):
         lay.setContentsMargins(0, 6, 0, 0)
 
         tip = QLabel(
-            "步骤里用 {{变量名}} 引用。变量只有三个来源：\n"
+            "步骤里用 {{变量名}} 引用。变量有四个来源：\n"
             "· 读取节点 ＝「读取数据」节点从文件/文件夹读到的："
             "第一行是它产出的列表变量（如 数据列表），"
             "下面几行是每个文件的字段（如 loop.item.标题）。\n"
             "· 采集节点 ＝「采集数据」节点从网页上采到的：列表采集配「循环」逐项遍历"
             "（循环里用 {{loop.item.字段}}），采当前页面用 {{变量.字段}}。\n"
-            "  这两类都是**只读展示**，不能在这里改或删；"
-            "点某行的【来源】就能跳进那个节点，换文件夹 / 改字段名都在那里做"
-            "（改名后别处的引用会自动跟着改）。\n"
-            "· 自定义创建 ＝ 手工加的（账号密码之类），可增删改，改完立即保存。\n"
+            "· 元素定位 ＝ 捕获元素时存下来的 XPath（名字 → XPath）。"
+            "任何步骤的「定位路径」里写 {{名字}} 就能复用它，改这一处全项目跟着变。\n"
+            "· 自定义创建 ＝ 手工加的（账号密码之类）。\n"
+            "前两类是**只读展示**（点【来源】跳进那个节点改配置）；"
+            "元素定位和自定义变量可以在这里直接改，改完立即保存。\n"
             "循环里的 {{loop.index}}（第几轮）不用配置。"
         )
         tip.setWordWrap(True)
@@ -155,8 +156,16 @@ class ProjectManagerDialog(QDialog):
 
         btns = QHBoxLayout()
         self.btn_var_add = QPushButton("添加变量")
+        self.btn_var_add.setToolTip("加一条自定义变量（账号密码之类）")
         self.btn_var_add.clicked.connect(self._add_var_row)
         btns.addWidget(self.btn_var_add)
+        self.btn_locator_add = QPushButton("添加元素定位")
+        self.btn_locator_add.setToolTip(
+            "加一条「元素定位」（名字 → XPath），步骤的定位里写 {{名字}} 就能复用；\n"
+            "平时用【捕获元素…】抓的时候也会自动问你要不要存一条。"
+        )
+        self.btn_locator_add.clicked.connect(self._add_locator_row)
+        btns.addWidget(self.btn_locator_add)
         self.btn_var_del = QPushButton("删除选中变量")
         self.btn_var_del.clicked.connect(self._del_var_rows)
         btns.addWidget(self.btn_var_del)
@@ -482,8 +491,8 @@ class ProjectManagerDialog(QDialog):
         self.btn_delete.setEnabled(len(stores) > 0)
         self.tabs.setEnabled(single)
         for w in (self.var_table, self.btn_var_add, self.btn_var_del,
-                  self.img_table, self.btn_img_import, self.btn_img_replace,
-                  self.btn_img_delete):
+                  self.btn_locator_add, self.img_table, self.btn_img_import,
+                  self.btn_img_replace, self.btn_img_delete):
             w.setEnabled(single)
         one = stores[0] if single else None
         self._store = one
@@ -528,11 +537,12 @@ class ProjectManagerDialog(QDialog):
     # 变量清单
     # ------------------------------
     def _load_var_list(self):
-        """刷新变量清单：读取 / 采集节点产出的变量 + 自定义变量。"""
+        """刷新变量清单：读取 / 采集节点产出的 + 元素定位 + 自定义变量。"""
         if self._store is None:
             return
         steps = self._store.load_steps()
         variables = self._store.load_variables()
+        locators = self._store.load_locators()
 
         self._loading = True
         self.var_table.setRowCount(0)
@@ -543,14 +553,19 @@ class ProjectManagerDialog(QDialog):
             self._append_data_node(s)
         for s in collectors:
             self._append_collect_node(s)
+        for name, xpath in locators.items():
+            self._append_row(name, xpath, "元素定位", KIND_LOCATOR)
         for k, v in variables.items():
             self._append_row(k, v, "自定义创建", KIND_PROJECT)
         self._loading = False
         self.data_label.setText(self._data_summary(readers))
-        self._set_status(
-            f"{len(readers)} 个读取节点、{len(collectors)} 个采集节点、"
-            f"{len(variables)} 个自定义变量"
-        )
+        status = (f"{len(readers)} 个读取节点、{len(collectors)} 个采集节点、"
+                  f"{len(locators)} 个元素定位、{len(variables)} 个自定义变量")
+        dups = sorted(set(locators) & set(variables))
+        if dups:
+            status += (f"；注意 {'、'.join(dups)} 既是元素定位又是自定义变量"
+                       "（运行时按元素定位取值，建议改掉一个）")
+        self._set_status(status)
 
     def _append_data_node(self, node: Step):
         """一个「读取数据」节点：列出它产出的变量与读到的每个文件字段。
@@ -629,13 +644,15 @@ class ProjectManagerDialog(QDialog):
         self.var_table.insertRow(row)
 
         name_item = QTableWidgetItem(name)
-        if kind == KIND_DATA:       # 读取节点产出的变量不让在这里改
+        if kind == KIND_DATA:       # 读取 / 采集节点产出的变量不让在这里改
             name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.var_table.setItem(row, COL_NAME, name_item)
 
         value_item = QTableWidgetItem(value)
-        if kind != KIND_PROJECT:    # 读取节点的值是运行时填的，不给改
+        if kind not in (KIND_PROJECT, KIND_LOCATOR):    # 节点产出的是运行时填的
             value_item.setFlags(value_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        value_item.setToolTip(
+            value if kind != KIND_LOCATOR else f"XPath：{value}")
         self.var_table.setItem(row, COL_VALUE, value_item)
 
         src_item = QTableWidgetItem(source)
@@ -657,12 +674,14 @@ class ProjectManagerDialog(QDialog):
         return int(item.data(Qt.ItemDataRole.UserRole + 1) or 0) if item else 0
 
     def _on_var_changed(self, item: QTableWidgetItem):
-        """改名 / 改值 → 立即保存（只对自定义变量生效）。"""
+        """改名 / 改值 → 立即保存（自定义变量与元素定位都算）。"""
         if self._loading or item.column() not in (COL_NAME, COL_VALUE):
             return
-        if self._row_kind(item.row()) != KIND_PROJECT:
-            return
-        self._save_variables()
+        kind = self._row_kind(item.row())
+        if kind == KIND_PROJECT:
+            self._save_variables()
+        elif kind == KIND_LOCATOR:
+            self._save_locators()
 
     def _on_var_clicked(self, row: int, col: int):
         """点「来源」列：跳进那个「读取数据」/「采集数据」节点去改配置。"""
@@ -684,7 +703,7 @@ class ProjectManagerDialog(QDialog):
         dlg = StepEditDialog(
             self._store.dir, old, self,
             variable_names=step_executor.available_variables(
-                steps, self._store.load_variables()),
+                steps, self._store.load_all_variables()),
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -712,6 +731,17 @@ class ProjectManagerDialog(QDialog):
         self.var_table.setCurrentCell(row, COL_NAME)
         self.var_table.editItem(self.var_table.item(row, COL_NAME))
 
+    def _add_locator_row(self):
+        """加一条「元素定位」：名字 → XPath（步骤的定位里写 {{名字}} 复用）。"""
+        if self._store is None:
+            return
+        self._loading = True
+        self._append_row("", "", "元素定位", KIND_LOCATOR)
+        self._loading = False
+        row = self.var_table.rowCount() - 1
+        self.var_table.setCurrentCell(row, COL_NAME)
+        self.var_table.editItem(self.var_table.item(row, COL_NAME))
+
     def _save_variables(self):
         """立即保存「自定义创建」的变量。"""
         if self._store is None:
@@ -728,8 +758,29 @@ class ProjectManagerDialog(QDialog):
         self._store.save_variables(variables)
         self._set_status(f"已保存 {len(variables)} 个自定义变量")
 
+    def _save_locators(self):
+        """立即保存「元素定位」；没填 XPath 的行丢掉（只写了名字还不算数）。"""
+        if self._store is None:
+            return
+        locators: Dict[str, str] = {}
+        for r in range(self.var_table.rowCount()):
+            if self._row_kind(r) != KIND_LOCATOR:
+                continue
+            name = self.var_table.item(r, COL_NAME)
+            value = self.var_table.item(r, COL_VALUE)
+            key = name.text().strip() if name else ""
+            xpath = value.text().strip() if value else ""
+            if key and xpath:
+                locators[key] = xpath
+        self._store.save_locators(locators)
+        dup = sorted(set(locators) & set(self._store.load_variables()))
+        self._set_status(
+            f"已保存 {len(locators)} 个元素定位"
+            + (f"；注意 {'、'.join(dup)} 与自定义变量重名，运行时按元素定位取值" if dup else "")
+        )
+
     def _del_var_rows(self):
-        """删除选中变量：自定义的删掉；读取节点产出的不让删。"""
+        """删除选中行：元素定位与自定义变量能删；节点产出的不让删。"""
         if self._store is None:
             return
         rows = sorted({i.row() for i in self.var_table.selectedIndexes()},
@@ -742,13 +793,15 @@ class ProjectManagerDialog(QDialog):
                 "「读取 / 采集节点」的变量不在这里删：\n"
                 "点它那一行的【来源】跳进节点，把对应字段删掉就行。",
             )
-        project_rows = [r for r in rows if self._row_kind(r) == KIND_PROJECT]
-        if project_rows:
+        editable = [r for r in rows
+                    if self._row_kind(r) in (KIND_PROJECT, KIND_LOCATOR)]
+        if editable:
             self._loading = True
-            for r in project_rows:
+            for r in editable:
                 self.var_table.removeRow(r)
             self._loading = False
             self._save_variables()
+            self._save_locators()
         self._load_var_list()
 
     def _set_status(self, text: str):
