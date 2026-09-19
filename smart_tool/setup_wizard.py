@@ -62,8 +62,10 @@ class BuildWorker(QThread):
         self.results: List[Tuple[bool, str]] = []
         #: 关键步骤（写配置、建数据目录）失败 → 程序没法正常用
         self.fatal = False
-        #: 是不是免安装模式（没往系统里装）
+        #: 免安装模式（没往系统里装）
         self.portable = False
+        #: 浏览器内核的情况：True 装好了 / False 试着装了但失败 / None 没勾（不用管）
+        self.browser_ok: Optional[bool] = None
         #: 程序被复制到别的位置时，那边的启动目标（用来重新启动）
         self.new_target: Optional[Dict[str, str]] = None
         self._bar = 0
@@ -143,12 +145,14 @@ class BuildWorker(QThread):
             self.results.append((True, "按你的选择跳过浏览器内核下载"))
             self.log.emit("跳过浏览器内核下载")
         elif browser_setup.is_installed():
+            self.browser_ok = True
             self.log.emit(f"浏览器内核已经装好了：{browser_setup.browsers_dir()}")
             self.results.append((True, "浏览器内核：已就绪（不用重下）"))
             self._step(88)
         else:
             self.log.emit("正在下载浏览器内核 Chromium（约 150 MB）…")
             ok = browser_setup.install(on_log=self._browser_log)
+            self.browser_ok = ok
             self.results.append((ok, "浏览器内核（Chromium）已装好" if ok else
                                  "浏览器内核没装成功（可以重跑安装向导再试）"))
             self._step(88)
@@ -416,6 +420,8 @@ class _BuildPage(QWizardPage):
         self.wizard_ref = wizard
         #: 关键步骤都成了没（写配置、建数据目录）——决定构建完能不能直接用
         self.can_continue = False
+        #: 环境真的准备好了没（决定【完成】按钮能不能点）
+        self.can_finish = False
         #: 程序被复制到别的位置时的启动目标
         self.new_target: Optional[Dict[str, str]] = None
         self.setTitle("正在安装 / 环境构建")
@@ -463,27 +469,56 @@ class _BuildPage(QWizardPage):
         self.log_box.verticalScrollBar().setValue(
             self.log_box.verticalScrollBar().maximum())
 
+    def isComplete(self) -> bool:
+        """环境真的准备好了没。
+
+        注意：光在 initializePage 里 setEnabled(False) 是拦不住的 —— Qt 在切页
+        之后会按 isComplete() 重新刷一次按钮状态，【完成】又会被点亮。所以这里
+        才是真正说了算的地方：没准备好就一直返回 False。
+        """
+        return self.can_finish
+
     def _on_done(self, ok: bool, results: list):
-        """ok = 关键步骤都成了（非关键的那几步失败也能接着用）。"""
+        """ok = 关键步骤都成了（非关键的那几步失败也能接着用）。
+
+        【完成】只在**环境真的准备好了**的时候才放开：
+        写配置 / 建项目目录这类关键步骤失败、或者浏览器内核该装没装上，
+        都算没准备好 —— 那会儿只能【上一步】回去改一改再重试，或者【取消】。
+        """
         self.wizard_ref.results = results
-        self.can_continue = ok
         self.new_target = getattr(self.worker, "new_target", None)
+        browser_ok = getattr(self.worker, "browser_ok", None)
+        ready = ok and browser_ok is not False
+        self.can_continue = ready
+        self.can_finish = ready
+
         lines = [("✓ " if flag else "✗ ") + text for flag, text in results]
         warn = [l for l in lines if l.startswith("✗")]
         self.log_box.appendPlainText("\n" + "\n".join(lines))
-        if ok and not warn:
+
+        if ready and not warn:
             self.status.setText("全部完成 ✓ 点【完成】就行")
-        elif ok:
+        elif ready:
             self.status.setText("可以用了 ✓ 上面带 ✗ 的那几步没成功，不影响使用")
+        elif browser_ok is False:
+            self.status.setText(
+                "环境还没准备好：浏览器内核没装上，先点【上一步】再点【下一步】重试"
+                "（或直接点【取消】）")
         else:
-            self.status.setText("关键步骤没成功（上面带 ✗ 的），先别急着用，点【完成】后可以重跑")
-        self.wizard_ref.button(QWizard.WizardButton.FinishButton).setEnabled(True)
-        self.wizard_ref.button(QWizard.WizardButton.BackButton).setEnabled(not ok)
+            self.status.setText(
+                "环境还没准备好（关键步骤没成功），先点【上一步】改一改再重试"
+                "（或直接点【取消】）")
+
+        finish = self.wizard_ref.button(QWizard.WizardButton.FinishButton)
+        finish.setEnabled(ready)
+        self.wizard_ref.button(QWizard.WizardButton.BackButton).setEnabled(not ready)
         self.wizard_ref.button(QWizard.WizardButton.CancelButton).setEnabled(True)
-        if not ok:
-            QMessageBox.warning(self, "有步骤没成功",
+        if not ready:
+            QMessageBox.warning(self, "还不能完成",
                                 "\n".join(warn) +
-                                "\n\n（点【完成】关掉向导后可以重跑一次）")
+                                "\n\n环境没准备好之前不能点【完成】。\n"
+                                "· 想重试：点【上一步】，再点【下一步】重新构建；\n"
+                                "· 不想装了：点【取消】（不会启动程序）。")
         elif warn and self.wizard_ref.first_run:
             QMessageBox.information(
                 self, "装好了，有几处没成功",

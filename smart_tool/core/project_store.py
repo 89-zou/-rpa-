@@ -355,6 +355,9 @@ class ProjectStore:
         )
         # 画布上手动连的箭头：纯展示，执行器不读，但改动步骤时必须原样保留
         data["canvas_edges"] = old.get("canvas_edges", [])
+        # 画布缩放（Ctrl+滚轮调的）：同理，保存步骤时别弄丢
+        if old.get("zoom"):
+            data["zoom"] = old["zoom"]
         data["layout"] = (
             layout_version if layout_version is not None
             else old.get("layout", "")
@@ -400,6 +403,21 @@ class ProjectStore:
         """只更新画布手动连线，其余配置保持不变。"""
         data = dict(self.load())
         data["canvas_edges"] = [[a, b] for a, b in edges]
+        self._write(data)
+
+    def load_canvas_zoom(self) -> float:
+        """画布缩放（Ctrl+滚轮调的那个）。没存过 / 不合法 → 0（＝按默认 100% 打开）。"""
+        try:
+            zoom = float(self.load().get("zoom") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        # 和画布自己的上下限对齐（0.2~5 倍），超出就当成没存过
+        return zoom if 0.2 <= zoom <= 5.0 else 0.0
+
+    def save_canvas_zoom(self, zoom: float):
+        """只更新画布缩放，其余配置保持不变。"""
+        data = dict(self.load())
+        data["zoom"] = round(float(zoom), 3)
         self._write(data)
 
     def load_real_mouse(self) -> bool:

@@ -674,6 +674,8 @@ class _View(QGraphicsView):
     MAX_SCALE = 5.0
     ZOOM_STEP = 1.15
 
+    zoom_changed = pyqtSignal(float)           # Ctrl+滚轮调过缩放（要落盘）
+
     def __init__(self, canvas: "FlowCanvas"):
         super().__init__()
         self._canvas = canvas
@@ -721,12 +723,19 @@ class _View(QGraphicsView):
             target = cur * factor
             if self.MIN_SCALE <= target <= self.MAX_SCALE:
                 self.scale(factor, factor)
+                self.zoom_changed.emit(self.current_scale())
             event.accept()
         else:
             super().wheelEvent(event)
 
     def current_scale(self) -> float:
         return self.transform().m11()
+
+    def set_zoom(self, value: float):
+        """直接设成某个缩放（打开项目时恢复上次调好的倍数）。"""
+        zoom = max(self.MIN_SCALE, min(self.MAX_SCALE, float(value)))
+        self.resetTransform()
+        self.scale(zoom, zoom)
 
     def _show_menu(self, pos):
         # 和双击一样「延后一拍」再发信号：
@@ -748,6 +757,7 @@ class FlowCanvas(QWidget):
     positions_changed = pyqtSignal()                       # 拖拽结束
     auto_layout_applied = pyqtSignal()                     # 自动排版完成（需落盘）
     edges_changed = pyqtSignal()                           # 手动连线增删（需落盘）
+    zoom_changed = pyqtSignal(float)                       # Ctrl+滚轮缩放（需落盘）
     connect_status = pyqtSignal(str)                       # 连线模式的状态提示
 
     def __init__(self, parent=None):
@@ -780,6 +790,16 @@ class FlowCanvas(QWidget):
         # 待排版：控件还没拿到真实宽度，先挂起，等显示/调整尺寸后再排
         self._layout_pending = False
         self._scene.selectionChanged.connect(self._on_scene_selection_changed)
+        # 视图缩放变化（Ctrl+滚轮）转给外面，由项目自己去存
+        self._view.zoom_changed.connect(self.zoom_changed.emit)
+
+    def current_scale(self) -> float:
+        """当前缩放倍数（1.0＝原始大小）。"""
+        return self._view.current_scale()
+
+    def set_zoom(self, value: float):
+        """恢复某个缩放倍数（打开项目时用）。"""
+        self._view.set_zoom(value)
 
     def set_placeholder_text(self, text: str):
         """设置空画布时的提示语。"""
