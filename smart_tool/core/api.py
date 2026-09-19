@@ -200,18 +200,20 @@ ACTION_SPECS: Dict[str, Dict[str, Any]] = {
     },
     "condition_start": {
         "label": "条件 if/else", "scenes": [SCENE_WEB, SCENE_DESKTOP],
-        "desc": "条件判断（系统会自动补上「分支」标记与「条件结束」）。"
-                "rule＝条件只提供数据，每个分支自带判断方式与值；"
-                "expr＝Python 表达式，结果 真/假 走第 1/2 个分支。",
+        "desc": "条件判断（系统会自动补上「条件结束」）。条件节点只负责给出判断的数据"
+                "（cond_expr），块里的每个动作节点自带 cond_op + cond_value，"
+                "从上往下第一个成立的执行；都不成立就整段跳过。"
+                "一个动作要好几步，先把它收成一个「组合」再挂规则。",
         "fields": [
             f("cond_mode", "str", "判断方式", default="rule",
               choices=["rule", "expr"]),
             f("cond_expr", "str", "判断的数据（rule，如 {{loop.item.标题}}）"
               "或 Python 表达式（expr，如 len({{loop.item.内容}}) > 500）", True),
-            f("cond_branches", "list",
-              "分支：[{\"name\":\"公示公告\",\"op\":\"contains\",\"value\":\"公示\"}]"
-              "（op 见 blocks.COND_OPS：contains / not_contains / eq / ne / "
-              "gt / lt / ge / le；op 留空＝兜底，必须放最后一个）", True),
+            f("cond_op", "str", "【写在块里的动作节点上】判断方式："
+              "contains / not_contains / eq / ne / gt / lt / ge / le；"
+              "留空＝兜底（上面都不成立时走它，必须放最后一个）"),
+            f("cond_value", "str", "【写在块里的动作节点上】要比较的值；"
+              "包含 / 不包含 / 等于 / 不等于 可写多个（逗号分隔＝任一命中）"),
         ],
     },
     "group_start": {
@@ -250,8 +252,8 @@ ACTION_SPECS: Dict[str, Dict[str, Any]] = {
         "fields": [f("wait_seconds", "float", "等几秒", True)],
     },
 }
-# 循环结束 / 条件结束 / 分支 / 组合结束 是结构标记，由系统自动补齐，不用手写
-AUTO_MARKERS = ("loop_end", "condition_end", "branch", "group_end")
+# 循环结束 / 条件结束 / 组合结束 是结构标记，由系统自动补齐，不用手写
+AUTO_MARKERS = ("loop_end", "condition_end", "group_end")
 
 
 def list_actions(scene: str = "") -> List[Dict[str, Any]]:
@@ -563,10 +565,7 @@ def _summary(step: Step) -> str:
     if a == "loop_end":
         return "循环结束"
     if a == "condition_start":
-        n = len(step.cond_branches or [])
-        return f"条件（{step.cond_mode}）{step.cond_expr}，{n} 个分支"
-    if a == "branch":
-        return "分支"
+        return f"条件（{step.cond_mode}）{step.cond_expr}"
     if a == "condition_end":
         return "条件结束"
     if a == "group_start":
@@ -657,9 +656,6 @@ def _step_from_dict(d: Dict[str, Any]) -> Step:
                                     image=str(loc.get("image") or ""))
         else:
             raise ApiError("locator 要么写 XPath 字符串，要么写 {type,value,image}")
-    if action == "condition_start" and not d.get("cond_branches"):
-        kw["cond_branches"] = [blocks.new_branch("分支 1", op="contains"),
-                               blocks.new_branch("兜底")]
     if action == "collect" and d.get("collect_fields"):
         kw["collect_fields"] = [dict(x) for x in d["collect_fields"] if isinstance(x, dict)]
     if action == "read_data" and d.get("data_cfg"):
@@ -674,8 +670,7 @@ def _step_from_dict(d: Dict[str, Any]) -> Step:
 
 
 def _finish(steps: List[Step]) -> List[Step]:
-    """保存前统一处理：补分支清单、重排 id。"""
-    blocks.normalize_branch_lists(steps)
+    """保存前统一处理：重排 id。"""
     for i, s in enumerate(steps, start=1):
         s.id = i
     return steps
@@ -698,7 +693,7 @@ def add_steps(project: str, steps: List[Dict[str, Any]],
     """加步骤（一次可以加一串）。
 
     at＝插到第几个步骤之前（0 开始；留空＝追加到最后）。
-    要插进某个循环/分支/组合里，就把 at 设成那个块的 body_end
+    要插进某个循环/条件/组合里，就把 at 设成那个块的 body_end
     （list_steps 的 blocks 里有）。
     加「循环 / 条件 / 组合」请用 add_loop / add_condition / add_group，
     它们会自动补配对标记。
@@ -803,41 +798,50 @@ def add_condition(project: str, cond_expr: str,
                   branches: Optional[List[Dict[str, Any]]] = None,
                   cond_mode: str = "rule", at: Optional[int] = None,
                   title: str = "", note: str = "") -> Dict[str, Any]:
-    """加一个条件判断（自动补「分支」标记与「条件结束」）。
+    """加一个条件判断（自动补「条件结束」）。
 
-    branches：[{"name": "公示公告", "op": "contains", "value": "公示",
-                "steps": [...这一步里的步骤...]}, ...]
+    branches：一个动作节点一条，顺序＝优先级：
+        [{"op": "contains", "value": "公示", "steps": [...这里的步骤...]}, …]
     · rule 模式：cond_expr 是「判断的数据」（如 {{loop.item.标题}}），
-      每个分支自带判断方式 op 与值 value（op 取值见 blocks.COND_OPS）；
-      op 留空＝兜底（无条件成立，必须放最后一个）。
-    · expr 模式：cond_expr 算出来 真/假 → 走第 1/2 个分支；
-      算出来是别的值 → 跟各分支的 value（逗号分隔可多个）比。
-    都不成立就整段跳过。
+      每条给的 op + value 写在**这一组的动作节点**上（op 留空＝兜底，放最后）；
+    · expr 模式：cond_expr 算出来 真/假 → 走第 1/2 组；
+      算出来是别的值 → 跟各组的 value（逗号分隔可多个）比。
+    一组里给多个步骤时自动收成一个「组合」——一个动作节点只能挂一条规则。
     """
     store = _store(project)
     steps = store.load_steps()
     pos = len(steps) if at is None else int(at)
-    items = branches or [{"name": "分支 1", "op": "contains"}, {"name": "兜底"}]
-    if len(items) < 1:
-        raise ApiError("至少要有一个分支")
+    items = branches or [{"op": "contains"}, {"op": ""}]
+    if not items:
+        raise ApiError("至少要有一个动作节点")
     new: List[Step] = [Step(id=0, action="condition_start", cond_mode=cond_mode,
-                            cond_expr=str(cond_expr), title=title, note=note,
-                            cond_branches=[blocks.new_branch(
-                                str(x.get("name") or f"分支 {i + 1}"),
-                                str(x.get("op") or ""),
-                                str(x.get("value") or ""))
-                                for i, x in enumerate(items)])]
+                            cond_expr=str(cond_expr), title=title, note=note)]
     body_ranges = []
     for item in items:
-        new.append(Step(id=0, action="branch"))
+        op = str(item.get("op") or "")
+        value = str(item.get("value") or "")
+        body = [_step_from_dict(x) for x in (item.get("steps") or [])]
         start = len(new)
-        new.extend([_step_from_dict(x) for x in (item.get("steps") or [])])
+        if not body:
+            new.append(Step(id=0, action="note", text="",
+                            title="（这一条还没有动作）", cond_op=op,
+                            cond_value=value))
+        elif len(body) == 1:
+            body[0].cond_op = op
+            body[0].cond_value = value
+            new.extend(body)
+        else:
+            new.append(Step(id=0, action=blocks.GROUP_START,
+                            title=str(item.get("name") or ""), cond_op=op,
+                            cond_value=value))
+            new.extend(body)
+            new.append(Step(id=0, action=blocks.GROUP_END))
         body_ranges.append([pos + start, pos + len(new) - 1])
     new.append(Step(id=0, action="condition_end"))
     result = steps[:pos] + new + steps[pos:]
     _save_checked(store, result)
     return {"range": [pos, pos + len(new) - 1], "branch_bodies": body_ranges,
-            "summary": f"条件（{cond_mode}）{cond_expr}，{len(items)} 个分支"}
+            "summary": f"条件（{cond_mode}）{cond_expr}，{len(items)} 个动作节点"}
 
 
 def add_group(project: str, title: str, body: Optional[List[Dict]] = None,

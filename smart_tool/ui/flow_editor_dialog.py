@@ -3,14 +3,16 @@
 
 设计要点：
 - 列表从上到下就是执行顺序
-- 「循环开始/结束」「条件/分支/条件结束」「组合/组合结束」是成对出现的结构节点：
+- 「循环开始/结束」「条件/条件结束」「组合/组合结束」是成对出现的结构节点：
   新增时系统一起创建，配置只存在「循环开始」「条件」这些节点上（点配对的另一端
   也是编辑同一份配置）
-- 块可以互相嵌套，按层级缩进显示（循环体、条件下的分支、分支里的循环……）
+- 条件体里的**直属动作节点**各自带一条「判断方式 + 值」，卡片上直接显示
+  （如「包含 公示」）；从上往下第一个成立的执行
+- 块可以互相嵌套，按层级缩进显示（循环体、条件体、组合里……）
 - **块都能展开 / 收起**：点块标记左边的 ▾ / ▸ 就行（循环、条件、组合都支持）
 - **合并成组合**：按住 Ctrl / Shift 多选几行 → 右键 → 「合并选中节点」，起个名字；
   之后画布上就只显示这一张卡片。取消组合、改名也在右键菜单里
-- 每个「循环体」「分支」「组合」的末尾都有一行「＋ 点击创建新节点」
+- 每个「循环体」「条件体」「组合」的末尾都有一行「＋ 点击创建新节点」
 - 每次改动（增/插/改/删/移/合并）立即写盘，并重新编号（从 1 开始），无需手动保存
 - 结构不合法时照样保存（不丢改动），但状态栏给出提醒
 """
@@ -35,7 +37,7 @@ CARD_H = 56          # 卡片固定高度，避免列表项显示不全
 ADD_ROW_H = 30       # 「＋ 点击创建新节点」这一行的高度
 LOOP_INDENT = 22     # 每层缩进像素
 SUMMARY_MAX = 78     # 摘要最大字符数（手动截断，不依赖字体度量）
-#: 能展开 / 收起的块（分支不支持：它藏在条件里，跟着条件一起收）
+#: 能展开 / 收起的块
 COLLAPSIBLE_KINDS = ("loop", "condition", "group")
 
 #: 【?】里的完整说明（界面上只留一句摘要，其余收进弹窗）
@@ -43,9 +45,10 @@ FLOW_EDITOR_HELP = (
     "列表从上到下就是执行顺序；双击某行可以编辑它。\n"
     "\n"
     "【结构节点】\n"
-    "「循环开始 / 循环结束」「条件 / 分支 / 条件结束」「组合 / 组合结束」都是成对的\n"
+    "「循环开始 / 循环结束」「条件 / 条件结束」「组合 / 组合结束」都是成对的\n"
     "结构节点：新增时系统一起创建，配置只有一份——点配对的另一端，编辑的也是同一个块。\n"
-    "块可以互相嵌套（循环里放条件、分支里放循环都行），按缩进分层显示。\n"
+    "条件体里的每个动作节点自带一条「判断方式 + 值」，就写在卡片第二行。\n"
+    "块可以互相嵌套（循环里放条件、条件里放循环都行），按缩进分层显示。\n"
     "\n"
     "【展开 / 收起】\n"
     "块标记左边的 ▾ / ▸ 点一下就能收起或展开（循环、条件、组合都支持），\n"
@@ -63,25 +66,27 @@ FLOW_EDITOR_HELP = (
     "要配合【项目管理…】→【登录态】使用（那边要配好登录态和「登录后才有的元素」）。\n"
     "\n"
     "【增删改】\n"
-    "每个循环体、每个分支、每个组合的末尾都有一行「＋ 点击创建新节点」，\n"
+    "每个循环体、条件体、组合的末尾都有一行「＋ 点击创建新节点」，\n"
     "点它新增的节点会留在那个块里面。删除块的标记＝整块删掉（会先问一次）；\n"
     "块里的普通步骤只删自己。所有改动立即保存，不需要手动存。"
 )
 
 
-def _branch_text(steps: List[Step], index: int) -> str:
-    """分支标记的摘要：从所属条件的分支清单里取名字与匹配值。"""
-    for sp in blocks.spans(steps):
-        if sp.kind != "condition" or not sp.contains(index):
+def _rule_texts(steps: List[Step]) -> dict:
+    """条件里每个「动作节点」的规则摘要（按行号索引）。
+
+    条件提供判断的数据，规则挂在块里的直属动作节点上；这里把它算出来，
+    列表上每个动作节点就能显示自己的条件（如「包含 公示」）。
+    """
+    out: dict = {}
+    all_spans = blocks.spans(steps)
+    for sp in all_spans:
+        if sp.kind != "condition":
             continue
-        order = [k for k in range(sp.inner_lo, sp.inner_hi)
-                 if steps[k].action == "branch"]
-        if index not in order:
-            return ""
-        bi = order.index(index)
-        cond = steps[sp.start]
-        return blocks.condition_branch_summary(cond, bi)
-    return ""
+        mode = steps[sp.start].cond_mode or "rule"
+        for k, row in enumerate(blocks.direct_children(all_spans, sp)):
+            out[row] = blocks.rule_summary(steps[row], k, mode)
+    return out
 
 
 class _StepCard(QWidget):
@@ -92,7 +97,7 @@ class _StepCard(QWidget):
     """
 
     def __init__(self, step: Step, indent: int = 0,
-                 branch_text: str = "", collapsed: bool = False,
+                 rule_text: str = "", collapsed: bool = False,
                  hidden_count: int = 0, on_toggle=None, number: str = "",
                  parent=None):
         super().__init__(parent)
@@ -133,8 +138,6 @@ class _StepCard(QWidget):
             prefix = "⤵ "
         elif step.action in ("loop_end", "condition_end", "group_end"):
             prefix = "⤴ "
-        elif step.action == "branch":
-            prefix = "⑂ "
         # 自定义名称优先，后面跟上类型名（如「登录页（打开网页）」）；
         # 编号用显示编号：组合是「2-4」这种范围，结束标记干脆没有编号
         shown = f"{step.title}（{name}）" if step.title else name
@@ -147,7 +150,7 @@ class _StepCard(QWidget):
         text_box.addWidget(title)
 
         summary = " ｜ ".join(
-            x for x in step_summary(step, branch_text) if x
+            x for x in step_summary(step, rule_text) if x
         )
         if not summary:
             summary = "（无参数）"
@@ -202,8 +205,6 @@ class FlowEditorDialog(QDialog):
         self._steps: List[Step] = [
             Step.from_dict(s.to_dict()) for s in steps
         ]
-        # 分支清单条数跟分支标记对齐（老项目 / 手改过文件的兜底）
-        blocks.normalize_branch_lists(self._steps)
         # 列表里的行 → ("step", 步骤下标) 或 ("add", 块起始下标)
         self._rows: List[Tuple[str, int]] = []
         self._spans: list = []
@@ -286,9 +287,10 @@ class FlowEditorDialog(QDialog):
         depths = blocks.depths(self._steps)
         span_by_start = {sp.start: sp for sp in self._spans}
         numbers = blocks.step_numbers(self._steps)
-        # 「＋ 点击创建新节点」放在每个循环体 / 分支 / 组合的末尾
+        self._rule_by_row = _rule_texts(self._steps)
+        # 「＋ 点击创建新节点」放在每个循环体 / 条件体 / 组合的末尾
         add_at = {sp.insert_pos: sp for sp in self._spans
-                  if sp.kind in ("loop", "branch", "group")}
+                  if sp.kind in ("loop", "condition", "group")}
         # 收起来的块：内部的行（含结束标记）整段不显示
         skip = set()
         for sp in self._spans:
@@ -325,7 +327,7 @@ class FlowEditorDialog(QDialog):
         self.list_widget.setItemWidget(
             item, _StepCard(self._steps[idx],
                             LOOP_INDENT * depth,
-                            branch_text=_branch_text(self._steps, idx),
+                            rule_text=self._rule_by_row.get(idx, ""),
                             collapsed=collapsed,
                             hidden_count=hidden_count,
                             on_toggle=on_toggle,
@@ -334,7 +336,7 @@ class FlowEditorDialog(QDialog):
         self._rows.append(("step", idx))
 
     def _append_add_row(self, span, depth: int):
-        """在块（循环体 / 分支 / 组合）末尾插一行「＋ 点击创建新节点」。"""
+        """在块（循环体 / 条件体 / 组合）末尾插一行「＋ 点击创建新节点」。"""
         item = QListWidgetItem()
         item.setSizeHint(QSize(0, ADD_ROW_H))
         # 只保留「可用」：这一行是按钮，不该被当成步骤选中
@@ -569,18 +571,23 @@ class FlowEditorDialog(QDialog):
         QTimer.singleShot(0, lambda: self._add_into_block(start_idx))
 
     def _add_into_block(self, start_idx: int):
-        step = self._new_step_via_dialog()
-        if step is None:
-            return
         sp = next((x for x in blocks.spans(self._steps) if x.start == start_idx),
                   None)
+        # 往「条件」里加节点：它自带判断方式，编辑框里要显示那一栏
+        rule_mode = None
+        if sp is not None and sp.kind == "condition":
+            rule_mode = self._steps[sp.start].cond_mode or "rule"
+        step = self._new_step_via_dialog(rule_mode)
+        if step is None:
+            return
         pos = sp.insert_pos if sp else len(self._steps)
         self._insert_at(pos, step)
 
     # ------------------------------
     # 增删改移
     # ------------------------------
-    def _new_step_via_dialog(self) -> Optional[Step]:
+    def _new_step_via_dialog(self, rule_mode: Optional[str] = None
+                             ) -> Optional[Step]:
         dlg = StepEditDialog(
             self.project_dir, None, self,
             variable_names=step_executor.available_variables(
@@ -588,6 +595,7 @@ class FlowEditorDialog(QDialog):
                 step_executor.library_written_vars(self.project_dir)),
             default_url=self._default_url(),
             scene=self.scene,
+            rule_mode=rule_mode,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             return dlg.get_step()
@@ -601,17 +609,18 @@ class FlowEditorDialog(QDialog):
     def _add_step(self):
         """新增：插到选中行之后（在循环里就留在循环里）；没选中则追加到末尾。"""
         idx = self._selected_row()
-        step = self._new_step_via_dialog()
+        pos = idx + 1 if idx >= 0 else len(self._steps)
+        step = self._new_step_via_dialog(blocks.rule_mode_at(self._steps, pos))
         if step is None:
             return
-        self._insert_at(idx + 1 if idx >= 0 else len(self._steps), step)
+        self._insert_at(pos, step)
 
     def _insert_step(self):
         """在选中的那一行之前插入。"""
         idx = self._selected_row()
         if idx < 0:
             return
-        step = self._new_step_via_dialog()
+        step = self._new_step_via_dialog(blocks.rule_mode_at(self._steps, idx))
         if step is None:
             return
         self._insert_at(idx, step)
@@ -622,27 +631,23 @@ class FlowEditorDialog(QDialog):
         if step.action == "loop_start":
             new_steps.append(Step(id=0, action=blocks.LOOP_END))
         elif step.action == "condition_start":
-            # 条件默认给「一个待填条件的 + 一个兜底」两个分支，可再增删
-            if not step.cond_branches:
-                step.cond_branches = [blocks.new_branch("分支 1", op="contains"),
-                                      blocks.new_branch("兜底")]
-            new_steps.append(Step(id=0, action=blocks.BRANCH))
-            new_steps.append(Step(id=0, action=blocks.BRANCH))
             new_steps.append(Step(id=0, action=blocks.COND_END))
         self._steps[pos:pos] = new_steps
+        blocks.apply_default_rule(self._steps, pos)
         self._commit(select_index=pos)
 
     def _edit_step(self):
         idx = self._selected_row()
         if idx < 0:
             return
-        # 设置合并：点「循环结束」「分支」「条件结束」「组合结束」都是编辑所属的那个块
+        # 设置合并：点「循环结束」「条件结束」「组合结束」都是编辑所属的那个块
         idx = blocks.marker_owner_index(self._steps, idx)
         if self._steps[idx].action == blocks.GROUP_START:
             # 组合节点没有表单，能改的只有名字（结构改动走右键菜单）
             self._rename_group_at(idx)
             return
         old = self._steps[idx]
+        owner = blocks.rule_owner_span(self._steps, idx)
         dlg = StepEditDialog(
             self.project_dir, old, self,
             variable_names=step_executor.available_variables(
@@ -650,17 +655,13 @@ class FlowEditorDialog(QDialog):
                 step_executor.library_written_vars(self.project_dir)),
             default_url=self._default_url(),
             scene=self.scene,
+            rule_mode=(self._steps[owner.start].cond_mode or "rule"
+                       if owner is not None else None),
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         new_step = dlg.get_step()
         new_step.pos = old.pos        # 保留画布坐标
-        if old.action == "condition_start" and new_step.action == "condition_start":
-            note = blocks.apply_condition_edit(self._steps, idx, new_step)
-            self._commit(select_index=idx)
-            if note:
-                self.status_label.setText(f"已自动保存；{note}")
-            return
         self._steps[idx] = new_step
         notes: List[str] = []
         if old.action == "read_data" and new_step.action == "read_data":
@@ -703,7 +704,6 @@ class FlowEditorDialog(QDialog):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
-            blocks.drop_branch_entry(self._steps, block.start)
             del self._steps[block.start:block.end + 1]
             self._commit(select_index=min(block.start, len(self._steps) - 1))
             return
@@ -752,8 +752,7 @@ class FlowEditorDialog(QDialog):
     # 自动保存（编号从 1 开始）
     # ------------------------------
     def _commit(self, select_index: Optional[int] = None):
-        """任何改动都走这里：补齐分支清单 → 重排编号 → 写盘 → 刷新列表。"""
-        blocks.normalize_branch_lists(self._steps)
+        """任何改动都走这里：重排编号 → 写盘 → 刷新列表。"""
         self._renumber()
         self._prune_collapsed()
         self._store.save(self._steps)

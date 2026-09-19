@@ -515,7 +515,8 @@ class WebAutomationTab(QWidget):
         self.canvas.apply_auto_layout()
         self._append_log("已按横向蛇形重新排版。")
 
-    def _make_step_dialog(self, step: Optional[Step] = None) -> StepEditDialog:
+    def _make_step_dialog(self, step: Optional[Step] = None,
+                          rule_mode: Optional[str] = None) -> StepEditDialog:
         """统一构造步骤编辑对话框，带上可用变量供变量下拉使用。"""
         return StepEditDialog(
             self._current_store.dir, step, self,
@@ -523,6 +524,7 @@ class WebAutomationTab(QWidget):
             default_url=next((s.url for s in self._steps
                               if s.action == "navigate" and s.url), ""),
             scene=self._scene,
+            rule_mode=rule_mode,
         )
 
     # ------------------------------
@@ -537,7 +539,6 @@ class WebAutomationTab(QWidget):
         """
         if not self._current_store:
             return
-        blocks.normalize_branch_lists(self._steps)
         for i, s in enumerate(self._steps, start=1):
             s.id = i
         self._current_store.save(self._steps)
@@ -558,12 +559,12 @@ class WebAutomationTab(QWidget):
         if not self._require_project():
             return
         row = self._selected_row()
-        dlg = self._make_step_dialog()
+        pos = row + 1 if row >= 0 else len(self._steps)
+        dlg = self._make_step_dialog(
+            None, blocks.rule_mode_at(self._steps, pos))
         try:
             if dlg.exec() == QDialog.DialogCode.Accepted:
-                step = dlg.get_step()
-                pos = row + 1 if row >= 0 else len(self._steps)
-                self._insert_at(pos, step)
+                self._insert_at(pos, dlg.get_step())
         finally:
             dlg.deleteLater()       # 弹窗用完就销毁，别越攒越多
 
@@ -572,11 +573,12 @@ class WebAutomationTab(QWidget):
         if not self._require_project():
             return
         row = self._selected_row()
-        dlg = self._make_step_dialog()
+        pos = row if row >= 0 else len(self._steps)
+        dlg = self._make_step_dialog(
+            None, blocks.rule_mode_at(self._steps, pos))
         try:
             if dlg.exec() == QDialog.DialogCode.Accepted:
-                self._insert_at(row if row >= 0 else len(self._steps),
-                                dlg.get_step())
+                self._insert_at(pos, dlg.get_step())
         finally:
             dlg.deleteLater()
 
@@ -586,13 +588,9 @@ class WebAutomationTab(QWidget):
         if step.action == "loop_start":
             new_steps.append(Step(id=0, action=blocks.LOOP_END))
         elif step.action == "condition_start":
-            if not step.cond_branches:
-                step.cond_branches = [blocks.new_branch("分支 1", op="contains"),
-                                      blocks.new_branch("兜底")]
-            new_steps.append(Step(id=0, action=blocks.BRANCH))
-            new_steps.append(Step(id=0, action=blocks.BRANCH))
             new_steps.append(Step(id=0, action=blocks.COND_END))
         self._steps[pos:pos] = new_steps
+        blocks.apply_default_rule(self._steps, pos)
         self._persist(select_row=pos)       # 新节点自己补空位，不动现有布局
 
     def _edit_selected_step(self):
@@ -603,7 +601,7 @@ class WebAutomationTab(QWidget):
     def _edit_step_by_id(self, step_id: int):
         """双击节点/点编辑：保留画布位置。
 
-        「循环结束」「分支」「条件结束」的设置与所属块的配置节点合并成一份，
+        「循环结束」「条件结束」的设置与所属块的配置节点合并成一份，
         点它们也是编辑那个块。
         """
         row = next((i for i, s in enumerate(self._steps) if s.id == step_id), -1)
@@ -615,7 +613,10 @@ class WebAutomationTab(QWidget):
             # 画布上只有一张组合卡片，双击它直接编辑这个组合（改名 / 登录用 / 取消组合）
             self._edit_group(row)
             return
-        dlg = self._make_step_dialog(old)
+        owner = blocks.rule_owner_span(self._steps, row)
+        dlg = self._make_step_dialog(
+            old, self._steps[owner.start].cond_mode or "rule"
+            if owner is not None else None)
         try:
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
@@ -623,12 +624,6 @@ class WebAutomationTab(QWidget):
         finally:
             dlg.deleteLater()       # 弹窗用完就销毁，别越攒越多
         new_step.pos = old.pos
-        if old.action == "condition_start" and new_step.action == "condition_start":
-            note = blocks.apply_condition_edit(self._steps, row, new_step)
-            self._persist(select_row=row)
-            if note:
-                self._append_log(f"条件改动：{note}")
-            return
         self._steps[row] = new_step
         if old.action == "read_data" and new_step.action == "read_data":
             # 读取节点改名（产出变量 / 字段名）→ 别处的引用一起跟着改
@@ -703,7 +698,6 @@ class WebAutomationTab(QWidget):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
-            blocks.drop_branch_entry(self._steps, block.start)
             del self._steps[block.start:block.end + 1]
             self._persist(select_row=min(block.start, len(self._steps) - 1))
             return
