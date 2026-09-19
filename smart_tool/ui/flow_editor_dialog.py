@@ -586,7 +586,8 @@ class FlowEditorDialog(QDialog):
         dlg = StepEditDialog(
             self.project_dir, None, self,
             variable_names=step_executor.available_variables(
-                self._steps, self.project_variables),
+                self._steps, self.project_variables,
+                step_executor.library_written_vars(self.project_dir)),
             default_url=self._default_url(),
             scene=self.scene,
         )
@@ -647,7 +648,8 @@ class FlowEditorDialog(QDialog):
         dlg = StepEditDialog(
             self.project_dir, old, self,
             variable_names=step_executor.available_variables(
-                self._steps, self.project_variables),
+                self._steps, self.project_variables,
+                step_executor.library_written_vars(self.project_dir)),
             default_url=self._default_url(),
             scene=self.scene,
         )

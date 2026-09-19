@@ -25,11 +25,9 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from smart_tool.core import project_store
+from smart_tool.core import free_code, project_store
 from smart_tool.core.project_store import Locator, Step
-from smart_tool.core.step_executor import (
-    build_script_source, parse_script_params,
-)
+from smart_tool.ui.code_editor import CodeEditor
 from smart_tool.ui.collect_panel import CollectPanel
 from smart_tool.ui.desktop_picker import DesktopPickerDialog
 from smart_tool.ui.element_picker_dialog import (
@@ -86,85 +84,108 @@ COND_MODES = [
 SCRIPT_LANGS = [("python", "Python（本地执行）"),
                 ("javascript", "JavaScript（在网页里执行）")]
 
+SCRIPT_PLACEHOLDER_PY = (
+    "# 写一个真正的函数，系统会自动调用它（第一个函数）\n"
+    "def 清洗标题(#价格表=D:/data/价格表.xlsx):\n"
+    "    标题 = @原始标题.strip()          # 读变量清单（直接写 标题 也行）\n"
+    "    @结果 = 标题 + '（已处理）'        # 等号左边＝写回变量清单\n"
+    "    return 标题"
+)
+SCRIPT_PLACEHOLDER_JS = (
+    "// 写一个真正的函数（ES6 也行），系统会自动调用它\n"
+    "function 清洗标题(#价格表=D:/data/价格表.xlsx) {\n"
+    "    const 标题 = 原始标题.trim();      // 读变量清单\n"
+    "    @结果 = 标题 + '（已处理）';        // 等号左边＝写回变量清单\n"
+    "    return 标题;\n"
+    "}"
+)
+
 # 脚本节点说明（放在【?】里）
 SCRIPT_HINT_PY = (
-    "把它当成一个函数来用：上面「入口参数」是形参，脚本里 return 的是返回值。\n"
+    "代码框里写一个**完整的函数**（第一个函数会被自动调用），三个引用符号：\n"
     "\n"
-    "【入口参数】写 `账号` 或 `标题=text`（变量名=形参名），逗号分隔。\n"
-    "脚本里直接用形参名：\n"
-    "    标题 = 标题.strip()\n"
-    "    首次见到 = 账号\n"
-    "留空＝不设参数表，这时脚本里用 vars[\"变量名\"] 拿（老写法一直有效）。\n"
+    "    def 清洗标题(#价格表=D:/data/价格表.xlsx, 后缀='（已处理）'):\n"
+    "        标题 = @原始标题.strip()      # 读变量清单（直接写 标题 也行）\n"
+    "        @结果 = 标题 + 后缀           # 等号左边是 @名字 → 写回变量清单\n"
+    "        /封面 = 'D:/图片/封面.png'    # 等号左边是 /图片名 → 存回图片库\n"
+    "        return @结果                  # 其它位置的 @名字 → 读变量\n"
     "\n"
-    "【返回值】脚本里 return 什么，就写到「返回写到」那个变量。\n"
-    "· 返回单个值（文本/数字/列表/字典都行）：写到那一个变量；\n"
-    "· 没填「返回写到」时：返回字典＝每个键写成一个变量；返回别的值＝只打进日志；\n"
-    "· 列表 / 字典会自动存成 JSON，所以「脚本返回一个列表 → 循环遍历它」能直接用。\n"
+    "【@名字】变量清单里的变量。等号左边＝写回，其它位置＝读取；\n"
+    "  名字是唯一的那就直接写名字（不加 @ 也行），带点的只能写 @名字。\n"
+    "  变量里存的都是文本，要算数先 int(...) / float(...)。\n"
+    "【/图片名】图片库里的图片：读＝得到 img/图片名.xxx 的绝对路径；\n"
+    "  等号左边＝把图片存回图片库（值可以是图片路径、bytes，或 dataURL 文本）。\n"
+    "【#文件名=路径】电脑里的文件（xlsx/csv/txt…）：只写在参数表里，\n"
+    "  函数里用这个名字就是那个路径（自己 open / openpyxl / pandas 打开）。\n"
+    "  路径里可以写 {{变量}}，如 #表=D:/导出/{{年月}}.xlsx。\n"
+    "  没写路径的形参（如 #表）运行时是空文本。\n"
     "\n"
     "【还能拿到什么】\n"
-    "  vars        —— 全部（或你声明的）流程变量，可读可写\n"
-    "  log()       —— 输出一行日志到运行窗口\n"
+    "  log('...')  —— 输出一行日志到运行窗口\n"
     "  page        —— Playwright 页面对象，可直接操作浏览器（网页场景）\n"
     "  current_url / project_dir —— 当前网址、项目目录\n"
     "\n"
     "【这是个完整的本机 Python】没有沙箱：能 import 库、读写文件、发网络请求。\n"
-    "要用什么就在脚本里自己 import（外面的 import 带不进来）。\n"
+    "要用什么就在函数里自己 import（外面的 import 带不进来）。\n"
     "\n"
-    "【报错】脚本抛异常会让这一步失败、流程停下（出错信息带行号）。\n"
-    "「某条数据不规整就跳过」这类场景，自己在脚本里 try/except 包一层。\n"
+    "【报错】抛异常会让这一步失败、流程停下（出错信息带行号）。\n"
+    "「某条数据不规整就跳过」这类场景，自己在函数里 try/except 包一层。\n"
     "\n"
-    "【执行超时】到点会真的把这步掐掉：脚本里每进一次循环都会看一眼\n"
-    "「到点了没」，所以死循环、超长循环能在超时那一刻停下并告诉你在第几行。\n"
+    "【执行超时】到点会真的把这步掐掉：每进一次循环都会看一眼「到点了没」，\n"
+    "所以死循环、超长循环能在超时那一刻停下并告诉你在第几行。\n"
     "唯一的例外是「等外部返回」的写法（time.sleep(600)、page.click() 卡住），\n"
-    "那种只能等它自己返回——所以页面上等元素请写 page.xxx(..., timeout=毫秒)。"
+    "那种只能等它自己返回——所以页面上等元素请写 page.xxx(..., timeout=毫秒)。\n"
+    "\n"
+    "【顺带进函数库】保存这个节点时，函数会自动进【项目管理…】→【函数库】，\n"
+    "流程别处就能用「调用函数」节点复用它（改一处、到处一起变）。"
 )
 SCRIPT_HINT_JS = (
-    "在网页里执行 JavaScript，直接操作 DOM。同样当函数用：入口参数是形参、\n"
-    "return 是返回值。\n"
+    "代码框里写一个**完整的函数**（也支持 ES6：箭头函数、const/let、\n"
+    "async/await、模板字符串；第一个函数会被自动调用）。写法与 Python 一致：\n"
     "\n"
-    "【入口参数】写法同 Python（`账号` 或 `标题=text`）。\n"
+    "    function 清洗标题(#价格表=D:/data/价格表.xlsx, 后缀='（已处理）') {\n"
+    "        const 标题 = 原始标题.trim();      // 读变量清单\n"
+    "        @结果 = 标题 + 后缀;                // 等号左边＝写回变量清单\n"
+    "        /封面 = 'data:image/png;base64,...'; // 存回图片库\n"
+    "        return 标题;\n"
+    "    }\n"
     "\n"
-    "【返回值】脚本里 return 的值写到「返回写到」那个变量；\n"
-    "返回对象（{a: 1}）且没填「返回写到」时，每个键写成一个变量。\n"
-    "注意 return 之后代码就不执行了。\n"
+    "【@名字】变量清单里的变量：等号左边＝写回，其它位置＝读取。\n"
+    "【/图片名】图片库里的图片 → 得到 /img 下的绝对路径（也能喂给上传控件）；\n"
+    "  等号左边＝存回图片库，值可以是 dataURL / Base64 / 图片路径。\n"
+    "【#文件名=路径】写在参数表里：函数里用这个名字拿到的就是那个路径。\n"
     "\n"
-    "【还能拿到什么】\n"
-    "  vars  —— 变量对象（vars[\"标题\"]，改了会自动写回流程变量）\n"
-    "  log() —— 输出一行日志到运行窗口\n"
-    "  url   —— 当前网址\n"
-    "\n"
-    "例：\n"
-    "    const n = document.querySelectorAll('.item').length;\n"
-    "    vars['条数'] = n;\n"
-    "    return n * 2;\n"
+    "【还能拿到什么】log('...') 输出日志、url 当前网址、project_dir 项目目录。\n"
     "\n"
     "【注意】\n"
-    "· JS 跑在页面里，刷新页面就没了；要跨步骤留值就放到 vars 里。\n"
+    "· JS 跑在页面里，刷新页面就没了（值都放在流程变量里）。\n"
     "· 桌面场景没有浏览器页面，JS 节点用不了（用 Python）。\n"
     "· 取到的文本是页面原始文本，该 trim() 就 trim()。\n"
-    "· 执行超时会中断「await 等着不回来」的写法；但如果脚本里写的是\n"
+    "· 执行超时会中断「await 等着不回来」的写法；但如果函数里写的是\n"
     "  同步死循环（while(true){}），页面本身就被卡住了，那种拦不住。"
 )
 
 CALL_HELP = (
     "函数＝写一次、到处调用的一段代码。定义在【项目管理…】→【函数库】，\n"
     "流程里放几个「调用函数」节点就能反复用它——改函数那一处，\n"
-    "所有调用它的地方一起变（这跟「自由代码」节点的区别：那是就地写一段）。\n"
+    "所有调用它的地方一起变（「自由代码」节点也是同一个写法，只是就地写）。\n"
     "\n"
     "【参数怎么传】写 `形参名=值`，逗号分隔，值可以是变量也可以是字面量：\n"
-    "    单价={{价格}}, 倍数=2, 备注=促销\n"
-    "函数的「入口参数」里写的是形参名（如 单价, 倍数），两边名字对上就行。\n"
-    "没写的形参＝空文本；只写名字不写 `=` （如 单价）＝把同名流程变量传进去。\n"
+    "    价格表=D:/data/价格表.xlsx, 单价={{价格}}, 倍数=2\n"
+    "· 形参名＝函数签名括号里的名字；\n"
+    "· 值里可以写 {{变量}}（运行时先换成实际值）；\n"
+    "· 只写名字不写 `=` （如 单价）＝把同名的流程变量传进去；\n"
+    "· 没写的形参用函数自己的默认值（file 形参＝签名里写的那个路径）。\n"
     "\n"
-    "【返回值】函数里 return 什么，就写到「返回写到」那个变量；\n"
-    "留空＝只把返回值打进日志。列表 / 字典会存成 JSON，循环能直接遍历。\n"
+    "【返回值】函数里 `@名字 = 值` 写的变量，调用后流程里就能用；\n"
+    "`return` 的值只打进运行日志（要看就点运行窗口的日志）。\n"
     "\n"
-    "【函数里能用什么】和「自由代码」节点一样：vars / log() / page /\n"
-    "current_url / project_dir；Python 函数里也能直接操作浏览器页面。\n"
-    "执行超时、报错行号的处理也一样（超时会真的把这步掐掉）。\n"
+    "【函数里能用什么】和「自由代码」节点完全一样：\n"
+    "@名字 读写变量清单、/图片名 读写图片库、log() / page / current_url /\n"
+    "project_dir；执行超时、报错行号的处理也一样（超时会真的把这步掐掉）。\n"
     "\n"
     "在哪加函数：【流程编辑…】上方的【项目管理…】→【函数库】页签，\n"
-    "点【新建函数】写名字、入口参数和代码即可。"
+    "点【新建函数】写代码即可；「自由代码」节点保存时也会自动进函数库。"
 )
 
 #: 【?】里的说明（界面上只留一句摘要）
@@ -688,22 +709,13 @@ class StepEditDialog(QDialog):
             self.script_lang_combo.addItem(label, key)
         form.addRow("脚本语言：", self.script_lang_combo)
 
-        self.script_code = QPlainTextEdit()
-        self.script_code.setPlaceholderText(
-            "# 把这个节点当成一个函数：上面传参进来，下面 return 出去\n"
-            "# 例如：\n"
-            "#   标题 = 标题.strip()\n"
-            "#   log('处理完：' + 标题)\n"
-            "#   return 标题 + '（已处理）'"
-        )
-        self.script_code.setMinimumHeight(190)
-        mono = QFont("Consolas")
-        mono.setStyleHint(QFont.StyleHint.Monospace)
-        self.script_code.setFont(mono)
+        self.script_code = CodeEditor()
+        self.script_code.setPlaceholderText(SCRIPT_PLACEHOLDER_PY)
+        self.script_code.setMinimumHeight(210)
         form.addRow("脚本代码：", self.script_code)
 
         self.script_hint = help_row(
-            "当成一个函数用：上面传参、下面 return 返回。",
+            "代码里写一个完整的函数（系统会自动调用它）。",
             "Python 脚本", SCRIPT_HINT_PY)
         self.script_help_btn = self.script_hint.findChild(HelpButton)
         form.addRow("", self.script_hint)
@@ -711,36 +723,6 @@ class StepEditDialog(QDialog):
         self.script_lang_combo.currentIndexChanged.connect(
             self._on_script_lang_changed
         )
-
-        script_row = QWidget()
-        script_layout = QHBoxLayout(script_row)
-        script_layout.setContentsMargins(0, 0, 0, 0)
-        self.script_vars = QLineEdit()
-        self.script_vars.setPlaceholderText(
-            "变量名，或用 变量名=形参名 改名，如：账号, 标题=text")
-        self.script_vars.setToolTip(
-            "脚本的入口参数（相当于函数参数表），逗号分隔：\n"
-            "· 直接写变量名 → 脚本里用同名变量拿它；\n"
-            "· 写 变量名=形参名 → 脚本里用形参名拿它（如 标题=text，脚本里用 text）。\n"
-            "留空＝不设参数表，脚本里用 vars[\"变量名\"] 拿（老写法照样能用）。"
-        )
-        script_layout.addWidget(self.script_vars, 1)
-        self.script_var_combo = QComboBox()
-        self.script_var_combo.setMinimumWidth(160)
-        self.script_var_combo.setToolTip("选择后追加到入口参数")
-        self.script_var_combo.activated.connect(self._insert_script_var)
-        script_layout.addWidget(self.script_var_combo)
-        form.addRow("入口参数：", script_row)
-
-        self.script_output = QLineEdit()
-        self.script_output.setPlaceholderText(
-            "变量名；脚本里 return 的值写到它（留空＝不写变量，只打进日志）")
-        self.script_output.setToolTip(
-            "脚本 return 的东西写到哪个流程变量。\n"
-            "留空的话：返回字典＝每个键写成一个变量；返回别的值＝只打进运行日志。\n"
-            "填了它，运行前的「变量没有来源」检查就不会再误报这个变量。"
-        )
-        form.addRow("返回写到：", self.script_output)
 
         self.script_timeout = QSpinBox()
         self.script_timeout.setRange(1, 3600)
@@ -813,10 +795,9 @@ class StepEditDialog(QDialog):
         self._loop_widgets = [self.loop_expr_row, self.loop_hint]
         self._script_widgets = [
             self.script_lang_combo, self.script_code, self.script_hint,
-            script_row,
         ]
-        # 「返回写到 / 执行超时」是自由代码与调用函数共用的两行
-        self._script_out_widgets = [self.script_output, self.script_timeout]
+        # 「执行超时」是自由代码与调用函数共用的那一行
+        self._script_out_widgets = [self.script_timeout]
         self._call_widgets = [
             self.call_func_combo, call_row, self.call_hint,
         ]
@@ -969,7 +950,6 @@ class StepEditDialog(QDialog):
             (self.loop_expr_var_combo, "插入变量 ▾"),
             (self.cond_var_combo, "插入变量 ▾"),
             (self.note_var_combo, "插入变量 ▾"),
-            (self.script_var_combo, "添加变量 ▾"),
             (self.call_var_combo, "插入变量 ▾"),
         ):
             combo.blockSignals(True)
@@ -1020,20 +1000,6 @@ class StepEditDialog(QDialog):
         self.loop_expr_edit.setFocus()
         self.loop_expr_var_combo.setCurrentIndex(0)
 
-    def _insert_script_var(self, index: int):
-        """把选中的变量追加到「入口参数」列表。"""
-        name = self.script_var_combo.itemData(index)
-        if not name:
-            return
-        current = [x.strip() for x in
-                   self.script_vars.text().replace("，", ",").split(",")
-                   if x.strip()]
-        if name not in current:
-            current.append(name)
-            self.script_vars.setText(", ".join(current))
-        self.script_vars.setFocus()
-        self.script_var_combo.setCurrentIndex(0)
-
     def _insert_call_var(self, index: int):
         """把选中的变量插到「参数」的光标处（写成 {{变量}}）。"""
         name = self.call_var_combo.itemData(index)
@@ -1042,6 +1008,16 @@ class StepEditDialog(QDialog):
         self.call_args.insert(f"{{{{{name}}}}}")
         self.call_args.setFocus()
         self.call_var_combo.setCurrentIndex(0)
+
+    def _image_names(self) -> List[str]:
+        """项目 img/ 里有哪些图片名（解析代码里的 /图片名 用）。"""
+        out: List[str] = []
+        if self.img_dir.is_dir():
+            for p in sorted(self.img_dir.iterdir()):
+                if p.is_file() and p.suffix.lower() in IMG_EXTS:
+                    out.append(p.stem)
+                    out.append(p.name)
+        return out
 
     def _load_function_list(self):
         """把项目函数库里的函数填进「调用函数」下拉。"""
@@ -1073,7 +1049,8 @@ class StepEditDialog(QDialog):
             self.script_help_btn.set_content(
                 "JavaScript 脚本" if is_js else "Python 脚本",
                 SCRIPT_HINT_JS if is_js else SCRIPT_HINT_PY)
-        self.script_timeout.setSuffix(" 秒")
+        self.script_code.setPlaceholderText(
+            SCRIPT_PLACEHOLDER_JS if is_js else SCRIPT_PLACEHOLDER_PY)
 
     # ------------------------------
     # 条件分支表
@@ -1362,8 +1339,6 @@ class StepEditDialog(QDialog):
 
         lang_idx = self.script_lang_combo.findData(s.script_lang or "python")
         self.script_lang_combo.setCurrentIndex(max(0, lang_idx))
-        self.script_vars.setText(s.script_vars or "")
-        self.script_output.setText(s.script_output or "")
         self.script_code.setPlainText(s.script_code or "")
         self.script_timeout.setValue(s.script_timeout or 30)
         self._on_script_lang_changed()
@@ -1515,19 +1490,17 @@ class StepEditDialog(QDialog):
                         f"第 {'、'.join(empty)} 个分支还是空的"
                     )
         elif action == "script":
-            if not self.script_code.toPlainText().strip():
-                errors.append("自由代码节点必须填写脚本代码")
-            elif self.script_lang_combo.currentData() == "python":
-                # Python 脚本先做一次语法检查，避免运行到一半才报错。
-                # 用和执行时同一套包装（代码是函数体，所以 return 是合法的）
-                try:
-                    compile(build_script_source(
-                        self.script_code.toPlainText(),
-                        parse_script_params(self.script_vars.text())),
-                        "<脚本检查>", "exec")
-                except SyntaxError as e:
-                    line = max(1, int(e.lineno or 1) - 1)
-                    errors.append(f"Python 脚本语法错误（第 {line} 行）：{e.msg}")
+            code = self.script_code.toPlainText()
+            if not code.strip():
+                errors.append("自由代码节点必须写一段代码（一个完整的函数定义）")
+            else:
+                # 用和执行时同一套解析：找函数、认 @变量 /图片 #文件、查语法
+                fc = free_code.analyze(
+                    code, self.script_lang_combo.currentData(),
+                    self._var_names_list, self._image_names())
+                errors.extend(fc.errors)
+                if not errors:
+                    self._register_functions(fc, code)
         elif action == "call":
             if not self.call_func_combo.currentData():
                 errors.append(
@@ -1539,6 +1512,34 @@ class StepEditDialog(QDialog):
             QMessageBox.warning(self, "内容不完整", "\n".join(f"· {e}" for e in errors))
             return
         self.accept()
+
+    def _register_functions(self, fc, code: str):
+        """保存自由代码节点时，把代码里的函数写进【函数库】（一处定义多处调用）。
+
+        存的是**这个函数自己的那段原文**（@名字 写法原样保留），
+        这样别处「调用函数」时不会误跑到同一个代码框里的另一个函数。
+        """
+        try:
+            store = project_store.ProjectStore(self.project_dir)
+            funcs = store.load_functions()
+        except Exception:
+            return
+        lang = self.script_lang_combo.currentData() or "python"
+        by_name = {f["name"]: f for f in funcs}
+        changed = False
+        for fn in fc.funcs:
+            entry = {
+                "name": fn.name,
+                "lang": lang,
+                "params": ", ".join(p.name for p in fn.params),
+                "code": free_code.function_source(code, fn),
+                "desc": str(by_name.get(fn.name, {}).get("desc") or ""),
+            }
+            if by_name.get(fn.name) != entry:
+                by_name[fn.name] = entry
+                changed = True
+        if changed:
+            store.save_functions(list(by_name.values()))
 
     def get_step(self) -> Step:
         """收集表单为 Step。id 由调用方统一重排。"""
@@ -1589,13 +1590,10 @@ class StepEditDialog(QDialog):
         elif action == "script":
             step.script_lang = self.script_lang_combo.currentData()
             step.script_code = self.script_code.toPlainText()
-            step.script_vars = self.script_vars.text().strip()
-            step.script_output = self.script_output.text().strip()
             step.script_timeout = self.script_timeout.value()
         elif action == "call":
             step.func_name = self.call_func_combo.currentData() or ""
             step.func_args = self.call_args.text().strip()
-            step.script_output = self.script_output.text().strip()
             step.script_timeout = self.script_timeout.value()
         elif action == "loop_start":
             step.loop_expr = self.loop_expr_edit.text().strip()
