@@ -2,9 +2,17 @@
 """Playwright 浏览器内核的检测与安装（打包后第一次运行要用）。
 
 打包出来的程序里只有 playwright 的驱动（node.exe + cli.js），**没有**浏览器本体
-（Chromium 约 150 MB，装在 `%LOCALAPPDATA%\\ms-playwright`）。所以：
+（Chromium 约 150 MB）。内核放哪儿按这个顺序找：
 
-· 安装向导里会调用 `install()` 把 Chromium 下下来（带日志）；
+1. 环境变量 `PLAYWRIGHT_BROWSERS_PATH`（设了就听它的）；
+2. **程序目录旁的「浏览器」文件夹** —— 建了它就用它（放 D 盘/U 盘/项目里都行，
+   绿色版、不想往 C 盘塞东西、或者怕被清理软件删掉，就建这个目录）；
+3. 默认 `%LOCALAPPDATA%\\ms-playwright`。
+
+`ensure_env()` 会把最终选中的目录写进 `PLAYWRIGHT_BROWSERS_PATH`，这样
+playwright 自己去启动浏览器、以及 `install()` 下载，用的都是同一个地方。
+
+· 安装向导 / `install()` 用它下载 Chromium（带日志）；
 · 运行时用 `is_installed()` 先看一眼，没装就给出中文提示，别让用户看到
   Playwright 那句英文报错。
 """
@@ -14,19 +22,42 @@ import sys
 from pathlib import Path
 from typing import Callable, List, Optional
 
+from smart_tool import paths
+
 #: Playwright 自己的环境变量（设了就优先用它）
 ENV_KEY = "PLAYWRIGHT_BROWSERS_PATH"
+#: 程序目录旁边这个文件夹名（建了就用它装内核，不往 C 盘塞）
+PORTABLE_DIR_NAME = "浏览器"
+
+
+def portable_dir() -> Path:
+    """程序目录旁的浏览器文件夹（绿色位置）。"""
+    return paths.app_dir() / PORTABLE_DIR_NAME
 
 
 def browsers_dir() -> Path:
-    """浏览器装在哪（跟 Playwright 的规则保持一致）。"""
+    """浏览器装在哪（跟 Playwright 的规则保持一致，外加"程序旁的浏览器文件夹"）。"""
     custom = os.environ.get(ENV_KEY)
-    if custom and custom not in ("0",):
+    if custom and custom != "0":
         return Path(custom).expanduser()
+    portable = portable_dir()
+    # 有内核 → 当然用它；只有空文件夹也算数（说明用户想让内核装在这儿）
+    if portable.is_dir():
+        return portable
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
         return Path(base) / "ms-playwright"
     return Path.home() / ".cache" / "ms-playwright"
+
+
+def ensure_env() -> Path:
+    """把选中的内核目录告诉 playwright（启动浏览器和下载都走同一个地方）。
+
+    必须在 `sync_playwright()` 启动浏览器之前调用，否则 playwright 会去默认位置找。
+    """
+    target = browsers_dir()
+    os.environ[ENV_KEY] = str(target)
+    return target
 
 
 def installed_kinds() -> List[str]:
@@ -65,6 +96,7 @@ def install(on_log: Optional[Callable[[str], None]] = None,
     if on_log:
         on_log(f"浏览器目录：{browsers_dir()}")
         on_log("开始下载 Chromium（约 150 MB，第一次会慢一点）…")
+    ensure_env()                      # 让下载也落到上面那个目录
     try:
         proc = subprocess.Popen(
             [node, cli, "install", "chromium"],

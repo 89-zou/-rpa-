@@ -118,6 +118,10 @@ class PickerWorker(QThread):
 
     def run(self):
         from playwright.sync_api import sync_playwright
+
+        from smart_tool.core import browser_setup
+
+        browser_setup.ensure_env()        # 内核可能在「程序目录旁的浏览器文件夹」里
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=False)

@@ -70,12 +70,23 @@ cd smart_tool
 py -3 -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
 
-:: 2) 装浏览器内核（约 150 MB，只装一次）
+:: 2) 装浏览器内核（约 700 MB，只装一次）
 .venv\Scripts\python -m playwright install chromium
 
 :: 3) 启动
 .venv\Scripts\python -m smart_tool.main
 ```
+
+> **内核装哪儿？** 默认在 `%LOCALAPPDATA%\ms-playwright`。想让它待在项目里
+> （不往 C 盘塞东西、拷 U 盘就能带走、也不怕被清理软件删），**在项目目录下建一个
+> 叫 `浏览器` 的文件夹**就行——程序会自动认这个目录，下载和启动都用它。
+> 也可以直接设环境变量 `PLAYWRIGHT_BROWSERS_PATH` 指到别处（优先级最高）。
+> 下载慢的话用国内镜像：
+>
+> ```powershell
+> $env:PLAYWRIGHT_DOWNLOAD_HOST = "https://cdn.npmmirror.com/binaries/playwright"
+> .venv\Scripts\python -m playwright install chromium
+> ```
 
 不想开界面、只想跑某个项目：
 
@@ -155,7 +166,9 @@ powershell -ExecutionPolicy Bypass -File packaging\build.ps1
 
 | 现象 | 怎么办 |
 |---|---|
-| 报「还没装浏览器内核」 | 跑一次 `.venv\Scripts\python -m playwright install chromium` |
+| 报「还没装浏览器内核」 | 跑一次 `.venv\Scripts\python -m playwright install chromium`（慢就用上面的国内镜像） |
+| 想让内核待在项目里 / 不占 C 盘 | 在项目目录下建一个 `浏览器` 文件夹，内核就装在那儿、也从那儿启动（也可以设 `PLAYWRIGHT_BROWSERS_PATH`） |
+| 内核莫名不见了（清理软件、卸载程序删过） | 重新装一次即可；装到项目旁的 `浏览器` 文件夹里最不容易被波及 |
 | 元素点不到 | 优先用【捕获元素】取 XPath；页面结构会变的，给定位配一张截图兜底（点不到就用模板匹配再试） |
 | 程序闪退、没提示 | 看 `crash.log`（在用户数据目录里），里面有异常调用栈 |
 | 换了电脑 / 项目搬家后「文件不存在」 | 不用改：数据源路径找不到时，会按文件名在项目目录里自动找同名文件，日志里会写一句 |
@@ -202,13 +215,24 @@ git clone https://github.com/89-zou/-rpa-.git smart_tool
 cd smart_tool
 py -3 -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
-.venv\Scripts\python -m playwright install chromium     :: ~150 MB, once
+.venv\Scripts\python -m playwright install chromium     :: ~700 MB on disk, once
 .venv\Scripts\python -m smart_tool.main                 :: launch the GUI
 ```
 
 The bundled demo project `采集示例-登录与采集` (42 nodes, two practice sites) is loaded on first
 launch and exercises every node type. Headless run of a project:
 `.venv\Scripts\python run_cli.py 采集示例-登录与采集`.
+
+> **Where the browser kernel lives**: by default `%LOCALAPPDATA%\ms-playwright`. To keep it
+> inside the project (nothing on the C: drive, portable on a USB stick), just create a folder
+> named `浏览器` next to the code — the app will download to and launch from it automatically.
+> `PLAYWRIGHT_BROWSERS_PATH` still wins if it is set. In mainland China the CDN can be very slow;
+> use a mirror:
+>
+> ```powershell
+> $env:PLAYWRIGHT_DOWNLOAD_HOST = "https://cdn.npmmirror.com/binaries/playwright"
+> .venv\Scripts\python -m playwright install chromium
+> ```
 
 **Package a single-file exe**
 

@@ -25,6 +25,12 @@ dist/
 build/
 packaging/*.ico
 
+# ---------- 浏览器内核（700 MB，只能靠命令下载，绝不能进 git）----------
+# GitHub 单文件上限 100 MB，而 chrome.dll 就有 287 MB —— 传不上去；
+# 别人 clone 之后跑一行 `.venv\Scripts\python -m playwright install chromium` 就有。
+浏览器/
+ms-playwright/
+
 # ---------- 发行版专用部件（本机保留，打包自己的 exe 照常用，只是不提交）----------
 # main.py 里对它们的导入都是可选的：缺了照样能跑，直接进主界面。
 # 启动广告海报
@@ -45,8 +51,10 @@ smart_tool/core/shortcut.py
 # 你自己的项目里可能存着账号密码、采集结果、登录态 cookie，别跟着代码走。
 projects/*
 !projects/采集示例-登录与采集/
-# 示例项目里这些也不入库：自动备份 / 登录态 cookie / 采集结果 / 临时验证脚本
+# 示例项目里这些也不入库：自动备份 / 登录态 cookie / 跑出来的产物 / 临时验证脚本
 projects/采集示例-登录与采集/steps.json.bak*
 projects/采集示例-登录与采集/auth/
-projects/采集示例-登录与采集/records.jsonl
+projects/采集示例-登录与采集/data/records.jsonl
+projects/采集示例-登录与采集/data/files/
+projects/采集示例-登录与采集/img/示例截图.png
 projects/_verify_*/

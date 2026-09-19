@@ -689,6 +689,8 @@ class StepExecutor:
         # 打包版不带浏览器内核：先看一眼，别让用户看到 Playwright 那句英文报错
         if not self.desktop and not browser_setup.is_installed():
             raise RuntimeError(browser_setup.hint())
+        # 内核可能在「程序目录旁的浏览器文件夹」里：告诉 playwright 去那儿找
+        browser_setup.ensure_env()
         kwargs = {"storage_state": str(self._auth_path)} if use_auth else {}
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=self.headless)
