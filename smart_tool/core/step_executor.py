@@ -17,7 +17,9 @@ from playwright.sync_api import (
     Page, TimeoutError as PlaywrightTimeout, sync_playwright,
 )
 
-from smart_tool.core import auth_store, blocks, datastore, desktop, image_locator
+from smart_tool.core import (
+    auth_store, blocks, datastore, desktop, image_locator, project_store,
+)
 from smart_tool.core import real_mouse as real_mouse_mod
 from smart_tool.core.blocks import Block
 from smart_tool.core.data_sources import DataSourceConfig, load_rows
@@ -238,6 +240,31 @@ def parse_script_params(raw: str) -> List[Tuple[str, str]]:
     return out
 
 
+def parse_func_params(raw: str) -> List[str]:
+    """函数的形参表（逗号分隔的名字，`单价, 倍数`）→ ["单价", "倍数"]。"""
+    return [chunk.strip() for chunk in str(raw or "").replace("，", ",").split(",")
+            if chunk.strip()]
+
+
+def parse_call_args(raw: str) -> List[Tuple[str, str]]:
+    """「调用函数」节点的实参 → [(形参名, 值), …]。
+
+    写法 `形参名=值`，值可写 {{变量}} 或字面量，逗号分隔（如 `单价={{价格}}, 倍数=2`）。
+    只写名字没写 `=` 的，当作「把同名变量传进去」。
+    """
+    out: List[Tuple[str, str]] = []
+    for chunk in str(raw or "").replace("，", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        name, sep, value = chunk.partition("=")
+        name = name.strip()
+        if not name:
+            continue
+        out.append((name, value.strip() if sep else f"{{{{{name}}}}}"))
+    return out
+
+
 def build_script_source(code: str, params: List[Tuple[str, str]]) -> str:
     """把用户代码包成一个函数（执行与编辑时的语法检查共用同一份）。"""
     names = ", ".join(p for _v, p in params)
@@ -286,7 +313,8 @@ def step_var_fields(step: Step) -> List[str]:
     texts = [step.url, step.value, step.wait_target,
              step.resume_url, step.resume_element, step.prompt,
              step.loop_expr, step.cond_expr,
-             step.win_title, step.keys, step.text]
+             step.win_title, step.keys, step.text,
+             step.func_args]        # 调用函数：实参里可写 {{变量}}
     # 定位也可以是变量（如 {{登录框}}：元素定位存在变量清单里）
     if step.locator is not None and step.locator.type != "image":
         texts.append(step.locator.value)
@@ -341,8 +369,8 @@ def collect_variables(steps: List[Step]) -> List[str]:
 def produced_variables(steps: List[Step]) -> Dict[str, Step]:
     """会产出变量的节点 → 那个节点。
 
-    「读取数据」「采集数据」按配置产出；「自由代码」按它填的「返回写到」算
-    （这样运行前的变量检查不会把它当成"没有来源"）。
+    「读取数据」「采集数据」按配置产出；「自由代码」和「调用函数」按它填的
+    「返回写到」算（这样运行前的变量检查不会把它当成"没有来源"）。
     """
     out: Dict[str, Step] = {}
     for s in steps:
@@ -353,7 +381,7 @@ def produced_variables(steps: List[Step]) -> Dict[str, Step]:
         elif s.action == "collect":
             for name in collect_outputs(s):
                 out.setdefault(name, s)
-        elif s.action == "script":
+        elif s.action in ("script", "call"):
             name = (s.script_output or "").strip()
             if name:
                 out.setdefault(name, s)
@@ -592,6 +620,8 @@ class StepExecutor:
         self._pause_requested = threading.Event()
         # 自由代码节点写出过哪些变量：循环里这些变量要跨轮保留（累加器 / 拼接）
         self._script_written: set = set()
+        # 函数库（项目里的 functions）：第一次真要调用时才去读盘
+        self._functions: Optional[Dict[str, Dict[str, Any]]] = None
 
     # ------------------------------
     # 对外控制
@@ -1000,6 +1030,8 @@ class StepExecutor:
                 self._pause_for_human(step)
             elif step.action == "script":
                 self._run_script(step)
+            elif step.action == "call":
+                self._run_call(step)
             elif step.action in ("loop_start", "loop_end", "condition_start",
                                  "condition_end", "branch"):
                 # 结构标记，正常路径在 blocks.parse 阶段已被剥离
@@ -1122,8 +1154,14 @@ class StepExecutor:
             updated, logs, returned = self._exec_python(
                 step, code, scope, params, args, timeout)
 
+        self._finish_script(step, scope, updated, logs, returned, "脚本")
+
+    def _finish_script(self, step: Step, scope: Dict[str, str],
+                       updated: Dict[str, Any], logs: List[str],
+                       returned: Any, tag: str):
+        """脚本 / 函数跑完的收尾：打日志、写回变量、处理返回值、写「返回写到」。"""
         for line in logs:
-            self.log(f"  [脚本] {line}")
+            self.log(f"  [{tag}] {line}")
 
         changed = []
         for k, v in updated.items():
@@ -1141,20 +1179,87 @@ class StepExecutor:
         if returned is not None:
             if out_var:
                 self._set_var(out_var, returned, changed)
-                self.log(f"  脚本返回 → {out_var} = {_short_text(returned)}")
+                self.log(f"  {tag}返回 → {out_var} = {_short_text(returned)}")
             elif isinstance(returned, dict):
                 for k, v in returned.items():
                     self._set_var(str(k), v, changed)
-                self.log("  脚本返回一字典 → "
+                self.log(f"  {tag}返回一字典 → "
                          + "、".join(str(k) for k in returned))
             else:
-                self.log(f"  [脚本] 返回：{_short_text(returned)}"
+                self.log(f"  [{tag}] 返回：{_short_text(returned)}"
                          "（没填「返回写到」，只记在这里）")
         elif out_var:
-            self.log(f"  提示：脚本没有 return，{out_var} 这次没写入。")
+            self.log(f"  提示：{tag}没有 return，{out_var} 这次没写入。")
 
         if changed:
-            self.log(f"  脚本更新变量：{', '.join(sorted(set(changed)))}")
+            self.log(f"  {tag}更新变量：{', '.join(sorted(set(changed)))}")
+
+    # ------------------------------
+    # 调用函数（函数库里的函数，一处定义多处调用）
+    # ------------------------------
+    def _function_lib(self) -> Dict[str, Dict[str, Any]]:
+        """函数库：项目 steps.json 里的 functions（第一次用到时才读盘）。"""
+        if self._functions is None:
+            lib: Dict[str, Dict[str, Any]] = {}
+            if self.project_dir:
+                store = project_store.ProjectStore(Path(self.project_dir))
+                for f in store.load_functions():
+                    lib[f["name"]] = f
+            self._functions = lib
+        return self._functions
+
+    def _run_call(self, step: Step):
+        """调用「函数库」里的一个函数。
+
+        - 实参写法 `形参名=值`（值可写 {{变量}} 或字面量）；没写的形参＝空文本
+        - 函数里 return 的值写到「返回写到」那个变量（和自由代码节点一致）
+        - 函数里照样能用 vars / log / page，等于把那段代码搬到这里执行
+        """
+        name = (step.func_name or "").strip()
+        if not name:
+            raise ValueError(
+                "「调用函数」节点还没选函数：双击它，在「调用函数」里选一个。\n"
+                "   函数在【项目管理…】→【函数库】里定义（一处定义、多处调用）。"
+            )
+        func = self._function_lib().get(name)
+        if func is None:
+            raise ValueError(
+                f"找不到函数「{name}」：可能被改名或删掉了。\n"
+                "   去【项目管理…】→【函数库】里看看，或者在这个节点里重新选一个。"
+            )
+        code = str(func.get("code") or "")
+        if not code.strip():
+            self.log(f"  函数「{name}」还没有代码，跳过。")
+            return
+        lang = str(func.get("lang") or "python").lower()
+        params = [(p, _param_name(p)) for p in parse_func_params(func.get("params"))]
+        valid = {p for p, _ in params}
+
+        given = dict(parse_call_args(step.func_args or ""))
+        unknown = [k for k in given if k not in valid]
+        if unknown:
+            raise ValueError(
+                f"函数「{name}」没有这些参数：{'、'.join(unknown)}。\n"
+                f"   它的入口参数是：{'、'.join(valid) or '（没有）'}"
+                "——在【项目管理…】→【函数库】里可以改。"
+            )
+        # 形参名 → 实际值（实参支持 {{变量}} 和字面量）；没传的按空文本
+        args = {p2: self._resolve_value(given.get(p1, "")) for p1, p2 in params}
+        scope = dict(self.variables)      # 函数里 vars[...] 照样能读全局变量
+        timeout = max(1, int(step.script_timeout or 30))
+
+        label = "JavaScript" if lang == "javascript" else "Python"
+        detail = ("，实参：" + "、".join(f"{k}={v}" for k, v in args.items())
+                  ) if args else "，没有参数"
+        self.log(f"  调用函数「{name}」（{label}）{detail}")
+
+        if lang == "javascript":
+            updated, logs, returned = self._exec_js(
+                step, code, scope, params, args, timeout)
+        else:
+            updated, logs, returned = self._exec_python(
+                step, code, scope, params, args, timeout)
+        self._finish_script(step, scope, updated, logs, returned, "函数")
 
     def _set_var(self, name: str, value: Any, changed: Optional[List[str]] = None):
         text = _to_var_text(value)
@@ -1175,13 +1280,14 @@ class StepExecutor:
         例外：卡在 time.sleep(600) 或浏览器调用这种「等外部返回」的写法上，
         只能等它自己返回——所以页面上等元素请用 page.xxx(..., timeout=毫秒)。
         """
+        who = "函数" if step.action == "call" else "脚本"
         src = build_script_source(code, params)
         filename = f"<脚本节点{step.id}>"
         try:
             tree = ast.parse(src, filename)
         except SyntaxError as e:
             line = max(1, int(e.lineno or 1) - 1)    # 减去包在外面的那一行
-            raise ValueError(f"Python 脚本语法错误（第 {line} 行）：{e.msg}")
+            raise ValueError(f"Python {who}语法错误（第 {line} 行）：{e.msg}")
         tree = _LoopGuard().visit(tree)
         ast.fix_missing_locations(tree)
         compiled = compile(tree, filename, "exec")
@@ -1207,17 +1313,17 @@ class StepExecutor:
             returned = ns["__run__"](**args)
         except _ScriptTimeout as e:
             raise ValueError(
-                f"Python 脚本超时：超过设定的 {timeout} 秒，已在第 {e.line} 行"
+                f"Python {who}超时：超过设定的 {timeout} 秒，已在第 {e.line} 行"
                 "附近中断。\n"
                 "    （循环里的等待请用 page.xxx(..., timeout=毫秒)；"
                 "time.sleep 这种系统等待没法中断，只能等它自己醒）"
             ) from None
         except Exception as e:
-            raise ValueError(f"Python 脚本出错{_script_line(e, step.id)}："
+            raise ValueError(f"Python {who}出错{_script_line(e, step.id)}："
                              f"{type(e).__name__}: {e}") from e
         used = time.monotonic() - started
         if used > timeout:
-            self.log(f"  提示：脚本耗时 {used:.1f}s，已超过设定 {timeout}s"
+            self.log(f"  提示：{who}耗时 {used:.1f}s，已超过设定 {timeout}s"
                      "（卡在等外部返回的调用上时没法中断）")
 
         out = dict(ns.get("vars") or {})

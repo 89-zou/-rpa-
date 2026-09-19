@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from smart_tool.core import project_store
 from smart_tool.core.project_store import Locator, Step
 from smart_tool.core.step_executor import (
     build_script_source, parse_script_params,
@@ -42,13 +43,13 @@ from smart_tool.ui.screen_capture import ScreenCaptureDialog
 WEB_ACTIONS = [
     "navigate", "read_data", "collect", "click", "fill", "select",
     "note", "pause_for_human", "loop_start", "loop_end", "condition_start",
-    "condition_end", "branch", "script",
+    "condition_end", "branch", "script", "call",
 ]
 # 桌面场景能用的动作（没有浏览器，也就没有 XPath / 下拉选择）
 DESKTOP_ACTIONS = [
     "win_activate", "click", "fill", "hotkey", "delay", "read_data",
     "note", "pause_for_human", "loop_start", "loop_end", "condition_start",
-    "condition_end", "branch", "script",
+    "condition_end", "branch", "script", "call",
 ]
 # 新建步骤时不出现在菜单里的动作：这些标记由系统配对生成
 NEW_STEP_HIDDEN = {"loop_end", "condition_end", "branch"}
@@ -67,6 +68,7 @@ ACTION_LABELS = {
     "condition_end": "条件结束（设置与「条件」共用，点哪个都是编辑这个条件）",
     "branch": "分支（匹配值在「条件」节点里改，点它会打开那个条件）",
     "script": "自由代码 script（Python / JavaScript）",
+    "call": "调用函数 call（调用【项目管理…】→【函数库】里定义好的函数）",
     # 桌面场景
     "win_activate": "激活窗口 win_activate（把目标程序的窗口切到最前面）",
     "hotkey": "按键 hotkey（如 enter、ctrl+s、alt+f4）",
@@ -142,6 +144,27 @@ SCRIPT_HINT_JS = (
     "· 取到的文本是页面原始文本，该 trim() 就 trim()。\n"
     "· 执行超时会中断「await 等着不回来」的写法；但如果脚本里写的是\n"
     "  同步死循环（while(true){}），页面本身就被卡住了，那种拦不住。"
+)
+
+CALL_HELP = (
+    "函数＝写一次、到处调用的一段代码。定义在【项目管理…】→【函数库】，\n"
+    "流程里放几个「调用函数」节点就能反复用它——改函数那一处，\n"
+    "所有调用它的地方一起变（这跟「自由代码」节点的区别：那是就地写一段）。\n"
+    "\n"
+    "【参数怎么传】写 `形参名=值`，逗号分隔，值可以是变量也可以是字面量：\n"
+    "    单价={{价格}}, 倍数=2, 备注=促销\n"
+    "函数的「入口参数」里写的是形参名（如 单价, 倍数），两边名字对上就行。\n"
+    "没写的形参＝空文本；只写名字不写 `=` （如 单价）＝把同名流程变量传进去。\n"
+    "\n"
+    "【返回值】函数里 return 什么，就写到「返回写到」那个变量；\n"
+    "留空＝只把返回值打进日志。列表 / 字典会存成 JSON，循环能直接遍历。\n"
+    "\n"
+    "【函数里能用什么】和「自由代码」节点一样：vars / log() / page /\n"
+    "current_url / project_dir；Python 函数里也能直接操作浏览器页面。\n"
+    "执行超时、报错行号的处理也一样（超时会真的把这步掐掉）。\n"
+    "\n"
+    "在哪加函数：【流程编辑…】上方的【项目管理…】→【函数库】页签，\n"
+    "点【新建函数】写名字、入口参数和代码即可。"
 )
 
 #: 【?】里的说明（界面上只留一句摘要）
@@ -725,6 +748,40 @@ class StepEditDialog(QDialog):
         self.script_timeout.setSuffix(" 秒")
         form.addRow("执行超时：", self.script_timeout)
 
+        # --- 调用函数（call）：用【项目管理…】→【函数库】里定义好的函数 ---
+        self.call_func_combo = QComboBox()
+        self.call_func_combo.setMinimumWidth(280)
+        self.call_func_combo.setToolTip(
+            "从项目的函数库里选一个函数（一处定义、多处调用）。\n"
+            "还没有函数？去【项目管理…】→【函数库】新建。"
+        )
+        form.addRow("调用函数：", self.call_func_combo)
+
+        call_row = QWidget()
+        call_layout = QHBoxLayout(call_row)
+        call_layout.setContentsMargins(0, 0, 0, 0)
+        self.call_args = QLineEdit()
+        self.call_args.setPlaceholderText(
+            "形参名=值，如：单价={{价格}}, 倍数=2（留空＝都按空文本传）")
+        self.call_args.setToolTip(
+            "传给函数的实参，逗号分隔，写法 `形参名=值`：\n"
+            "· 值可以写 {{变量}}，也可以是字面量（2、促销 这种）；\n"
+            "· 只写名字不写 = （如 单价）＝把同名的流程变量传进去；\n"
+            "· 没写的形参＝空文本。"
+        )
+        call_layout.addWidget(self.call_args, 1)
+        self.call_var_combo = QComboBox()
+        self.call_var_combo.setMinimumWidth(160)
+        self.call_var_combo.setToolTip("插入一个变量（插入到光标处）")
+        self.call_var_combo.activated.connect(self._insert_call_var)
+        call_layout.addWidget(self.call_var_combo)
+        form.addRow("参数：", call_row)
+
+        self.call_hint = help_row(
+            "函数在【项目管理…】→【函数库】里定义，改一处、所有调用一起变。",
+            "调用函数", CALL_HELP)
+        form.addRow("", self.call_hint)
+
         # --- 备注（所有动作）---
         self.note_edit = QLineEdit()
         self.note_edit.setPlaceholderText("可选，仅用于你自己辨识这一步")
@@ -756,8 +813,14 @@ class StepEditDialog(QDialog):
         self._loop_widgets = [self.loop_expr_row, self.loop_hint]
         self._script_widgets = [
             self.script_lang_combo, self.script_code, self.script_hint,
-            script_row, self.script_output, self.script_timeout,
+            script_row,
         ]
+        # 「返回写到 / 执行超时」是自由代码与调用函数共用的两行
+        self._script_out_widgets = [self.script_output, self.script_timeout]
+        self._call_widgets = [
+            self.call_func_combo, call_row, self.call_hint,
+        ]
+        self._load_function_list()
         self._refresh_var_combos()
 
     # ------------------------------
@@ -785,6 +848,7 @@ class StepEditDialog(QDialog):
         is_image = is_locate and self.locator_type.currentData() == "image"
         is_pause = action == "pause_for_human"
         is_script = action == "script"
+        is_call = action == "call"
         is_win = action == "win_activate"
         is_keys = action == "hotkey"
         is_delay = action == "delay"
@@ -832,6 +896,10 @@ class StepEditDialog(QDialog):
                    is_pause and cond in ("element_present", "url_and_element"))
         for w in self._script_widgets:
             self._show(w, is_script)
+        for w in self._script_out_widgets:
+            self._show(w, is_script or is_call)
+        for w in self._call_widgets:
+            self._show(w, is_call)
         for w in self._loop_widgets:
             self._show(w, is_loop)
         for w in self._cond_widgets:
@@ -902,6 +970,7 @@ class StepEditDialog(QDialog):
             (self.cond_var_combo, "插入变量 ▾"),
             (self.note_var_combo, "插入变量 ▾"),
             (self.script_var_combo, "添加变量 ▾"),
+            (self.call_var_combo, "插入变量 ▾"),
         ):
             combo.blockSignals(True)
             combo.clear()
@@ -964,6 +1033,39 @@ class StepEditDialog(QDialog):
             self.script_vars.setText(", ".join(current))
         self.script_vars.setFocus()
         self.script_var_combo.setCurrentIndex(0)
+
+    def _insert_call_var(self, index: int):
+        """把选中的变量插到「参数」的光标处（写成 {{变量}}）。"""
+        name = self.call_var_combo.itemData(index)
+        if not name:
+            return
+        self.call_args.insert(f"{{{{{name}}}}}")
+        self.call_args.setFocus()
+        self.call_var_combo.setCurrentIndex(0)
+
+    def _load_function_list(self):
+        """把项目函数库里的函数填进「调用函数」下拉。"""
+        self.call_func_combo.clear()
+        self.call_func_combo.addItem("（选一个函数…）", "")
+        try:
+            funcs = project_store.ProjectStore(self.project_dir).load_functions()
+        except Exception:
+            funcs = []
+        for f in funcs:
+            lang = "JS" if str(f.get("lang")).lower() == "javascript" else "Python"
+            params = (f.get("params") or "").strip()
+            tip = f"{f['name']}（{lang}）"
+            if params:
+                tip += f"\n入口参数：{params}"
+            if (f.get("desc") or "").strip():
+                tip += f"\n{f['desc'].strip()}"
+            self.call_func_combo.addItem(f"{f['name']}（{lang}）", f["name"])
+            self.call_func_combo.setItemData(
+                self.call_func_combo.count() - 1, tip,
+                Qt.ItemDataRole.ToolTipRole)
+        if not funcs:
+            self.call_func_combo.setItemText(
+                0, "（还没有函数：去【项目管理…】→【函数库】新建）")
 
     def _on_script_lang_changed(self):
         is_js = self.script_lang_combo.currentData() == "javascript"
@@ -1266,6 +1368,15 @@ class StepEditDialog(QDialog):
         self.script_timeout.setValue(s.script_timeout or 30)
         self._on_script_lang_changed()
 
+        # 调用函数：函数可能已经被改名 / 删掉，那就把它补进下拉，别让用户白改
+        name = (s.func_name or "").strip()
+        idx = self.call_func_combo.findData(name)
+        if name and idx < 0:
+            self.call_func_combo.addItem(f"{name}（已不在函数库里）", name)
+            idx = self.call_func_combo.count() - 1
+        self.call_func_combo.setCurrentIndex(max(0, idx))
+        self.call_args.setText(s.func_args or "")
+
         self.output_var_edit.setText(s.output_var or "")
         self.read_panel.load(s.data_cfg or {})
         self.collect_panel.load(s)
@@ -1417,6 +1528,12 @@ class StepEditDialog(QDialog):
                 except SyntaxError as e:
                     line = max(1, int(e.lineno or 1) - 1)
                     errors.append(f"Python 脚本语法错误（第 {line} 行）：{e.msg}")
+        elif action == "call":
+            if not self.call_func_combo.currentData():
+                errors.append(
+                    "调用函数节点必须选一个函数"
+                    "（还没定义过？去【项目管理…】→【函数库】新建一个）"
+                )
 
         if errors:
             QMessageBox.warning(self, "内容不完整", "\n".join(f"· {e}" for e in errors))
@@ -1473,6 +1590,11 @@ class StepEditDialog(QDialog):
             step.script_lang = self.script_lang_combo.currentData()
             step.script_code = self.script_code.toPlainText()
             step.script_vars = self.script_vars.text().strip()
+            step.script_output = self.script_output.text().strip()
+            step.script_timeout = self.script_timeout.value()
+        elif action == "call":
+            step.func_name = self.call_func_combo.currentData() or ""
+            step.func_args = self.call_args.text().strip()
             step.script_output = self.script_output.text().strip()
             step.script_timeout = self.script_timeout.value()
         elif action == "loop_start":
