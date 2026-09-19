@@ -3,21 +3,26 @@
 
 设计要点：
 - 列表从上到下就是执行顺序
-- 「循环开始/结束」「条件/分支/条件结束」是成对出现的结构节点：新增时系统一起创建，
-  配置只存在「循环开始」「条件」这些节点上（点配对的另一端也是编辑同一份配置）
+- 「循环开始/结束」「条件/分支/条件结束」「组合/组合结束」是成对出现的结构节点：
+  新增时系统一起创建，配置只存在「循环开始」「条件」这些节点上（点配对的另一端
+  也是编辑同一份配置）
 - 块可以互相嵌套，按层级缩进显示（循环体、条件下的分支、分支里的循环……）
-- 每个「循环体」和「分支」的末尾都有一行「＋ 点击创建新节点」，点一下把步骤加进去
-- 每次改动（增/插/改/删/移）立即写盘，并重新编号（从 1 开始），无需手动保存
+- **块都能展开 / 收起**：点块标记左边的 ▾ / ▸ 就行（循环、条件、组合都支持）
+- **合并成组合**：按住 Ctrl / Shift 多选几行 → 右键 → 「合并选中节点」，起个名字；
+  之后画布上就只显示这一张卡片。取消组合、改名也在右键菜单里
+- 每个「循环体」「分支」「组合」的末尾都有一行「＋ 点击创建新节点」
+- 每次改动（增/插/改/删/移/合并）立即写盘，并重新编号（从 1 开始），无需手动保存
 - 结构不合法时照样保存（不丢改动），但状态栏给出提醒
 """
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 from PyQt6.QtCore import QSize, Qt, QTimer
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QAction, QFont
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QDialog, QFrame, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout, QWidget,
+    QAbstractItemView, QDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
+    QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QVBoxLayout,
+    QWidget,
 )
 
 from smart_tool.core import blocks, project_store, step_executor
@@ -29,6 +34,8 @@ CARD_H = 56          # 卡片固定高度，避免列表项显示不全
 ADD_ROW_H = 30       # 「＋ 点击创建新节点」这一行的高度
 LOOP_INDENT = 22     # 每层缩进像素
 SUMMARY_MAX = 78     # 摘要最大字符数（手动截断，不依赖字体度量）
+#: 能展开 / 收起的块（分支不支持：它藏在条件里，跟着条件一起收）
+COLLAPSIBLE_KINDS = ("loop", "condition", "group")
 
 
 def _branch_text(steps: List[Step], index: int) -> str:
@@ -49,10 +56,15 @@ def _branch_text(steps: List[Step], index: int) -> str:
 
 
 class _StepCard(QWidget):
-    """列表里的一行节点卡片：色条 + 中文动作名 + 摘要。"""
+    """列表里的一行节点卡片：色条 + 中文动作名 + 摘要。
+
+    `on_toggle` 不为 None 时（循环 / 条件 / 组合的**开始**标记），
+    最左边多一个 ▾ / ▸，点一下把这个块收起来或展开。
+    """
 
     def __init__(self, step: Step, indent: int = 0,
-                 branch_text: str = "", parent=None):
+                 branch_text: str = "", collapsed: bool = False,
+                 hidden_count: int = 0, on_toggle=None, parent=None):
         super().__init__(parent)
         self.setFixedHeight(CARD_H)
         name, color = ACTION_META.get(step.action, (step.action, "#888888"))
@@ -60,6 +72,21 @@ class _StepCard(QWidget):
         root = QHBoxLayout(self)
         root.setContentsMargins(8 + indent, 5, 8, 5)
         root.setSpacing(9)
+
+        if on_toggle is not None:
+            btn = QPushButton("▸" if collapsed else "▾")
+            btn.setFixedSize(18, 18)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip("展开这个块" if collapsed else "收起这个块")
+            btn.setStyleSheet(
+                "QPushButton {border:none; color:#555555; font-size:12px;"
+                " padding:0px;}"
+                "QPushButton:hover {color:#111111;}"
+            )
+            # 延后一拍：点一下会重建整个列表，这个按钮当场就被销毁了，
+            # 直接在事件里重建会访问到已析构的控件（闪退）
+            btn.clicked.connect(lambda _=False: QTimer.singleShot(0, on_toggle))
+            root.addWidget(btn)
 
         bar = QFrame()
         bar.setFixedWidth(4)
@@ -72,9 +99,9 @@ class _StepCard(QWidget):
         text_box.addStretch()
 
         prefix = ""
-        if step.action in ("loop_start", "condition_start"):
+        if step.action in ("loop_start", "condition_start", "group_start"):
             prefix = "⤵ "
-        elif step.action in ("loop_end", "condition_end"):
+        elif step.action in ("loop_end", "condition_end", "group_end"):
             prefix = "⤴ "
         elif step.action == "branch":
             prefix = "⑂ "
@@ -94,6 +121,8 @@ class _StepCard(QWidget):
             summary = "（无参数）"
         if len(summary) > SUMMARY_MAX:
             summary = summary[:SUMMARY_MAX] + "…"
+        if collapsed and hidden_count:
+            summary += f"　（已收起 {hidden_count} 个步骤）"
         sub = QLabel(summary)
         sub.setStyleSheet("color:#666666;")
         text_box.addWidget(sub)
@@ -103,7 +132,7 @@ class _StepCard(QWidget):
 
 
 class _AddInLoopRow(QWidget):
-    """循环体末尾那一行「＋ 点击创建新节点」，点一下往这个循环里加步骤。"""
+    """块末尾那一行「＋ 点击创建新节点」，点一下往这个块里加步骤。"""
 
     def __init__(self, on_click, indent: int = 0, parent=None):
         super().__init__(parent)
@@ -146,6 +175,7 @@ class FlowEditorDialog(QDialog):
         # 列表里的行 → ("step", 步骤下标) 或 ("add", 块起始下标)
         self._rows: List[Tuple[str, int]] = []
         self._spans: list = []
+        self._collapsed: set = set()      # 收起来的块（起始标记的下标）
         self._changed = False
         self._init_ui()
         self._reload()
@@ -158,9 +188,11 @@ class FlowEditorDialog(QDialog):
 
         tip = QLabel(
             "列表从上到下就是执行顺序；双击某行可编辑。\n"
-            "「循环开始/结束」「条件/分支/条件结束」都是系统一起创建的结构节点，"
-            "设置只有一份（点配对的另一端也是编辑同一个块）；块可以嵌套，按缩进分层。\n"
-            "每个循环体 / 分支末尾都有「＋ 点击创建新节点」；所有改动立即保存。"
+            "「循环开始/结束」「条件/分支/条件结束」「组合/组合结束」都是系统一起创建的"
+            "结构节点，设置只有一份（点配对的另一端也是编辑同一个块）；块可以嵌套，按缩进分层。\n"
+            "块标记左边的 ▾ / ▸ 可以展开 / 收起（循环、条件、组合都行）；"
+            "按住 Ctrl / Shift 多选几行 → 右键 →「合并选中节点」把它们收成一个组合并起名。\n"
+            "每个块末尾都有「＋ 点击创建新节点」；所有改动立即保存。"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#777777;")
@@ -168,13 +200,16 @@ class FlowEditorDialog(QDialog):
 
         self.list_widget = QListWidget()
         self.list_widget.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection
+            QAbstractItemView.SelectionMode.ExtendedSelection
         )
         self.list_widget.setVerticalScrollMode(
             QAbstractItemView.ScrollMode.ScrollPerPixel
         )
         self.list_widget.itemSelectionChanged.connect(self._update_buttons)
         self.list_widget.itemDoubleClicked.connect(lambda _: self._edit_step())
+        self.list_widget.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list_widget.customContextMenuRequested.connect(self._show_menu)
         root.addWidget(self.list_widget, 1)
 
         # 操作按钮条
@@ -218,19 +253,30 @@ class FlowEditorDialog(QDialog):
     # 列表刷新
     # ------------------------------
     def _reload(self, select_index: Optional[int] = None):
-        """重建列表；select_index 指定刷新后选中的步骤下标。"""
+        """重建列表；select_index 指定刷新后选中的步骤下标。
+
+        收起来的块（`self._collapsed`）只显示它自己的开始标记，里面的行全部不画。
+        """
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
         self._rows = []
         self._spans = blocks.spans(self._steps)
         depths = blocks.depths(self._steps)
-        # 「＋ 点击创建新节点」放在每个循环体 / 分支的末尾
+        span_by_start = {sp.start: sp for sp in self._spans}
+        # 「＋ 点击创建新节点」放在每个循环体 / 分支 / 组合的末尾
         add_at = {sp.insert_pos: sp for sp in self._spans
-                  if sp.kind in ("loop", "branch")}
+                  if sp.kind in ("loop", "branch", "group")}
+        # 收起来的块：内部的行（含结束标记）整段不显示
+        skip = set()
+        for sp in self._spans:
+            if sp.start in self._collapsed:
+                skip.update(range(sp.inner_lo, sp.end + 1))
         for i, s in enumerate(self._steps):
+            if i in skip:
+                continue
             if i in add_at:
                 self._append_add_row(add_at[i], depths[i])
-            self._append_step_row(i, depths[i])
+            self._append_step_row(i, depths[i], span_by_start.get(i))
         self.list_widget.blockSignals(False)
 
         if select_index is not None:
@@ -240,19 +286,30 @@ class FlowEditorDialog(QDialog):
                     break
         self._update_buttons()
 
-    def _append_step_row(self, idx: int, depth: int):
+    def _append_step_row(self, idx: int, depth: int, span=None):
+        """加一行卡片；span 只在「块的开始标记」这一行传进来（要挂展开按钮）。"""
+        collapsed = False
+        hidden_count = 0
+        on_toggle = None
+        if span is not None and span.kind in COLLAPSIBLE_KINDS:
+            collapsed = span.start in self._collapsed
+            hidden_count = blocks.inner_count(span)
+            on_toggle = lambda start=span.start: self._toggle_collapse(start)
         item = QListWidgetItem()
         item.setSizeHint(QSize(0, CARD_H))          # 必须显式设置，否则卡片会被压扁
         self.list_widget.addItem(item)
         self.list_widget.setItemWidget(
             item, _StepCard(self._steps[idx],
                             LOOP_INDENT * depth,
-                            branch_text=_branch_text(self._steps, idx))
+                            branch_text=_branch_text(self._steps, idx),
+                            collapsed=collapsed,
+                            hidden_count=hidden_count,
+                            on_toggle=on_toggle)
         )
         self._rows.append(("step", idx))
 
     def _append_add_row(self, span, depth: int):
-        """在块（循环体 / 分支）末尾插一行「＋ 点击创建新节点」。"""
+        """在块（循环体 / 分支 / 组合）末尾插一行「＋ 点击创建新节点」。"""
         item = QListWidgetItem()
         item.setSizeHint(QSize(0, ADD_ROW_H))
         # 只保留「可用」：这一行是按钮，不该被当成步骤选中
@@ -264,6 +321,17 @@ class FlowEditorDialog(QDialog):
         )
         self._rows.append(("add", span.start))
 
+    # ------------------------------
+    # 展开 / 收起
+    # ------------------------------
+    def _toggle_collapse(self, start: int):
+        """收起 / 展开起始标记在 start 的那个块。"""
+        if start in self._collapsed:
+            self._collapsed.discard(start)
+        else:
+            self._collapsed.add(start)
+        self._reload(select_index=start)
+
     def _selected_row(self) -> int:
         """当前选中行 → self._steps 下标；没选中（或选的是「＋」行）返回 -1。"""
         row = self.list_widget.currentRow()
@@ -272,6 +340,132 @@ class FlowEditorDialog(QDialog):
             if kind == "step":
                 return idx
         return -1
+
+    def _selected_indices(self) -> List[int]:
+        """多选出来的步骤下标（去重、按列表顺序）。"""
+        out: List[int] = []
+        for item in self.list_widget.selectedItems():
+            row = self.list_widget.row(item)
+            if 0 <= row < len(self._rows):
+                kind, idx = self._rows[row]
+                if kind == "step" and idx not in out:
+                    out.append(idx)
+        return sorted(out)
+
+    # ------------------------------
+    # 右键菜单：合并 / 取消组合 / 改名 / 展开收起
+    # ------------------------------
+    def _show_menu(self, pos):
+        item = self.list_widget.itemAt(pos)
+        if item is not None and not item.isSelected():
+            # 右键点在某一行上：先把它选中（右键本身不会改选中项），
+            # 免得「右键第 5 行、菜单里动的却是之前选中的第 2 行」
+            self.list_widget.clearSelection()
+            item.setSelected(True)
+            self.list_widget.setCurrentItem(item)
+        sel = self._selected_indices()
+        group_sp = self._group_of(sel)
+        block_sp = self._collapsible_of(sel)
+
+        menu = QMenu(self)
+        act_merge = QAction("合并选中节点…", menu)
+        act_merge.setEnabled(len(sel) >= 2)
+        act_merge.triggered.connect(self._merge_selected)
+        menu.addAction(act_merge)
+        act_unge = QAction("取消组合（里面的步骤都留着）", menu)
+        act_unge.setEnabled(group_sp is not None)
+        act_unge.triggered.connect(self._ungroup_selected)
+        menu.addAction(act_unge)
+        act_rename = QAction("给组合改名…", menu)
+        act_rename.setEnabled(group_sp is not None)
+        act_rename.triggered.connect(self._rename_group_selected)
+        menu.addAction(act_rename)
+        menu.addSeparator()
+        if block_sp is not None:
+            folded = block_sp.start in self._collapsed
+            act_fold = QAction("展开这个块" if folded else "收起这个块", menu)
+            act_fold.triggered.connect(
+                lambda: self._toggle_collapse(block_sp.start))
+            menu.addAction(act_fold)
+        if not sel:
+            act_none = QAction("（先选中一行再操作）", menu)
+            act_none.setEnabled(False)
+            menu.addAction(act_none)
+        menu.exec(self.list_widget.viewport().mapToGlobal(pos))
+
+    def _group_of(self, indices: List[int]):
+        """选中的行落在哪个组合里（含组合的两个标记）。"""
+        for idx in indices:
+            sp = blocks.enclosing_span(self._spans, idx, ("group",))
+            if sp is not None:
+                return sp
+        return None
+
+    def _collapsible_of(self, indices: List[int]):
+        """选中的行落在哪个可收起的块里。"""
+        for idx in indices:
+            sp = blocks.enclosing_span(self._spans, idx, COLLAPSIBLE_KINDS)
+            if sp is not None:
+                return sp
+        return None
+
+    def _merge_selected(self):
+        """把选中的连续几行合成一个组合（画布上就只显示一张卡片）。"""
+        sel = self._selected_indices()
+        if len(sel) < 2:
+            QMessageBox.information(
+                self, "合并节点",
+                "请先按住 Ctrl / Shift 选中要合并的两个以上节点。")
+            return
+        lo, hi = sel[0], sel[-1]
+        if sel != list(range(lo, hi + 1)):
+            QMessageBox.information(
+                self, "合并节点",
+                "只能合并挨着的几行：中间别夹着没选中的行。")
+            return
+        problem = blocks.can_group(self._steps, lo, hi)
+        if problem:
+            QMessageBox.information(self, "没法合并", problem)
+            return
+        name, ok = QInputDialog.getText(
+            self, "给组合起个名字",
+            "这几步要合成一张卡片，给它起个名字（画布上显示这个名字）：",
+            text=blocks.DEFAULT_GROUP_NAME)
+        if not ok:
+            return
+        name = blocks.make_group(self._steps, lo, hi, name)
+        self._commit(select_index=lo)
+        self.status_label.setText(
+            f"已自动保存；这几步合并成了「{name}」，画布上只显示这一张卡片")
+
+    def _ungroup_selected(self):
+        """取消组合：只去掉这层壳，里面的步骤一个都不删。"""
+        sp = self._group_of(self._selected_indices())
+        if sp is None:
+            QMessageBox.information(self, "取消组合", "选中的行不在任何组合里。")
+            return
+        name = blocks.ungroup(self._steps, sp.start) or "组合"
+        self._commit(select_index=min(sp.start, len(self._steps) - 1))
+        self.status_label.setText(
+            f"已自动保存；「{name}」已取消组合，里面的步骤都留着")
+
+    def _rename_group_selected(self):
+        sp = self._group_of(self._selected_indices())
+        if sp is None:
+            QMessageBox.information(self, "组合改名", "选中的行不在任何组合里。")
+            return
+        self._rename_group_at(sp.start)
+
+    def _rename_group_at(self, index: int):
+        """给 index 处的「组合开始」改名字。"""
+        old = self._steps[index].title
+        name, ok = QInputDialog.getText(
+            self, "组合改名", "组合名称（画布上显示的就是它）：", text=old)
+        if not ok:
+            return
+        self._steps[index].title = (
+            (name or "").strip() or blocks.DEFAULT_GROUP_NAME)
+        self._commit(select_index=index)
 
     def _span_of_marker(self, idx: int):
         """idx 正好是某个块的起始/结束标记 → 返回那个块。"""
@@ -298,9 +492,14 @@ class FlowEditorDialog(QDialog):
         self.btn_down.setEnabled(has and idx < hi)
         loops = sum(1 for sp in self._spans if sp.kind == "loop")
         conds = sum(1 for sp in self._spans if sp.kind == "condition")
+        groups = sum(1 for sp in self._spans if sp.kind == "group")
+        folded = sum(1 for sp in self._spans
+                     if sp.kind in COLLAPSIBLE_KINDS and sp.start in self._collapsed)
         extra = "".join([
             f"，{loops} 个循环" if loops else "",
             f"，{conds} 个条件" if conds else "",
+            f"，{groups} 个组合" if groups else "",
+            f"，{folded} 个已收起" if folded else "",
         ])
         self.count_label.setText(f"共 {len(self._steps)} 个步骤" + extra)
 
@@ -382,8 +581,12 @@ class FlowEditorDialog(QDialog):
         idx = self._selected_row()
         if idx < 0:
             return
-        # 设置合并：点「循环结束」「分支」「条件结束」都是编辑所属的那个块
+        # 设置合并：点「循环结束」「分支」「条件结束」「组合结束」都是编辑所属的那个块
         idx = blocks.marker_owner_index(self._steps, idx)
+        if self._steps[idx].action == blocks.GROUP_START:
+            # 组合节点没有表单，能改的只有名字（结构改动走右键菜单）
+            self._rename_group_at(idx)
+            return
         old = self._steps[idx]
         dlg = StepEditDialog(
             self.project_dir, old, self,
@@ -420,6 +623,20 @@ class FlowEditorDialog(QDialog):
         s = self._steps[idx]
         name = ACTION_META.get(s.action, (s.action, ""))[0]
         block = self._span_of_marker(idx)
+        if block is not None and block.kind == "group":
+            # 组合节点上按「删除」＝取消组合，绝不会连里面的步骤一起删掉
+            gname = self._steps[block.start].title or "组合"
+            reply = QMessageBox.question(
+                self, "取消组合",
+                f"「{gname}」是组合节点。\n"
+                "取消组合只是去掉这一层壳，里面的步骤一个都不会删。\n"
+                "确定取消吗？"
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            blocks.ungroup(self._steps, block.start)
+            self._commit(select_index=min(block.start, len(self._steps) - 1))
+            return
         if block is not None:
             # 只有选中块的「标记」才整块删；块里的普通步骤就删它自己
             body = block.end - block.start - 1
@@ -482,10 +699,21 @@ class FlowEditorDialog(QDialog):
         """任何改动都走这里：补齐分支清单 → 重排编号 → 写盘 → 刷新列表。"""
         blocks.normalize_branch_lists(self._steps)
         self._renumber()
+        self._prune_collapsed()
         self._store.save(self._steps)
         self._changed = True
         self._reload(select_index=select_index)
         self._set_saved_tip()
+
+    def _prune_collapsed(self):
+        """增删步骤会让下标整体挪动，收起状态只保留「确实还落在某个块开头」的。
+
+        不清理的话，收起的记录会挂到一个无关的普通步骤上（虽然不会崩，
+        但点开时会莫名其妙收起一个不相干的块）。
+        """
+        starts = {sp.start for sp in blocks.spans(self._steps)
+                  if sp.kind in COLLAPSIBLE_KINDS}
+        self._collapsed &= starts
 
     def _renumber(self):
         """步骤编号按列表顺序从 1 重新排。"""

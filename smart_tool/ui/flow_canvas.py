@@ -10,9 +10,12 @@
   循环 / 条件（整块当一端，箭头直接落在它的虚线框上）；**块内部（循环体 /
   条件体 / 分支体）一条自动箭头都不画**，先后顺序看编号就够了
 - 想画框内的箭头：选中框内节点 → 点它右边出现的小箭头 → 再点另一个节点，
-  连这一条（要再连一条就再操作一遍）；点橙色箭头即可删掉它。
+  连这一条（要再连一条就再操作一遍）；**双击**橙色箭头即可删掉它。
   纯画布展示，不动执行顺序（存在 steps.json 的 canvas_edges 里，执行器不读）
 - 虚线框只有循环（紫）和条件（蓝）两种：**分支不套框**（靠分支卡片区分）
+- **组合节点**：把连着的一串步骤合成一个、起个名字，画布上只显示一张卡片
+  （内部的行不画，所以它内部的循环 / 条件也不画框）。合并 / 取消合并只能在
+  【流程编辑】里做；画布上双击它只会提示去哪儿展开
 - **拖虚线框＝整块移动**（块里嵌套的块与所有卡片一起走）；拖单个卡片仍是单独移动
 - 块可以嵌套（分支里放循环等），框按层级一层层套
 - 位置持久化到每个步骤的 pos；执行顺序由步骤列表顺序决定
@@ -86,6 +89,8 @@ ACTION_META = {
     "condition_start": ("条件", "#2f6fb3"),
     "condition_end": ("条件结束", "#2f6fb3"),
     "branch": ("分支", "#5b8fd0"),
+    "group_start": ("组合", "#0d7a6a"),
+    "group_end": ("组合结束", "#0d7a6a"),
     "script": ("自由代码", "#475569"),
     # 桌面场景
     "win_activate": ("激活窗口", "#7c3aed"),
@@ -94,11 +99,20 @@ ACTION_META = {
 }
 
 
-def node_height_for(step: Step) -> float:
-    """卡片高度（排版与绘制共用同一算法，避免对不齐）。"""
-    lines = max(1, len(step_summary(step)))
-    # 标题行 + 类型行 + 正文行
-    return HEADER_H + TYPE_LINE_H + lines * BODY_LINE_H + BODY_PAD * 2
+def node_height_for(step: Step, lines: Optional[List[str]] = None) -> float:
+    """卡片高度（排版与绘制共用同一算法，避免对不齐）。
+
+    lines 给的是「这张卡片实际要画几行」——组合卡片显示的不是步骤摘要，
+    所以要把行数显式传进来，否则算出来的高度和画出来的对不上。
+    """
+    if lines is None:
+        lines = step_summary(step)
+    return HEADER_H + TYPE_LINE_H + max(1, len(lines)) * BODY_LINE_H + BODY_PAD * 2
+
+
+def group_card_lines(count: int) -> List[str]:
+    """组合卡片上的正文：里面收了几步 + 去哪儿展开。"""
+    return [f"组合（{count} 个步骤）", "在【流程编辑…】里展开 / 取消组合"]
 
 
 def step_summary(s: Step, branch_text: str = "") -> List[str]:
@@ -159,6 +173,10 @@ def step_summary(s: Step, branch_text: str = "") -> List[str]:
         return [branch_text or "（匹配值在条件节点里改）"]
     if s.action == "condition_end":
         return ["条件体到此结束"]
+    if s.action == "group_start":
+        return [s.title or "（未命名组合）", "把连着的一串步骤收成一张卡片"]
+    if s.action == "group_end":
+        return ["组合到此结束"]
     if s.action == "script":
         lang = "JavaScript" if (s.script_lang or "").lower() == "javascript" else "Python"
         first = ""
@@ -216,15 +234,15 @@ class NodeItem(QGraphicsItem):
     """步骤卡片。"""
 
     def __init__(self, step: Step, canvas: "FlowCanvas",
-                 branch_text: str = ""):
+                 branch_text: str = "", lines: Optional[List[str]] = None):
         super().__init__()
         self.step = step
         self.canvas = canvas
         self._canvas = canvas
         self._name, color = ACTION_META.get(step.action, (step.action, "#888888"))
         self._color = QColor(color)
-        self._lines = step_summary(step, branch_text)
-        self._h = node_height_for(step)
+        self._lines = lines if lines is not None else step_summary(step, branch_text)
+        self._h = node_height_for(step, self._lines)
 
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
@@ -451,8 +469,9 @@ class EdgeItem(QGraphicsPathItem):
 
 
 # 画布上不画卡片的标记：成对标记的「结束」那一端只在【流程编辑】里显示，
-# 画布上用虚线框表示这一块的结束位置就够了
-HIDDEN_ACTIONS = ("loop_end", "condition_end")
+# 画布上用虚线框表示这一块的结束位置就够了。
+# 组合体内部的行也不画（只留「组合开始」那一张卡片），见 blocks.card_hidden_indices
+HIDDEN_ACTIONS = blocks.END_MARKERS
 
 
 def _region_pad(depth: int) -> Tuple[float, float, float, float]:
@@ -596,7 +615,11 @@ class _View(QGraphicsView):
         self.customContextMenuRequested.connect(self._show_menu)
 
     def mousePressEvent(self, event):
-        """左键：连线途中 → 完成连线；点橙色箭头 → 删掉它；其余走默认。"""
+        """左键：连线途中 → 完成连线；其余走默认。
+
+        手动连线的橙色箭头**不在这里删**：单击太容易误碰（拖动、选中节点时
+        手一滑就把线删了），改成双击才删，见 mouseDoubleClickEvent。
+        """
         if event.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(event)
             return
@@ -604,11 +627,15 @@ class _View(QGraphicsView):
             self._canvas.finish_connect(self.itemAt(event.pos()))
             event.accept()
             return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        """双击一条橙色箭头＝删掉它（单击不再删）。"""
         item = self.itemAt(event.pos())
         if isinstance(item, EdgeItem) and self._canvas.delete_manual_edge(item):
             event.accept()
             return
-        super().mousePressEvent(event)
+        super().mouseDoubleClickEvent(event)
 
     def wheelEvent(self, event):
         """Ctrl+滚轮 自由缩放（以鼠标位置为中心）；普通滚轮仍为上下滚动。"""
@@ -759,33 +786,44 @@ class FlowCanvas(QWidget):
     def assign_auto_layout(self, steps: List[Step],
                            per_row: Optional[int] = None):
         """横向蛇形排版：左→右填满一行后换行，下一行反向，原地写回 pos。"""
-        visible = [s for s in steps if s.action not in HIDDEN_ACTIONS]
-        if not visible:
+        hidden = blocks.card_hidden_indices(steps)
+        span_map = {sp.start: sp for sp in blocks.spans(steps)}
+        cards = [(i, s) for i, s in enumerate(steps) if i not in hidden]
+        if not cards:
             return
         per_row = max(1, per_row or self.compute_per_row())
-        heights = [node_height_for(s) for s in visible]
+        heights = [node_height_for(s, self._card_lines(i, s, span_map))
+                   for i, s in cards]
         # 块框会往外扩（层级越深越大），行距跟着放大，免得框压到上一行
         max_depth = max((sp.depth for sp in blocks.spans(steps)), default=0)
         gap_y = GAP_Y + 13.0 * (max_depth + 1)
 
         y = float(MARGIN_Y)
-        for row_start in range(0, len(visible), per_row):
-            row_end = min(row_start + per_row, len(visible))
+        for row_start in range(0, len(cards), per_row):
+            row_end = min(row_start + per_row, len(cards))
             row_h = max(heights[row_start:row_end])
             row_idx = row_start // per_row
             for i in range(row_start, row_end):
                 col = i % per_row
                 if row_idx % 2 == 1:        # 奇数行反向（蛇形回折）
                     col = per_row - 1 - col
-                visible[i].pos = [
+                cards[i][1].pos = [
                     float(MARGIN_X + col * (NODE_W + GAP_X)),
                     y,
                 ]
             y += row_h + gap_y
-        # 不画卡片的结束标记：给个占位坐标，免得每次都被判成「缺位置」而重排
-        for i, s in enumerate(steps):
-            if s.action in HIDDEN_ACTIONS and i > 0 and steps[i - 1].pos:
-                s.pos = list(steps[i - 1].pos)
+        # 不画卡片的行：给个占位坐标，免得每次都被判成「缺位置」而重排
+        for i in range(len(steps)):
+            if i in hidden and i > 0 and steps[i - 1].pos:
+                steps[i].pos = list(steps[i - 1].pos)
+
+    def _card_lines(self, index: int, step: Step,
+                    span_map: dict) -> Optional[List[str]]:
+        """这张卡片实际要画的正文行；普通节点返回 None（用步骤摘要）。"""
+        if step.action != blocks.GROUP_START:
+            return None
+        sp = span_map.get(index)
+        return group_card_lines(blocks.inner_count(sp) if sp else 0)
 
     def apply_auto_layout(self):
         """对外入口：按当前宽度重排全部节点并刷新画布。"""
@@ -812,8 +850,9 @@ class FlowCanvas(QWidget):
         self._steps = steps
 
         if auto_layout is None:
-            auto_layout = any(s.pos is None for s in steps
-                              if s.action not in HIDDEN_ACTIONS)
+            hidden = blocks.card_hidden_indices(steps)
+            auto_layout = any(s.pos is None for i, s in enumerate(steps)
+                              if i not in hidden)
         if auto_layout:
             self.assign_auto_layout(steps)
         if keep_view is None:
@@ -849,11 +888,14 @@ class FlowCanvas(QWidget):
         self._scene.clear()
 
         self._spans = blocks.spans(self._steps)
-        for s in self._steps:
-            if s.action in HIDDEN_ACTIONS:
-                continue        # 成对标记的结束端不画卡片（流程编辑里能看到）
+        hidden = blocks.card_hidden_indices(self._steps)
+        span_map = {sp.start: sp for sp in self._spans}
+        for i, s in enumerate(self._steps):
+            if i in hidden:
+                continue        # 结束端标记、以及组合体内部：画布上不画卡片
             node = NodeItem(s, self,
-                            branch_text=self._branch_text_of(s))
+                            branch_text=self._branch_text_of(s),
+                            lines=self._card_lines(i, s, span_map))
             # 块内的节点才给「连线小箭头」：最外层是自动连好的，不用手动连
             node.set_connectable(self._inside_block(s))
             self._scene.addItem(node)
@@ -951,14 +993,15 @@ class FlowCanvas(QWidget):
         - loop box → 循环紫框；condition box → 条件蓝框：
           连接到「一个块」时直接接到它最外层的虚线框上，
           箭头不必伸进框里去够里面的卡片；
-        - branch box → 分支卡本身（分支不套框，没有框可接）。
+        - branch box → 分支卡本身（分支不套框，没有框可接）；
+        - group box → 组合那张卡片（组合不套框，画布上就一张卡片）。
         """
         if isinstance(ref, tuple):
             idx = ref[1]
             sp = self._span_by_start(idx)
             if sp is None:
                 return None
-            if sp.kind == "branch":
+            if sp.kind in ("branch", "group"):
                 return self._nodes.get(self._steps[idx].id)
             return _LoopBoxPort(self._span_rect(sp))
         return self._nodes.get(ref)
@@ -966,9 +1009,11 @@ class FlowCanvas(QWidget):
     def _units_in(self, lo: int, hi: int) -> List[object]:
         """把 [lo, hi) 里的步骤按「单元」切开：块整块算一个单元。
 
-        块的端点见 _endpoint：循环 / 条件接到各自的虚线框上，分支接到分支卡上。
+        块的端点见 _endpoint：循环 / 条件接到各自的虚线框上，分支接到分支卡上，
+        组合接到它自己那张卡片上。
         """
         units: List[object] = []
+        hidden = blocks.card_hidden_indices(self._steps)
         i = lo
         while i < hi:
             sp = self._span_by_start(i)
@@ -978,8 +1023,8 @@ class FlowCanvas(QWidget):
             if complete:
                 units.append(("box", i))
                 i = sp.inner_hi if sp.kind == "branch" else sp.end + 1
-            elif self._steps[i].action in HIDDEN_ACTIONS:
-                i += 1          # 不画卡片的结束标记，不参与连线
+            elif i in hidden:
+                i += 1          # 不画卡片的行（结束标记 / 组合体内部），不参与连线
             else:
                 units.append(self._steps[i].id)
                 i += 1
@@ -1065,7 +1110,7 @@ class FlowCanvas(QWidget):
         )
 
     def delete_manual_edge(self, item) -> bool:
-        """点一条橙色箭头＝删掉它；返回是否真的删了。"""
+        """双击一条橙色箭头＝删掉它；返回是否真的删了。"""
         if item not in self._manual_edge_items:
             return False
         idx = self._manual_edge_items.index(item)
@@ -1159,17 +1204,25 @@ class FlowCanvas(QWidget):
         return f"{step.id}. {step.title or name}"
 
     def _build_regions(self):
-        """循环 / 条件各画一个虚线框（嵌套时框也嵌套）；分支不画框。
+        """循环 / 条件各画一个虚线框（嵌套时框也嵌套）；分支、组合不画框。
+
+        组合里面收着的循环 / 条件也不画框——组合在画布上就是一张卡片，
+        框画出来反而像是「组合里还有东西露在外面」。
 
         注意：先把所有 LoopRegion 对象都建好（此时 _span_rect 还不准，
         因为子 region 可能还没注册到 _region_spans），然后按 depth 从大到小
         重算 rect——内层先准确，外层 union 子层时才能拿到正确的框范围。
         """
+        in_group = set()
+        for gsp in blocks.group_spans(self._spans):
+            in_group.update(range(gsp.start, gsp.end + 1))
         # 第一轮：创建所有 region 对象，先占位注册到列表里
         pending: List[Tuple[LoopRegion, blocks.Span]] = []
         for sp in self._spans:
             if sp.kind not in REGION_COLORS:
-                continue        # 分支不套框：靠卡片与「条件→分支」箭头区分
+                continue        # 分支 / 组合不套框
+            if sp.start in in_group:
+                continue        # 被组合收起来了，不画
             region = LoopRegion(REGION_COLORS[sp.kind], self, sp)
             self._scene.addItem(region)
             self._regions.append(region)

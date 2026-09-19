@@ -8,11 +8,11 @@ from smart_tool.ui.web_automation_tab import WebAutomationTab
 
 
 class MainWindow(QMainWindow):
-    """智能化工具主窗口。"""
+    """小邹RPA 主窗口。"""
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("智能化工具 ｜ 作者：@小邹")
+        self.setWindowTitle("小邹RPA ｜ 作者：@小邹")
         self.setGeometry(300, 200, 900, 650)
 
         central = QWidget()
@@ -21,7 +21,7 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.web_tab = WebAutomationTab()
-        self.tabs.addTab(self.web_tab, "浏览器自动化")
+        self.tabs.addTab(self.web_tab, "主页")
         layout.addWidget(self.tabs)
 
     def closeEvent(self, event):
