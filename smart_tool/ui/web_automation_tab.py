@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QCheckBox, QDialog, QHBoxLayout, QLabel, QMenu, QMessageBox,
@@ -118,6 +118,12 @@ class WebAutomationTab(QWidget):
         self._user_paused = False       # 小窗上手动暂停中
         self._flow_paused = False       # 流程里的「暂停等人工」节点正在等
         self._step_labels: dict = {}    # 步骤 id → 显示编号（结构标记的结束端不占编号）
+        # 画布缩放：Ctrl+滚轮会连发一串，抖一下再落盘（跟着项目走）
+        self._pending_zoom = 0.0
+        self._zoom_timer = QTimer(self)
+        self._zoom_timer.setSingleShot(True)
+        self._zoom_timer.setInterval(500)
+        self._zoom_timer.timeout.connect(self._save_zoom_now)
         self._init_ui()
         # 启动就打开一个项目：优先「安装时指定的默认项目」，没有就找内置演示项目；
         # 都没有（比如用户把演示项目删了）→ 保持空项目，自己去【新建项目…】。
@@ -194,6 +200,7 @@ class WebAutomationTab(QWidget):
         self.canvas.auto_layout_applied.connect(self._on_auto_layout_applied)
         self.canvas.context_menu_requested.connect(self._show_canvas_menu)
         self.canvas.edges_changed.connect(self._persist_canvas_edges)
+        self.canvas.zoom_changed.connect(self._persist_canvas_zoom)
         self.canvas.connect_status.connect(self._on_connect_status)
         layout.addWidget(self.canvas, 3)
 
@@ -335,6 +342,8 @@ class WebAutomationTab(QWidget):
                                auto_layout=False, keep_view=False)
         # 画布上手动连的箭头（纯展示，随项目保存）
         self.canvas.set_manual_edges(store.load_canvas_edges())
+        # 上次在这个项目里调好的缩放（Ctrl+滚轮那个），没存过就是 100%
+        self.canvas.set_zoom(store.load_canvas_zoom() or 1.0)
         if need_layout:
             self.canvas.request_layout_when_ready()
         self.canvas.set_placeholder_text(DEFAULT_PLACEHOLDER)
@@ -356,6 +365,15 @@ class WebAutomationTab(QWidget):
         if self._current_store:
             self._current_store.save_canvas_edges(self.canvas.manual_edges())
 
+    def _persist_canvas_zoom(self, zoom: float):
+        """Ctrl+滚轮调了缩放 → 稍后落盘（连着滚会来一串，攒一攒再写）。"""
+        self._pending_zoom = float(zoom)
+        self._zoom_timer.start()
+
+    def _save_zoom_now(self):
+        if self._current_store and self._pending_zoom:
+            self._current_store.save_canvas_zoom(self._pending_zoom)
+
     def _clear_project(self):
         """卸载当前项目（未载入状态）。"""
         self._current_store = None
@@ -368,6 +386,7 @@ class WebAutomationTab(QWidget):
         self.canvas.set_manual_edges([])
         self.canvas.set_placeholder_text(NO_PROJECT_PLACEHOLDER)
         self.canvas.load_steps([])
+        self.canvas.set_zoom(1.0)          # 没项目就回到原始大小
         self.project_label.setText("当前项目：（未载入，请点【载入项目…】）")
         self._update_edit_buttons()
 
