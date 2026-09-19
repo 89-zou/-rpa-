@@ -1,10 +1,10 @@
-﻿# 打 Windows 包（onedir）：powershell -ExecutionPolicy Bypass -File packaging\build.ps1
+﻿# 打 Windows 包（单文件 exe）：powershell -ExecutionPolicy Bypass -File packaging\build.ps1
 #
-# 产物：dist\小邹RPA\（整个文件夹就是"安装包"，拷给别人即可）
-#       dist\小邹RPA\小邹RPA.exe 是入口，第一次运行会弹安装向导。
+# 产物：dist\小邹RPA.exe —— 就这一个文件，拷给别人即可，双击第一次运行会弹安装向导。
 #
 # 注意：浏览器内核（Chromium，约 150MB）不打进包里，由安装向导联网下载到
 #       %LOCALAPPDATA%\ms-playwright。
+#       单文件版每次启动要先解包到 %TEMP%（几秒钟），想秒开就改成 onedir（见 spec 注释）。
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot            # 仓库根目录
@@ -23,10 +23,9 @@ Write-Host "== 2/2 开始打包（几分钟，中间会刷很多日志）==" -Fo
     --workpath (Join-Path $root "build") `
     (Join-Path $PSScriptRoot "小邹RPA.spec")
 
-$exe = Join-Path $root "dist\小邹RPA\小邹RPA.exe"
+$exe = Join-Path $root "dist\小邹RPA.exe"
 if (-not (Test-Path $exe)) { throw "打包结束但没找到 $exe" }
 
-$size = (Get-ChildItem (Join-Path $root "dist\小邹RPA") -Recurse -File |
-         Measure-Object -Property Length -Sum).Sum / 1MB
-Write-Host ("打包完成：{0}（{1:N0} MB）" -f $exe, $size) -ForegroundColor Green
-Write-Host "把这个 dist\小邹RPA 文件夹整个拷给别人，双击 exe 就会弹安装向导。"
+$size = (Get-Item $exe).Length / 1MB
+Write-Host ("打包完成：{0}（{1:N0} MB，单文件）" -f $exe, $size) -ForegroundColor Green
+Write-Host "把这个 exe 拷给别人，双击就会弹安装向导。"

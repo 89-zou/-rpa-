@@ -1,21 +1,26 @@
 # -*- coding: utf-8 -*-
-"""安装向导：引导选目录 → 环境构建 → 建快捷方式 → 启动程序。
+"""安装向导：引导选文件夹 → 环境构建 → 建快捷方式 → 启动程序。
 
 用户拿到 exe 以后看到的第一个界面就是它（第一次运行自动弹）：
     1. 【欢迎】说明这个小工具能干什么；
-    2. 【目录】默认 C 盘常用安装路径（Program Files），也可以自己挑；
-       还要选【用户数据目录】（项目、账号密码、采集结果、登录态都放这儿）；
+    2. 【选一个文件夹】程序和数据都放这儿（默认＝程序现在待的位置，
+       不硬推 C 盘；也可以自己挑，选好之后程序会把自己复制过去）；
     3. 【选项】桌面快捷方式（默认勾上，强烈建议留着）、开始菜单；
     4. 【安装】开始环境构建，实时日志：
-          · 写配置、建目录
-          · 把内置的演示项目复制到你的数据目录（启动后会默认打开它）
+          · 写配置、建项目目录
+          · 把内置的演示项目复制到你的文件夹（启动后会默认打开它）
           · 下载浏览器内核 Chromium（打包版没有自带，约 150 MB）
-          · 建桌面 / 开始菜单快捷方式（带 logo 图标）
+          · 把自己复制到目标文件夹、建带 logo 的快捷方式
           · 登记到 Windows 的卸载列表（设置 → 应用 里能看到「小邹RPA」，点卸载走
-            `smart_tool/uninstall.py`，会把快捷方式、程序文件、配置一并清掉）
+            `smart_tool/uninstall.py`，会把快捷方式、程序本体、配置一并清掉）
     5. 完成后可以直接启动程序。
 
-另外也能当独立入口跑：`python -m smart_tool.setup_wizard`（随时重跑，比如补装浏览器）。
+程序和数据在同一个文件夹里（绿色版）：换电脑、拷 U 盘，整个文件夹搬走就行。
+
+写不进去系统的情况（没权限、注册表被策略锁住）不报错，直接退成「免安装模式」：
+程序留在原地，只把文件夹和环境构建好，不碰注册表。
+
+另外也能当独立入口跑：`小邹RPA.exe --setup`（随时重跑，比如补装浏览器）。
 """
 import shutil
 import subprocess
@@ -81,12 +86,13 @@ class BuildWorker(QThread):
     # ------------------------------
     def _build(self):
         plan = self.plan
-        data_dir = Path(str(plan["data_dir"])).expanduser()
-        self._step(6, f"用户数据目录：{data_dir}")
+        # 程序和数据就放同一个文件夹（用户只指定这一个目录）
+        target_dir = Path(str(plan["target_dir"])).expanduser()
+        self._step(6, f"安装位置：{target_dir}")
 
-        # 1) 写配置：数据目录 / 快捷方式选项 / 默认打开的项目
+        # 1) 写配置：数据目录 = 这个文件夹（绿色版），以及快捷方式选项、默认项目
         try:
-            paths.set_data_dir(data_dir)
+            paths.set_data_dir(target_dir)
             paths.save_config(
                 installed=True,
                 desktop_shortcut=bool(plan.get("desktop")),
@@ -99,10 +105,10 @@ class BuildWorker(QThread):
             self.results.append((False, f"写配置失败：{e}（可能是目录没权限）"))
 
         # 2) 建目录
-        projects = data_dir / "projects"
+        projects = target_dir / "projects"
         try:
             projects.mkdir(parents=True, exist_ok=True)
-            (data_dir / "logs").mkdir(parents=True, exist_ok=True)
+            (target_dir / "logs").mkdir(parents=True, exist_ok=True)
             self._step(16, f"项目目录：{projects}")
             self.results.append((True, f"项目目录就绪：{projects}"))
         except OSError as e:
@@ -147,15 +153,15 @@ class BuildWorker(QThread):
                                  "浏览器内核没装成功（可以重跑安装向导再试）"))
             self._step(88)
 
-        # 5) 装进系统：把程序复制到安装目录、建快捷方式、登记卸载入口。
-        #    先探一下能不能装：装不了（没权限写安装目录 / 写不了注册表）就退成
-        #    免安装模式——程序留在原地，只构建数据目录和环境，一个字节都不写系统。
+        # 5) 把程序放到你选的文件夹里 + 建快捷方式 + 登记卸载入口。
+        #    先探一下能不能放：放不进去（没权限之类）就退成免安装模式——
+        #    程序留在原地用，只把项目目录和环境构建好，一个字节都不写系统。
         self._step(90, "正在准备安装位置…")
         can_copy, can_reg, reason = self._probe()
         self.portable = not (can_copy and can_reg)
         if self.portable:
             self.log.emit(f"免安装模式：{reason}")
-            self.log.emit("程序就留在原地用；以后卸载时直接把程序文件夹删掉就行。")
+            self.log.emit("程序就留在原地用；以后卸载时直接把它删掉就行。")
             self.results.append((True, f"免安装模式（不写入系统）：{reason}"))
             target = shortcut.launch_target()
         else:
@@ -182,7 +188,7 @@ class BuildWorker(QThread):
                 self.results.append(
                     (False, f"{label}创建失败：{r['error']}（不影响使用，可手动建）"))
 
-        # 6) 记下装到哪儿 + 登记到 Windows 卸载列表
+        # 6) 记下程序在哪儿 + 登记到 Windows 卸载列表
         self._step(96, "正在登记卸载信息…")
         install_dir = ""
         if not self.portable and not str(target.get("args") or "").strip():
@@ -193,72 +199,62 @@ class BuildWorker(QThread):
                           installed_at=f"{datetime.now():%Y-%m-%d %H:%M}")
         if self.portable or not can_reg:
             self.results.append(
-                (True, "没有登记系统卸载入口：卸载时删掉程序文件夹即可"
-                       f"（程序在 {paths.app_dir()}）"))
+                (True, "没有登记系统卸载入口：卸载时把程序和数据文件夹删掉即可"
+                       f"（程序在 {Path(target['target']).parent}）"))
         else:
-            size = uninstall_reg.dir_size(install_dir) if install_dir else 0
-            info = uninstall_reg.register(target, size_bytes=size)
+            info = uninstall_reg.register(
+                target, size_bytes=uninstall_reg.dir_size(Path(target["target"])))
             if info["ok"]:
                 self.results.append(
                     (True, "已登记到系统卸载列表（设置 → 应用 → 小邹RPA 里可以卸载）"))
             else:
-                # 登记失败也能用：告诉用户手动删目录就是卸载
+                # 登记失败也能用：告诉用户手动删就是卸载
                 self.results.append(
                     (False, f"登记卸载入口失败：{info['error']}"
-                            f"（不影响使用，卸载时删掉 {paths.app_dir()} 即可）"))
+                            "（不影响使用，卸载时删掉程序文件夹即可）"))
         self._step(98)
 
-        # 程序被复制到别的位置：记下来，构建完直接启动那边的，别在这边"假装装好了"
+        # 程序被复制到了别处：记下来，构建完直接启动那边的，别在这边"假装装好了"
         if not self.portable and \
                 str(target["target"]) != str(shortcut.launch_target()["target"]):
             self.new_target = target
 
     # ------------------------------
     def _probe(self) -> Tuple[bool, bool, str]:
-        """探一探这台机器能不能「装进系统」：能否复制程序、能否写卸载列表。
+        """探一探这台机器能不能把程序放进你选的目录、能不能写卸载列表。
 
-        返回 (能复制程序?, 能写注册表?, 说明)。装不了不算失败——降级免安装即可。
+        返回 (能放进去?, 能写注册表?, 说明)。放不进去不算失败——降级免安装即可。
         """
-        want = str(self.plan.get("install_dir") or "").strip()
+        target_dir = Path(str(self.plan.get("target_dir") or "")).expanduser()
         frozen = bool(self.plan.get("frozen"))
         can_reg = uninstall_reg.can_register()
         no_reg = "" if can_reg else "这台机器写不了注册表（受限账户或组策略限制）"
         if not frozen:
             return True, can_reg, no_reg or "源码运行：不复制程序文件"
-        if not want:
-            return True, can_reg, no_reg or "程序已经在当前位置"
-        want_path = Path(want).expanduser()
-        try:
-            same = want_path.resolve() == paths.app_dir().resolve()
-        except OSError:
-            same = False
-        if same:
-            return True, can_reg, no_reg or "程序已经在安装目录里"
-        if not _dir_writable(want_path):
-            return False, can_reg, f"往 {want_path} 里写不进东西（通常要管理员权限）"
+        if not _dir_writable(target_dir):
+            return False, can_reg, f"{target_dir} 里写不进东西（换个文件夹，或用管理员身份运行）"
         return True, can_reg, no_reg
 
     def _copy_program(self) -> Optional[Dict[str, str]]:
-        """把程序文件复制到安装目录（就是自己复制自己），返回那边的启动目标。"""
-        want = str(self.plan.get("install_dir") or "").strip()
-        if not want:
+        """把程序（单文件 exe）复制到你选的目录，返回那边的启动目标。"""
+        if not self.plan.get("frozen"):
             return None
-        want_path = Path(want).expanduser()
-        here = paths.app_dir()
+        target_dir = Path(str(self.plan.get("target_dir"))).expanduser()
+        src = Path(sys.executable).resolve()
+        dst = target_dir / src.name
         try:
-            if want_path.resolve() == here.resolve():
-                self.results.append((True, f"程序就在安装目录里：{here}"))
+            if dst.exists() and dst.resolve() == src.resolve():
+                self.results.append((True, f"程序已经在这个文件夹里：{src}"))
                 return None
-            shutil.copytree(here, want_path, dirs_exist_ok=True)
+            shutil.copy2(src, dst)
         except OSError as e:
             # 复制不了也不报错：退回免安装模式
             self.portable = True
-            self.results.append((False, f"复制程序到 {want_path} 失败：{e}"))
+            self.results.append((False, f"复制程序到 {target_dir} 失败：{e}"))
             self.log.emit("复制不过去，改用免安装模式：程序留在原地用。")
             return None
-        self.results.append((True, f"程序已复制到：{want_path}"))
-        return {"target": str(want_path / Path(sys.executable).name), "args": "",
-                "workdir": str(want_path)}
+        self.results.append((True, f"程序已放到：{dst}"))
+        return {"target": str(dst), "args": "", "workdir": str(target_dir)}
 
     def _browser_log(self, text: str):
         """下载浏览器的输出：日志照发，进度条也跟着动一动。"""
@@ -324,11 +320,12 @@ class _WelcomePage(QWizardPage):
             lay.addWidget(pic)
         text = QLabel(
             "接下来会带你做这几件事（点【取消】不会改动任何东西）：\n"
-            "  1. 选目录：程序装哪儿、你的项目数据存哪儿；\n"
+            "  1. 选一个文件夹：程序和你所有的项目数据都放在这里面（就一个目录）；\n"
             "  2. 环境构建：自动把内置演示项目装好、把浏览器内核下好；\n"
             "  3. 建一个带 logo 的桌面快捷方式，以后双击就能启动。\n\n"
             "装完就能直接用：打开程序会默认载入那个演示项目（不想要了随时删，\n"
-            "删掉以后就是一个空项目，自己新建即可）。"
+            "删掉以后就是一个空项目，自己新建即可）。\n"
+            "整个文件夹随时可以拷到 U 盘或另一台电脑，项目数据跟着一起走。"
         )
         text.setWordWrap(True)
         lay.addWidget(text)
@@ -339,43 +336,34 @@ class _DirsPage(QWizardPage):
     def __init__(self, wizard):
         super().__init__()
         self.wizard_ref = wizard
-        self.setTitle("选择目录")
-        self.setSubTitle("默认值直接用也行；想改就点【浏览…】")
+        self.setTitle("选一个文件夹")
+        self.setSubTitle("程序和你的项目数据都放这个文件夹里；默认值是程序现在所在的位置")
         root = QVBoxLayout(self)
 
         form = QFormLayout()
-        self.data_edit = QLineEdit(wizard.default_data_dir)
-        btn_data = QPushButton("浏览…")
-        btn_data.clicked.connect(lambda: wizard.pick_dir(self.data_edit, "选用户数据目录"))
-        form.addRow("用户数据目录：", wizard.with_button(self.data_edit, btn_data))
-        if wizard.frozen:
-            self.install_edit = QLineEdit(wizard.default_install_dir)
-            btn_app = QPushButton("浏览…")
-            btn_app.clicked.connect(
-                lambda: wizard.pick_dir(self.install_edit, "选程序安装目录"))
-            form.addRow("程序安装目录：", wizard.with_button(self.install_edit, btn_app))
-        else:
-            self.install_edit = None
+        self.dir_edit = QLineEdit(wizard.default_dir)
+        btn = QPushButton("浏览…")
+        btn.clicked.connect(lambda: wizard.pick_dir(self.dir_edit, "选一个文件夹"))
+        form.addRow("安装位置：", wizard.with_button(self.dir_edit, btn))
         root.addLayout(form)
 
         hint = QLabel(
-            "· 用户数据目录：你的项目（含账号密码）、图片库、采集结果、登录态 cookie、\n"
-            "  崩溃日志都放这里。换电脑或做备份，只拷这一个目录就够了。\n"
-            + ("· 程序安装目录：程序文件会复制到这里（建议用默认的 Program Files）。\n"
-               "  这个目录要管理员权限；写不进去的话会自动改用免安装模式：程序留在原地、\n"
-               "  不写注册表，只把用户数据目录和环境构建好，卸载时删掉程序文件夹即可。"
-               if wizard.frozen else
-               f"· 程序现在在：{paths.app_dir()}"
-               "（源码运行时不会复制程序文件；打包成 exe 后才会复制）"))
+            "· 就这一个目录，程序文件、你的项目（含账号密码）、图片库、采集结果、\n"
+            "  登录态 cookie 全在里面；卸载 = 把这个文件夹删掉。\n"
+            "· 换个地方也行（比如 D 盘、U 盘）：点【浏览…】选好，程序会把自己复制过去。\n"
+            "· 写不进去的目录（比如没权限的系统目录）会自动改用免安装模式：程序留在\n"
+            "  原地、不写注册表，只把项目目录和环境构建好。\n"
+            + ("" if wizard.frozen else
+               f"· 源码运行模式：不会复制程序文件，程序现在在 {paths.app_dir()}"))
         hint.setStyleSheet("color:#666;")
         hint.setWordWrap(True)
         root.addWidget(hint)
         root.addStretch(1)
 
     def validatePage(self) -> bool:
-        text = self.data_edit.text().strip()
+        text = self.dir_edit.text().strip()
         if not text:
-            QMessageBox.warning(self, "提示", "请先选一个「用户数据目录」")
+            QMessageBox.warning(self, "提示", "请先选一个文件夹")
             return False
         try:
             Path(text).expanduser().mkdir(parents=True, exist_ok=True)
@@ -440,8 +428,10 @@ class _BuildPage(QWizardPage):
         self.log_box.setPlaceholderText("安装过程中的日志会显示在这里…")
         lay.addWidget(self.log_box, 1)
 
-    def initializePage(self, page_id: int):
-        super().initializePage(page_id)
+    def initializePage(self):
+        # 注意：PyQt6 这个钩子不带参数（Qt 原版就是 initializePage()），
+        # 写成 initializePage(self, page_id) 会在进入本页时直接抛 TypeError
+        super().initializePage()
         buttons = self.wizard_ref.button
         buttons(QWizard.WizardButton.FinishButton).setEnabled(False)
         buttons(QWizard.WizardButton.BackButton).setEnabled(False)
@@ -451,8 +441,7 @@ class _BuildPage(QWizardPage):
         self.log_box.setPlainText("")
 
         plan = {
-            "data_dir": self.wizard_ref.data_dir(),
-            "install_dir": self.wizard_ref.install_dir(),
+            "target_dir": self.wizard_ref.target_dir(),
             "desktop": self.wizard_ref.page_options.chk_desktop.isChecked(),
             "startmenu": self.wizard_ref.page_options.chk_start.isChecked(),
             "browser": self.wizard_ref.page_options.chk_browser.isChecked(),
@@ -506,8 +495,7 @@ class SetupWizard(QWizard):
         self.results: List[Tuple[bool, str]] = []
         #: 程序被复制到别的安装目录时，那边的启动目标（main.py 用它来重新启动）
         self.relaunch_target: Optional[Dict[str, str]] = None
-        self.default_data_dir = self._default_data_dir()
-        self.default_install_dir = self._default_install_dir()
+        self.default_dir = self._default_dir()
 
         self.setWindowTitle(f"{paths.APP_NAME} 安装向导")
         self.setWizardStyle(QWizard.WizardStyle.ModernStyle)
@@ -532,27 +520,16 @@ class SetupWizard(QWizard):
     # 小工具
     # ------------------------------
     @staticmethod
-    def _default_data_dir() -> str:
-        cfg = paths.load_config().get("data_dir")
-        if cfg:
-            return str(cfg)
-        if (paths.app_dir() / "projects").is_dir():
-            return str(paths.app_dir())          # 绿色版：程序旁边
-        return str(paths.CONFIG_DIR)
+    def _default_dir() -> str:
+        """默认安装位置 = 程序现在待的地方（用户自己放在哪就是哪，不硬推 C 盘）。"""
+        config_dir = str(paths.load_config().get("data_dir") or "").strip()
+        if config_dir:
+            return config_dir
+        return str(paths.app_dir())
 
-    @staticmethod
-    def _default_install_dir() -> str:
-        import os
-
-        base = os.environ.get("ProgramFiles") or r"C:\Program Files"
-        return str(Path(base) / paths.APP_NAME)
-
-    def data_dir(self) -> str:
-        return self.page_dirs.data_edit.text().strip()
-
-    def install_dir(self) -> Optional[str]:
-        edit = self.page_dirs.install_edit
-        return edit.text().strip() if edit is not None else None
+    def target_dir(self) -> str:
+        """用户选的那个文件夹（程序和数据都在里面）。"""
+        return self.page_dirs.dir_edit.text().strip()
 
     @staticmethod
     def with_button(edit: QLineEdit, button: QPushButton) -> QWidget:

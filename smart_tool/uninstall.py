@@ -8,16 +8,14 @@
                <安装目录>\\小邹RPA.exe --uninstall --silent --purge   静默 + 连用户数据一起删
     · 源码运行：.venv\\Scripts\\python -m smart_tool.uninstall
 
-清什么、不清什么：
-    清    快捷方式、注册表卸载项、程序文件、配置目录（%APPDATA%\\小邹RPA）
-    不清  用户数据（项目、账号密码、图片库、采集结果、登录态）
-          —— 得用户自己勾，或者命令行加 --purge
-    不清  浏览器内核（%LOCALAPPDATA%\\ms-playwright）
-          —— 别的程序也可能在用，得用户自己勾
+清什么、不清什么（程序和数据在同一个文件夹里，绿色版）：
+    清    快捷方式、注册表卸载项、配置目录（%APPDATA%\\小邹RPA）、**程序那个 exe**
+    不清  程序文件夹本身，也不动文件夹里别的东西
+    要另外勾 项目数据（那个文件夹里的 projects/）—— 默认不勾，删了账号密码就没了
+    要另外勾 浏览器内核（%LOCALAPPDATA%\\ms-playwright）—— 别的程序也可能在用
 
-有个绕不开的麻烦：程序目录里那个 exe 正在运行，Windows 不让删自己（连加载过的
-dll 都锁着）。所以真正的删除交给一个临时 .bat：它先等几秒（那时本进程已退出），
-再 rd /s /q 把整个目录端掉，删完把自己也删掉。
+exe 正在运行，Windows 不让删自己（连加载过的 dll 都锁着）。所以真正的删除交给一个
+临时 .bat：它先等几秒（那时本进程已退出），再 del 掉 exe / rd 掉目录，删完把自己也删掉。
 """
 import argparse
 import codecs
@@ -86,19 +84,38 @@ def _shortcut_files(cfg: dict) -> List[Path]:
 
 
 def _looks_like_install_dir(path: Path) -> bool:
-    """这个目录看着像本程序的安装目录吗（有同名 exe 或 _internal 文件夹）。
+    """这个目录看着像本程序所在的地方吗（有同名 exe 或 _internal 文件夹）。
 
-    为什么要有这道检查：万一配置丢了/读坏了，"安装目录"就没法确定。
-    那时候宁可不动程序文件（让用户手动删），也绝不能凭猜去删别人一个文件夹。
+    为什么要有这道检查：万一配置丢了/读坏了，"程序在哪儿"就没法确定。
+    那时候宁可不动程序本体（让用户手动删），也绝不能凭猜去删别人一个文件夹。
     """
     try:
         if not path.is_dir():
             return False
         if (path / Path(sys.executable).name).is_file():
             return True
-        return (path / "_internal").is_dir()      # PyInstaller onedir 的目录结构
+        return (path / "_internal").is_dir()      # onedir 打包时的目录结构
     except OSError:
         return False
+
+
+def _program_files(install_dir: Path) -> List[Path]:
+    """程序**自己**的那几个文件：exe（单文件版就只有它）+ onedir 版的 _internal。
+
+    注意：程序和数据在同一个文件夹里，所以这里绝对不能把整个文件夹当程序删掉，
+    否则用户的项目、账号密码、采集结果会跟着一起没。
+    """
+    files: List[Path] = []
+    try:
+        exe = install_dir / Path(sys.executable).name
+        if exe.is_file():
+            files.append(exe)
+        internal = install_dir / "_internal"
+        if internal.is_dir():
+            files.append(internal)
+    except OSError:
+        pass
+    return files
 
 
 def build_plan() -> List[Item]:
@@ -106,22 +123,26 @@ def build_plan() -> List[Item]:
     cfg = paths.load_config()
     frozen = bool(getattr(sys, "frozen", False))
     items: List[Item] = []
+    install_dir: Optional[Path] = None
 
-    # 1) 程序文件（打包安装才有；源码运行不动仓库）
+    # 1) 程序本体（打包安装才有；源码运行不动仓库）
     if frozen:
         recorded = str(cfg.get("install_dir") or "").strip()
         install = Path(recorded) if recorded else None
         if install is not None and _looks_like_install_dir(install):
+            install_dir = install
+            targets = _program_files(install)
             items.append(Item(
-                "program", "程序文件（含这个卸载程序自己）", [install],
+                "program", "程序本体（就那个 exe）", targets,
                 note=f"{install}　窗口关掉后由后台小脚本删除"
-                     "（正在运行的 exe 删不掉自己）",
-                size=uninstall_reg.dir_size(install), kind="program"))
+                     "（正在运行的 exe 删不掉自己）；这个文件夹里的项目数据不在这里删",
+                size=sum(uninstall_reg.dir_size(t) for t in targets),
+                kind="program"))
         else:
             # 没登记过安装位置（老版本装的，或者配置文件丢过）→ 不猜、不动
             items.append(Item(
-                "program", "程序文件", removable=False, kind="note",
-                note=f"没登记安装位置，卸载不会自动删；要清理就手动删掉这个文件夹："
+                "program", "程序本体", removable=False, kind="note",
+                note="没登记安装位置，卸载不会自动删；要清理就手动删掉程序那个 exe："
                      f"{paths.app_dir()}"))
 
     # 2) 快捷方式
@@ -130,9 +151,12 @@ def build_plan() -> List[Item]:
         items.append(Item("shortcut", "快捷方式（桌面 / 开始菜单）", lnks,
                           note="、".join(str(p) for p in lnks)))
 
-    # 3) 配置目录；用户数据要是也在这儿，合成一项说清楚（别偷偷把账号密码删了）
+    # 3) 配置目录 + 项目数据
+    #    正常安装（程序和数据在同一个文件夹）时，数据只删那个文件夹里的 projects/，
+    #    别动文件夹本身——文件夹里还有用户自己放的别的东西。
     data_dir = Path(str(cfg.get("data_dir") or paths.DATA_DIR))
     if _same(data_dir, paths.CONFIG_DIR):
+        # 老式安装：数据就放在配置目录里 → 合成一项说清楚
         items.append(Item(
             "config", "配置目录 + 用户数据（项目、账号密码、图片库、采集结果、登录态）",
             [paths.CONFIG_DIR],
@@ -141,10 +165,18 @@ def build_plan() -> List[Item]:
     else:
         items.append(Item("config", "配置目录（config.json、图标缓存）",
                           [paths.CONFIG_DIR], note=str(paths.CONFIG_DIR)))
-        items.append(Item(
-            "data", "用户数据（项目、账号密码、图片库、采集结果、登录态）",
-            [data_dir], note=f"{data_dir}　不删的话下次安装还能接着用",
-            default=False, danger=True))
+        if install_dir is not None and _same(data_dir, install_dir):
+            items.append(Item(
+                "data", "项目数据（项目、账号密码、图片库、采集结果、登录态）",
+                [data_dir / "projects"],
+                note=f"{data_dir}\\projects　就在程序那个文件夹里，"
+                     "程序本体和它分开删；不删的话下次安装还能接着用",
+                default=False, danger=True))
+        else:
+            items.append(Item(
+                "data", "用户数据（项目、账号密码、图片库、采集结果、登录态）",
+                [data_dir], note=f"{data_dir}　不删的话下次安装还能接着用",
+                default=False, danger=True))
 
     # 4) 浏览器内核（Chromium）
     if browser_setup.is_installed():
@@ -198,20 +230,31 @@ def _remove_paths(targets: List[Path]) -> Tuple[bool, str]:
     return True, f"已删除（{removed} 项）"
 
 
-def _write_delete_bat(target: Path, delay_s: int) -> Path:
-    """写一个「延迟删目录」的小脚本，返回脚本路径。"""
-    body = "\r\n".join([
-        "@echo off",
-        f"ping -n {delay_s} 127.0.0.1 > nul",       # 等本进程退出（那时 exe/dll 才解锁）
-        f'rd /s /q "{target}" 2>nul',
-        "ping -n 2 127.0.0.1 > nul",                # 没删干净就再补一刀
-        f'rd /s /q "{target}" 2>nul',
+def _write_delete_bat(targets: List[Path], delay_s: int) -> Path:
+    """写一个「延迟删东西」的小脚本，返回脚本路径。
+
+    目录用 rd，文件（比如正在运行的 exe）用 del。
+    """
+    def commands() -> List[str]:
+        lines = []
+        for t in targets:
+            if t.is_dir():
+                lines.append(f'rd /s /q "{t}" 2>nul')
+            else:
+                lines.append(f'del /f /q "{t}" 2>nul')
+        return lines
+
+    body = "\r\n".join(
+        ["@echo off",
+         f"ping -n {delay_s} 127.0.0.1 > nul"]        # 等本进程退出（那时 exe/dll 才解锁）
+        + commands()
+        + ["ping -n 2 127.0.0.1 > nul"]               # 没删干净就再补一刀
+        + commands()
         # 脚本把自己也删掉。两个讲究（都是实机踩出来的）：
-        #   · 每条 rd 后面必须 2>nul：第二次 rd 会因为目录已经没了而报错，
+        #   · 每条删除命令后面必须 2>nul：第二次删会因为东西已经没了而报错，
         #     报错输出没被吞掉的话，它后面的行（包括这行自删）根本不执行；
         #   · 前面的 (goto) 2>nul 让 cmd 跳到文件末尾、松开文件句柄，del 才删得掉。
-        '(goto) 2>nul & del /f /q "%~f0"',
-    ]) + "\r\n"
+        + ['(goto) 2>nul & del /f /q "%~f0"']) + "\r\n"
     bat = Path(tempfile.gettempdir()) / f"{paths.APP_NAME}-卸载.bat"
     try:
         # cmd 默认按系统 ANSI 读批处理（中文系统＝GBK），这样中文路径才不会乱码。
@@ -223,13 +266,13 @@ def _write_delete_bat(target: Path, delay_s: int) -> Path:
     return bat
 
 
-def _schedule_dir_delete(target: Path, delay_s: int = 4) -> Optional[Path]:
-    """把「删掉这个目录」交给临时脚本去办（本进程退出后才动手）。"""
-    target = Path(target)
+def _schedule_delete(targets: List[Path], delay_s: int = 4) -> Optional[Path]:
+    """把删除交给临时脚本去办（本进程退出后才动手，那时 exe/dll 才解锁）。"""
+    paths_to_go = [Path(t) for t in targets]
     if sys.platform != "win32":                     # 非 Windows 没这麻烦，直接删
-        _remove_paths([target])
+        _remove_paths(paths_to_go)
         return None
-    bat = _write_delete_bat(target, delay_s)
+    bat = _write_delete_bat(paths_to_go, delay_s)
     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | \
         getattr(subprocess, "CREATE_NO_WINDOW", 0)
     subprocess.Popen(["cmd.exe", "/c", str(bat)], creationflags=flags,
@@ -250,10 +293,12 @@ def execute(items: List[Item], log: Callable[[str], None] = print) -> List[Tuple
                 # 只是告诉用户"这一项没自动删"，什么都不动
                 results.append((True, f"{item.label}：{item.note}"))
             elif item.kind == "program":
-                log(f"程序文件交给后台脚本删除：{item.targets[0]}")
-                _schedule_dir_delete(item.targets[0])
-                results.append((True, f"程序文件：{item.targets[0]}"
-                                      "（窗口关掉后自动删除，大约几秒）"))
+                log("程序本体交给后台小脚本删除：" +
+                    "、".join(str(t) for t in item.targets))
+                _schedule_delete(item.targets)
+                results.append((True, "程序本体："
+                                      + "、".join(str(t) for t in item.targets)
+                                      + "（窗口关掉后自动删除，大约几秒）"))
             else:
                 ok, msg = _remove_paths(item.targets)
                 results.append((ok, f"{item.label}：{msg}"))
