@@ -22,9 +22,30 @@ from PyQt6.QtWidgets import (
 
 from smart_tool.core.element_picker import PICKER_JS, next_shot_path
 from smart_tool.core.project_store import ProjectStore
+from smart_tool.ui.help_tip import help_row
 
 NAV_TIMEOUT_MS = 120_000
 POLL_MS = 200
+
+#: 【?】里的完整说明（界面上只留一句摘要）
+PICKER_HELP = (
+    "点【开始捕获】会打开一个浏览器窗口（用的是上面的网址）：\n"
+    "\n"
+    "· 鼠标划过元素 → 画橙框，并在旁边显示「这个选择器命中几个」；\n"
+    "  命中好几个说明这个写法不够准，最好换一个元素或换种写法。\n"
+    "· 点一下 → 抓下它的 XPath，同时把这个元素的截图存进项目 img/；\n"
+    "  这张图后面可以当「兜底截图」用（XPath 失效时靠它找位置）。\n"
+    "· 抓到没有，看页面就知道：点中的元素会被「绿框」圈住，\n"
+    "  屏幕顶端还会弹一条绿色提示「✓ 已捕获第 N 个」。\n"
+    "\n"
+    "【可以连着抓】抓完会自动重新装填，接着点下一个就行，抓到满意为止点【完成】。\n"
+    "· 按 Esc 只是收起橙框（方便你看清页面），不会退出；\n"
+    "· 抓完最后留下的只有你选中那一次的元素截图，中间试的那些会自动删掉，\n"
+    "  不会在 img/ 里堆废图。\n"
+    "\n"
+    "【抓不到的情况】如果元素在 iframe 里，XPath 能拿到但截不到图——\n"
+    "这时可以自己裁剪一张图放进项目 img/ 当兜底。"
+)
 
 
 class PickerWorker(QThread):
@@ -157,17 +178,9 @@ class ElementPickerDialog(QDialog):
     def _init_ui(self, url: str):
         root = QVBoxLayout(self)
 
-        tip = QLabel(
-            "点【开始捕获】会打开一个浏览器窗口：\n"
-            "· 鼠标划过元素 → 画橙框，并显示「这个选择器命中几个」；\n"
-            "· 点一下 → 抓下它的 XPath，同时把这个元素的图截下来存进 img/；\n"
-            "· 抓到没有，看页面就知道：点中的元素会被「绿框」圈住，屏幕顶端还会弹一条"
-            "绿色提示「✓ 已捕获第 N 个」。\n"
-            "可以连着抓多个；抓到满意为止点【完成】。按 Esc 只是收起橙框，不会退出。"
-        )
-        tip.setWordWrap(True)
-        tip.setStyleSheet("color: #555;")
-        root.addWidget(tip)
+        root.addWidget(help_row(
+            "点【开始捕获】，在浏览器里点元素（抓到会弹绿框提示）。",
+            "元素捕获", PICKER_HELP))
 
         form = QFormLayout()
         self.url_edit = QLineEdit(url)

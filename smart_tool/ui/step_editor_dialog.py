@@ -31,6 +31,7 @@ from smart_tool.ui.desktop_picker import DesktopPickerDialog
 from smart_tool.ui.element_picker_dialog import (
     drop_capture_image, pick_element, save_captured_locator,
 )
+from smart_tool.ui.help_tip import HelpButton, help_row
 from smart_tool.ui.read_data_panel import ReadDataPanel
 from smart_tool.ui.screen_capture import ScreenCaptureDialog
 
@@ -80,22 +81,120 @@ COND_MODES = [
 SCRIPT_LANGS = [("python", "Python（本地执行）"),
                 ("javascript", "JavaScript（在网页里执行）")]
 
-# 脚本节点可用的对象说明
+# 脚本节点可用的对象说明（放在【?】里）
 SCRIPT_HINT_PY = (
+    "在本地执行 Python 代码，能读写流程变量。\n"
+    "\n"
     "可用对象：\n"
-    "  vars   —— 当前变量字典（可读写，改完自动写回流程变量）\n"
-    "  log()  —— 输出一行日志到运行窗口\n"
-    "  page   —— Playwright 页面对象，可直接操作浏览器\n"
+    "  vars        —— 当前变量字典（可读写，改完自动写回流程变量）\n"
+    "  log()       —— 输出一行日志到运行窗口\n"
+    "  page        —— Playwright 页面对象，可直接操作浏览器\n"
     "  current_url / project_dir —— 当前网址、项目目录\n"
-    "脚本里可写 result = {\"新变量\": 值} 直接输出变量。\n"
-    "注意：Python 脚本无法强制中断，请自行避免死循环。"
+    "\n"
+    "输出新变量：脚本里写 result = {\"新变量\": 值}，\n"
+    "（也可以直接改 vars[\"某个变量\"]，改完同样会写回。）\n"
+    "\n"
+    "注意：Python 脚本无法强制中断，请自行避免死循环；\n"
+    "「超时」只用于提示，到点了也不会硬停。"
 )
 SCRIPT_HINT_JS = (
-    "在网页里执行，可直接操作 DOM。可用对象：\n"
-    "  vars   —— 当前变量对象（如 vars[\"标题\"]，改完自动写回）\n"
-    "  log()  —— 输出一行日志到运行窗口\n"
-    "  url    —— 当前网址\n"
-    "例：vars[\"页数\"] = document.querySelectorAll(\".item\").length;"
+    "在网页里执行 JavaScript，直接操作 DOM。\n"
+    "\n"
+    "可用对象：\n"
+    "  vars  —— 当前变量对象（如 vars[\"标题\"]，改完自动写回流程变量）\n"
+    "  log() —— 输出一行日志到运行窗口\n"
+    "  url   —— 当前网址\n"
+    "\n"
+    "例：vars[\"页数\"] = document.querySelectorAll(\".item\").length;\n"
+    "\n"
+    "注意：脚本在页面里跑，刷新页面就没了；要跨步骤传值就用 vars。"
+)
+
+#: 【?】里的说明（界面上只留一句摘要）
+LOOP_HELP = (
+    "「循环开始 / 循环结束」是一对结构节点：新增循环时系统一起创建，\n"
+    "夹在中间的那些步骤（列表里缩进显示）会重复执行。\n"
+    "设置只有这一份——点「循环结束」打开的也是这里。\n"
+    "\n"
+    "【循环内容怎么写】\n"
+    "· 跑固定次数 → 填数字，如 10（{{loop.item}} 是当前序号，0 起）；\n"
+    "· 挨个处理「读取数据」/「采集数据」拿到的东西 → 填 {{变量名}}\n"
+    "  （如 {{文章列表}}）；\n"
+    "· 别的写法也行：值是列表 / 多行文本就逐项遍历，是数字就跑那么多次。\n"
+    "\n"
+    "【循环体里能用什么】\n"
+    "· {{loop.item}}         —— 当前这一项（列表项是对象时，用它下面的字段，\n"
+    "                           如 {{loop.item.标题}}）\n"
+    "· {{loop.index}}        —— 现在是第几轮（从 1 开始）\n"
+    "\n"
+    "【想多个循环嵌套】直接在里面再放一个循环就行；\n"
+    "【想循环里带条件】把「条件」节点放进去，它按结果走不同分支。\n"
+    "\n"
+    "【循环跑几行】由「开始」和「结束」之间的步骤决定；\n"
+    "想让某一步不参与循环，把它挪到「循环结束」后面去。"
+)
+
+COND_HELP = (
+    "执行时会先算出「判断内容」的结果，然后从上往下找第一个匹配的分支，\n"
+    "只执行那个分支里的步骤；一个都不匹配就整段跳过（后面的步骤照常执行）。\n"
+    "\n"
+    "【判断方式】\n"
+    "· 变量相等：把「判断内容」渲染成文本，跟各分支的匹配值逐个比，一样就走那个分支。\n"
+    "  匹配值可以写多个，用逗号分隔（如 北京,上海,广州），命中任意一个就走。\n"
+    "· 表达式：写一段 Python 表达式，里面的 {{变量}} 会按数字 / 文本自动代入。\n"
+    "  结果是真 / 假 → 走第 1 / 第 2 个分支；算出来是别的值 → 按匹配值走。\n"
+    "\n"
+    "【分支】\n"
+    "· 分支的先后就是判断顺序（列表里从上到下）；\n"
+    "· 分支名只是给你自己看的，随便起；\n"
+    "· 点【添加分支】加一个，选中后可以删除——删分支会连同它里面的步骤一起删掉。\n"
+    "\n"
+    "【配对】\n"
+    "「条件 / 分支 / 条件结束」是配套的：设置只有一份，\n"
+    "点「条件结束」或某个分支标记，打开的也都是这个条件节点。"
+)
+
+NOTE_HELP = (
+    "这个节点不点页面、不填表单，只是给你自己留记号：\n"
+    "\n"
+    "· 画布上它就是一张说明卡片（比如在登录那几步前面写「下面开始登录」），\n"
+    "  文字会自动按卡片宽度折行，最多显示 3 行；\n"
+    "· 运行时会把内容打进日志——想看看某个变量到底取到了什么，\n"
+    "  在它后面插一个这种节点、写上 {{那个变量}} 就行。\n"
+    "\n"
+    "写法：内容里可以写多个 {{变量}}，运行时都会换成实际值；\n"
+    "也可以写多行（用回车换行），日志里就一行一条。\n"
+    "内容留空＝什么都不做（画布上也只显示一句占位文字）。"
+)
+
+LOCATOR_HELP = (
+    "定位路径就是「要找哪个元素」，网页场景填 XPath。\n"
+    "\n"
+    "【定位里可以写变量】\n"
+    "捕获到的元素可以存成「元素定位」（用【捕获元素…】抓的时候会问你要不要存），\n"
+    "之后任何定位里写 {{登录框}} 就能复用它——\n"
+    "改【项目管理…】→【变量清单】里的那一条，全项目跟着变。\n"
+    "做多个同类页面（同一套模板的不同站点）时，这一招能省很多事。\n"
+    "\n"
+    "【XPath 怎么写】\n"
+    "· 优先用 id：//*[@id=\"user_login\"]；\n"
+    "· 类名要注意：@class='a' 是「class 整个等于 a」，\n"
+    "  元素写的是 class=\"star-rating Three\" 就匹配不上，\n"
+    "  要用 //p[contains(@class,'star-rating')]；\n"
+    "· 最好别用第几个子元素这种（//div[3]），页面一变就错位。\n"
+    "\n"
+    "【兜底截图】下面那一栏是给 XPath 失效时兜底用的，选填。"
+)
+
+FALLBACK_HELP = (
+    "选填。配了它以后：XPath 等不到元素 / 点不动时，会自动改用这张图做模板匹配，\n"
+    "命中后按坐标点击或填入（日志里会写明这次走了兜底）。\n"
+    "\n"
+    "什么时候值得配：页面改版频繁、或者元素没有稳定的 id / class；\n"
+    "用【捕获元素…】抓的时候会自动生成一张，不用自己截。\n"
+    "\n"
+    "注意：截图匹配对分辨率、系统缩放、浏览器窗口大小比较敏感，\n"
+    "换台机器可能就找不到了——所以它是兜底，别当主定位。"
 )
 WAIT_OPTIONS = [
     ("", "不等待"),
@@ -258,15 +357,8 @@ class StepEditDialog(QDialog):
         self.note_var_combo.activated.connect(self._insert_note_var)
         note_vars.addWidget(self.note_var_combo)
         nb.addLayout(note_vars)
-        note_hint = QLabel(
-            "这个节点不点页面、不填表单，只是给你自己留记号：\n"
-            "· 画布上它就是一张说明卡片（如「下面开始登录」）；\n"
-            "· 运行时会把内容打进日志——想看看某个变量到底取到了什么，"
-            "在它后面插一个、写上 {{那个变量}} 就行。"
-        )
-        note_hint.setWordWrap(True)
-        note_hint.setStyleSheet("color: #888;")
-        nb.addWidget(note_hint)
+        nb.addWidget(help_row("给自己留的记号：画布上是说明卡片，运行时打进日志。",
+                              "提示 / 日志", NOTE_HELP))
         form.addRow("提示内容：", self.note_box)
 
         # --- 桌面动作专用 ---
@@ -327,13 +419,9 @@ class StepEditDialog(QDialog):
         self.capture_hint.setStyleSheet("color: #0f766e;")
         form.addRow("", self.capture_hint)
 
-        self.locator_hint = QLabel(
-            "定位里可以写变量：捕获到的元素可以存成「元素定位」（捕获时会问你要不要存），"
-            "之后任何定位写 {{登录框}} 就能复用它——"
-            "改【项目管理…】→【变量清单】里的那一条，全项目跟着变。"
-        )
-        self.locator_hint.setWordWrap(True)
-        self.locator_hint.setStyleSheet("color: #888;")
+        self.locator_hint = help_row(
+            "定位里可以写变量：元素定位（如 {{登录框}}）改一处、全项目跟着变。",
+            "定位路径", LOCATOR_HELP)
         form.addRow("", self.locator_hint)
 
         self.image_hint = QLabel(
@@ -373,12 +461,9 @@ class StepEditDialog(QDialog):
         fb_layout.addWidget(self.btn_fallback_clear)
         form.addRow("兜底截图：", self.fallback_row)
 
-        self.fallback_hint = QLabel(
-            "选填。配了它以后：XPath 等不到元素 / 点不动时，会自动改用这张图做模板匹配，"
-            "命中后按坐标点击或填入（日志里会写明走了兜底）。"
-        )
-        self.fallback_hint.setWordWrap(True)
-        self.fallback_hint.setStyleSheet("color: #888;")
+        self.fallback_hint = help_row(
+            "选填：XPath 失效时用它兜底（自动改用截图找位置）。",
+            "兜底截图", FALLBACK_HELP)
         form.addRow("", self.fallback_hint)
 
         # --- 输入值组（fill/select）：右侧下拉可直接关联数据源变量 ---
@@ -471,17 +556,9 @@ class StepEditDialog(QDialog):
         loop_layout.addWidget(self.loop_expr_var_combo)
         form.addRow("循环内容：", self.loop_expr_row)
 
-        self.loop_hint = QLabel(
-            "「循环开始 / 循环结束」是一对节点：新增循环时系统一起创建，\n"
-            "夹在中间的那些步骤（列表里缩进显示）会重复执行。\n"
-            "设置只有这一份：点「循环结束」也是打开这里。\n"
-            "· 只想跑固定次数 → 填数字，如 10（{{loop.item}} 是当前序号，0 起）；\n"
-            "· 想按「读取数据」读到的内容挨个处理 → 填 {{变量名}}（如 {{文章列表}}），\n"
-            "  循环体里用 {{loop.item.字段}} 取当前这一项，{{loop.index}} 是第几轮（1 起）；\n"
-            "· 变量是别的东西也行：值是列表 / 多行文本就逐项遍历，是数字就跑那么多次。"
-        )
-        self.loop_hint.setWordWrap(True)
-        self.loop_hint.setStyleSheet("color: #7a4fb5;")
+        self.loop_hint = help_row(
+            "夹在「循环开始 / 循环结束」中间的步骤会重复执行。",
+            "循环怎么填", LOOP_HELP)
         form.addRow("", self.loop_hint)
 
         # --- 条件节点（condition_start）---
@@ -536,15 +613,9 @@ class StepEditDialog(QDialog):
         bb.addWidget(self.cond_count_label, 1)
         form.addRow("", branch_btns)
 
-        self.cond_branch_hint = QLabel(
-            "执行时会先算出「判断内容」的结果，然后从上往下找第一个匹配的分支，"
-            "只执行那个分支里的步骤；都不匹配就整个跳过（后面步骤照常执行）。\n"
-            "「变量相等」：变量值跟某分支的某个匹配值一样 → 走这个分支；\n"
-            "「表达式」：结果是真/假时走第 1 / 第 2 个分支，结果是别的值时按匹配值走。\n"
-            "删除分支会把它里面的步骤一起删掉。"
-        )
-        self.cond_branch_hint.setWordWrap(True)
-        self.cond_branch_hint.setStyleSheet("color: #888;")
+        self.cond_branch_hint = help_row(
+            "从上往下找第一个匹配的分支，只执行那一个；都不匹配就整段跳过。",
+            "条件与分支", COND_HELP)
         form.addRow("", self.cond_branch_hint)
 
         self._cond_widgets = [
@@ -558,9 +629,6 @@ class StepEditDialog(QDialog):
         self.script_lang_combo = QComboBox()
         for key, label in SCRIPT_LANGS:
             self.script_lang_combo.addItem(label, key)
-        self.script_lang_combo.currentIndexChanged.connect(
-            self._on_script_lang_changed
-        )
         form.addRow("脚本语言：", self.script_lang_combo)
 
         self.script_code = QPlainTextEdit()
@@ -575,10 +643,15 @@ class StepEditDialog(QDialog):
         self.script_code.setFont(mono)
         form.addRow("脚本代码：", self.script_code)
 
-        self.script_hint = QLabel(SCRIPT_HINT_PY)
-        self.script_hint.setWordWrap(True)
-        self.script_hint.setStyleSheet("color: #4b5563;")
+        self.script_hint = help_row(
+            "本地执行 Python 代码，能读变量、也能造新变量。",
+            "Python 脚本", SCRIPT_HINT_PY)
+        self.script_help_btn = self.script_hint.findChild(HelpButton)
         form.addRow("", self.script_hint)
+        # 说明和秒数后缀都跟着脚本语言变，所以等这两样都建好了再接信号
+        self.script_lang_combo.currentIndexChanged.connect(
+            self._on_script_lang_changed
+        )
 
         script_row = QWidget()
         script_layout = QHBoxLayout(script_row)
@@ -841,7 +914,10 @@ class StepEditDialog(QDialog):
 
     def _on_script_lang_changed(self):
         is_js = self.script_lang_combo.currentData() == "javascript"
-        self.script_hint.setText(SCRIPT_HINT_JS if is_js else SCRIPT_HINT_PY)
+        if self.script_help_btn is not None:
+            self.script_help_btn.set_content(
+                "JavaScript 脚本" if is_js else "Python 脚本",
+                SCRIPT_HINT_JS if is_js else SCRIPT_HINT_PY)
         self.script_timeout.setSuffix(" 秒" + ("" if is_js else "（仅提示，不强制中断）"))
 
     # ------------------------------

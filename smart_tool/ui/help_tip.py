@@ -56,6 +56,10 @@ class HelpButton(QPushButton):
         # 用所在窗口当父级：嵌在【项目管理】页签里时，弹窗也挂在那个对话框上
         show_help(self.window(), self._title, self._text)
 
+    def set_content(self, title: str, text: str):
+        """换一段说明（同一个按钮要跟着选项变的场景，比如脚本语言）。"""
+        self._title, self._text = title, text
+
 
 def help_row(lead: str, title: str, text: str) -> QWidget:
     """「一句摘要 + 右上角 ?」的一行；摘要留空就只剩一个 ?。"""

@@ -18,6 +18,24 @@ from smart_tool import paths
 from smart_tool.core.project_store import (
     SCENE_DESKTOP, SCENE_WEB, ProjectStore, create_project, list_projects,
 )
+from smart_tool.ui.help_tip import help_row
+
+#: 【?】里的完整说明（界面上只留一行路径）
+PICKER_PATH_HELP = (
+    "每个项目就是 projects/ 下的一个文件夹，里面必须有 steps.json（流程步骤）\n"
+    "和（可选）img/（元素截图）、data/（采集到的数据）、auth/（登录态）。\n"
+    "\n"
+    "【载入】在列表里选中一个项目，点【载入】或直接双击它。\n"
+    "\n"
+    "【浏览其他文件夹…】项目不一定非得放在默认目录：\n"
+    "选任意一个文件夹，只要里面含 steps.json 就能当项目载入。\n"
+    "（比如把项目拷到 U 盘或共享盘上，用这个入口打开。）\n"
+    "\n"
+    "【新建】回主界面点【新建项目…】：填名称、选场景（网页 / 桌面），\n"
+    "网页场景还可以顺手填一个起始网址。\n"
+    "\n"
+    "【删除】项目的删除在【项目管理…】里做（会连带删掉它的截图和数据，不可恢复）。"
+)
 
 
 class NewProjectDialog(QDialog):
@@ -127,18 +145,18 @@ class ProjectPickerDialog(QDialog):
     def _init_ui(self):
         root = QVBoxLayout(self)
 
-        tip = QLabel(
-            f"项目文件夹：{paths.PROJECTS_DIR}\n"
-            "选中一个项目后点【载入】；也可以浏览到其他文件夹（需含 steps.json）。"
-        )
-        tip.setWordWrap(True)
-        tip.setStyleSheet("color: #777;")
-        root.addWidget(tip)
+        root.addWidget(help_row(f"项目文件夹：{paths.PROJECTS_DIR}",
+                                "项目放哪儿", PICKER_PATH_HELP))
 
         self.list_widget = QListWidget()
         self.list_widget.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection
         )
+        # 名字太长就省略号，鼠标停上去看完整信息（别横向滚动条）
+        self.list_widget.setWordWrap(False)
+        self.list_widget.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.list_widget.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list_widget.itemDoubleClicked.connect(lambda _: self._choose_from_list())
         self.list_widget.itemSelectionChanged.connect(self._update_buttons)
         root.addWidget(self.list_widget, 1)
@@ -170,11 +188,11 @@ class ProjectPickerDialog(QDialog):
         self.list_widget.clear()
         select_row = -1
         for i, s in enumerate(self._stores):
-            item = QListWidgetItem(
-                f"{s.name}    （{len(s.load_steps())} 步，"
-                f"{s.image_count()} 张截图）"
-            )
+            steps_n = len(s.load_steps())
+            item = QListWidgetItem(f"{s.name}（{steps_n} 步）")
             item.setData(Qt.ItemDataRole.UserRole, str(s.dir))
+            item.setToolTip(f"{s.name}\n{steps_n} 步 ｜ {s.image_count()} 张截图"
+                            f"\n{s.dir}")
             self.list_widget.addItem(item)
             if self._current_path and s.dir.resolve() == self._current_path:
                 select_row = i

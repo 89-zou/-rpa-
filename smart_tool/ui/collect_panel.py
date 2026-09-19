@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
 )
 
 from smart_tool.core.project_store import Step
+from smart_tool.ui.help_tip import HelpButton
 
 # (key, 显示名, 附加那一列的提示)
 KIND_OPTIONS = [
@@ -55,16 +56,40 @@ MODES = [
 ]
 
 HINT = (
-    "· 「文字 / 属性 / 链接 / HTML」直接存成文本；「图片 / 文件」下载到 data/files/；"
-    "「截图」存成 png。\n"
-    "· 列表模式下，字段的定位是在「当前行」里找（写 //h2 就是这一行里的 h2）；"
-    "采到的数据会变成 {{变量}}（JSON 数组），配「循环」节点逐行遍历，"
-    "循环里用 {{loop.item.字段}}。\n"
-    "· 「附加」不是备注：取属性时填属性名（如 src），截图时填「整页」或 x,y,宽,高。\n"
-    "· 所有数据都会追加到项目的 data/records.jsonl，"
-    "在【项目管理…】→【采集数据】里可以查看 / 导出 Excel。\n"
-    "· XPath 小坑：@class='a' 是「class 整个等于 a」，元素写的是 "
-    "class=\"star-rating Three\" 就匹配不上，要用 //p[contains(@class,'star-rating')]。"
+    "采集的时候怎么取、取到哪去、字段怎么配，点右边的 ? 看完整说明。"
+)
+
+#: 【?】里的完整说明（界面上不放长段灰字）
+COLLECT_HELP = (
+    "【取什么】每个字段的「取什么」决定怎么取值：\n"
+    "· 文字 / 属性 / 链接 / HTML —— 直接存成文本；\n"
+    "  取属性要填属性名（src、title、data-xxx 之类）；\n"
+    "· 图片 / 文件 —— 下载到项目的 data/files/，字段里存相对路径；\n"
+    "· 截图 —— 存成 png，可以截元素、整页，或指定的一个区域。\n"
+    "\n"
+    "【一条记录 还是 一列】\n"
+    "· 采当前页面（一条记录）：整页范围内找元素，采下来就是一条；\n"
+    "· 列表采集：先给一个能命中多行的 XPath（每行一个元素，如 //div[@class='item']），\n"
+    "  然后每个字段的定位「在每一行里面找」——写 //h3 或 .//h3 都行。\n"
+    "  采到的数据变成一个列表变量（JSON 数组），配「循环」节点逐行遍历，\n"
+    "  循环体里用 {{loop.item.字段}} 取当前这一项。\n"
+    "\n"
+    "【「附加」这一列不是备注】\n"
+    "· 取属性时：填属性名（必填，如 src）；\n"
+    "· 截图时：留空＝截这个元素；填「整页」＝整页截图；\n"
+    "  填 x,y,宽,高（如 0,120,800,600）＝按屏幕坐标截一块区域。\n"
+    "\n"
+    "【数据去哪儿了】\n"
+    "· 结构化数据追加到项目的 data/records.jsonl（一行一条，断了也不丢）；\n"
+    "· 图片、附件、截图存进 data/files/；\n"
+    "· 每条记录自动带 _time（采集时间）、_url（来源网址）、_step（第几步）。\n"
+    "  在【项目管理…】→【采集数据】里能看、能导出 Excel / CSV。\n"
+    "\n"
+    "【XPath 小坑】\n"
+    "@class='a' 是「class 整个等于 a」；元素写的是 class=\"star-rating Three\"\n"
+    "就匹配不上，要用 //p[contains(@class,'star-rating')]。\n"
+    "定位写错时不会干等：每个字段最多等 3 秒，首条就写日志、同一字段连着 3 行都失败\n"
+    "就跳过它，不会让整条流程卡住。"
 )
 
 
@@ -135,6 +160,14 @@ class CollectPanel(QWidget):
         btns.addStretch()
         root.addLayout(btns)
 
+        hint_row = QHBoxLayout()
+        hint = QLabel(HINT)
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#777777;")
+        hint_row.addWidget(hint, 1)
+        hint_row.addWidget(HelpButton("采集数据", COLLECT_HELP))
+        root.addLayout(hint_row)
+
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(
             ["字段名", "取什么", "定位（XPath）", "附加"])
@@ -151,11 +184,6 @@ class CollectPanel(QWidget):
         self.table.itemChanged.connect(lambda _i: self._on_edited())
         root.addWidget(self.table, 1)
         self._refresh_extra_hint()
-
-        hint = QLabel(HINT)
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color:#777777;")
-        root.addWidget(hint)
 
     def _build_add_menu(self) -> QMenu:
         menu = QMenu(self)
