@@ -451,14 +451,26 @@ def rule_summary(step: Step, index: int, mode: str = "rule") -> str:
 
 
 def rule_mode_at(steps: List[Step], pos: int) -> Optional[str]:
-    """在 pos 这个位置插入节点时，它会不会落在某个「条件」里。
+    """在 pos 这个位置插入节点时，它会不会成为某个「条件」的**直属**动作节点。
 
-    落在里面就返回那个条件的判断方式（rule / expr），否则 None ——
-    两个界面用它决定「新建节点」的对话框要不要显示「条件判断」那一栏。
+    是的话返回那个条件的判断方式（rule / expr），否则 None —— 两个界面用它决定
+    「新建节点」的对话框要不要显示「条件判断」那一栏。
+
+    注意要排除「落在条件里、但嵌在更里层块里」的位置（比如条件里的循环体内部）：
+    那些节点没有自己的判断方式，规则挂在循环 / 组合那个块本身上。
     """
-    for sp in spans(steps):
-        if sp.kind == "condition" and sp.inner_lo <= pos <= sp.end:
-            return steps[sp.start].cond_mode or "rule"
+    all_spans = spans(steps)
+    for sp in all_spans:
+        if sp.kind != "condition" or not (sp.inner_lo <= pos <= sp.end):
+            continue
+        nested = any(
+            x is not sp and sp.start < x.start and x.end < sp.end
+            and x.start < pos <= x.end
+            for x in all_spans
+        )
+        if nested:
+            continue        # 落在这个条件的某个嵌套块里面，不是它的直属节点
+        return steps[sp.start].cond_mode or "rule"
     return None
 
 
