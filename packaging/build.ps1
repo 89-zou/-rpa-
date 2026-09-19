@@ -1,4 +1,4 @@
-# 打 Windows 包（onedir）：powershell -ExecutionPolicy Bypass -File packaging\build.ps1
+﻿# 打 Windows 包（onedir）：powershell -ExecutionPolicy Bypass -File packaging\build.ps1
 #
 # 产物：dist\小邹RPA\（整个文件夹就是"安装包"，拷给别人即可）
 #       dist\小邹RPA\小邹RPA.exe 是入口，第一次运行会弹安装向导。
