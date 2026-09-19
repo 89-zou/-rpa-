@@ -589,17 +589,21 @@ class StepExecutor:
         if not self._auth_check_locator:
             return
         self._auth_checked = True
+        # 体检元素里也能写变量（如 {{登录后菜单}}＝元素定位），
+        # 变量没定义就不体检了——宁可跳过这一关，也别误判成「失效」
+        xpath = self._resolve_value(self._auth_check_locator).strip()
+        if "{{" in xpath:
+            self.log(f"  体检元素里有没定义的变量：{xpath[:60]} → 这次跳过体检")
+            return
         try:
-            found = self._page.locator(
-                f"xpath={self._auth_check_locator}").count() > 0
+            found = self._page.locator(f"xpath={xpath}").count() > 0
         except Exception as e:
             self.log(f"  登录态体检出错（当作失效）：{str(e).splitlines()[0][:80]}")
             found = False
         if found:
             self.log("  登录态体检通过：已经是登录状态（登录那几步会自动跳过）。")
             return
-        self.log(f"  页面上没有「{self._auth_check_locator}」"
-                 "（登录后才有的元素）→ 判定登录态已失效。")
+        self.log(f"  页面上没有「{xpath}」（登录后才有的元素）→ 判定登录态已失效。")
         self._auth_expired = True
         raise AuthExpired()
 
