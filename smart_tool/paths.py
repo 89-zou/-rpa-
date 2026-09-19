@@ -57,9 +57,14 @@ ASSETS_DIR = BUNDLE_DIR / "assets"
 # 配置文件
 # ------------------------------
 def load_config() -> dict:
-    """读用户配置（不存在就给个空壳，不抛异常）。"""
+    """读用户配置（不存在就给个空壳，不抛异常）。
+
+    用 utf-8-sig 读：配置文件有时候会被记事本之类改过而带上 BOM，
+    普通 utf-8 读出来开头会多个 \\ufeff 导致 json 解析失败——那样整个配置
+    都会被当成空的（数据目录、安装位置全丢），坑很大。
+    """
     try:
-        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}

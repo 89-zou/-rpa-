@@ -59,6 +59,7 @@ class Item:
     # paths   直接删这些文件/目录
     # program 程序目录（正在运行的 exe 锁着，交给临时脚本删）
     # registry 注册表里的卸载入口
+    # note    只提示不删（比如"安装位置没登记，程序文件请手动删"）
     kind: str = "paths"
 
 
@@ -84,6 +85,22 @@ def _shortcut_files(cfg: dict) -> List[Path]:
     return found
 
 
+def _looks_like_install_dir(path: Path) -> bool:
+    """这个目录看着像本程序的安装目录吗（有同名 exe 或 _internal 文件夹）。
+
+    为什么要有这道检查：万一配置丢了/读坏了，"安装目录"就没法确定。
+    那时候宁可不动程序文件（让用户手动删），也绝不能凭猜去删别人一个文件夹。
+    """
+    try:
+        if not path.is_dir():
+            return False
+        if (path / Path(sys.executable).name).is_file():
+            return True
+        return (path / "_internal").is_dir()      # PyInstaller onedir 的目录结构
+    except OSError:
+        return False
+
+
 def build_plan() -> List[Item]:
     """看看这台机器上装了哪些东西，列成清单（只看不删）。"""
     cfg = paths.load_config()
@@ -92,13 +109,20 @@ def build_plan() -> List[Item]:
 
     # 1) 程序文件（打包安装才有；源码运行不动仓库）
     if frozen:
-        install = Path(str(cfg.get("install_dir") or paths.app_dir()))
-        if install.is_dir():
+        recorded = str(cfg.get("install_dir") or "").strip()
+        install = Path(recorded) if recorded else None
+        if install is not None and _looks_like_install_dir(install):
             items.append(Item(
                 "program", "程序文件（含这个卸载程序自己）", [install],
                 note=f"{install}　窗口关掉后由后台小脚本删除"
                      "（正在运行的 exe 删不掉自己）",
                 size=uninstall_reg.dir_size(install), kind="program"))
+        else:
+            # 没登记过安装位置（老版本装的，或者配置文件丢过）→ 不猜、不动
+            items.append(Item(
+                "program", "程序文件", removable=False, kind="note",
+                note=f"没登记安装位置，卸载不会自动删；要清理就手动删掉这个文件夹："
+                     f"{paths.app_dir()}"))
 
     # 2) 快捷方式
     lnks = _shortcut_files(cfg)
@@ -222,6 +246,9 @@ def execute(items: List[Item], log: Callable[[str], None] = print) -> List[Tuple
                 r = uninstall_reg.unregister()
                 results.append((bool(r["ok"]),
                                 "注册表卸载入口：" + ("已删除" if r["ok"] else str(r["error"]))))
+            elif item.kind == "note":
+                # 只是告诉用户"这一项没自动删"，什么都不动
+                results.append((True, f"{item.label}：{item.note}"))
             elif item.kind == "program":
                 log(f"程序文件交给后台脚本删除：{item.targets[0]}")
                 _schedule_dir_delete(item.targets[0])
