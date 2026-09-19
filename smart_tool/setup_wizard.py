@@ -40,16 +40,27 @@ from smart_tool.core import browser_setup, shortcut, uninstall_reg
 # 环境构建（在后台线程里跑，界面不卡）
 # ============================================================
 class BuildWorker(QThread):
-    """按计划做环境构建：写配置 → 建目录 → 演示项目 → 浏览器内核 → 快捷方式。"""
+    """按计划做环境构建：写配置 → 建目录 → 演示项目 → 浏览器内核 → 快捷方式。
+
+    写不进去系统的机器（没管理员权限、注册表被策略锁了之类）不报错，直接退成
+    「免安装模式」：程序留在原地，只把用户数据目录和环境构建好，不碰注册表。
+    """
 
     log = pyqtSignal(str)
     progress = pyqtSignal(int)
-    done = pyqtSignal(bool, list)          # (全部成功?, [(成功?, 说明), ...])
+    #: (还能继续用?, [(成功?, 说明), ...])
+    done = pyqtSignal(bool, list)
 
     def __init__(self, plan: Dict, parent=None):
         super().__init__(parent)
         self.plan = plan
         self.results: List[Tuple[bool, str]] = []
+        #: 关键步骤（写配置、建数据目录）失败 → 程序没法正常用
+        self.fatal = False
+        #: 是不是免安装模式（没往系统里装）
+        self.portable = False
+        #: 程序被复制到别的位置时，那边的启动目标（用来重新启动）
+        self.new_target: Optional[Dict[str, str]] = None
         self._bar = 0
 
     def _step(self, percent: int, text: str = ""):
@@ -63,9 +74,9 @@ class BuildWorker(QThread):
             self._build()
         except Exception as e:                     # 兜底：不让向导崩掉
             self.results.append((False, f"环境构建出错：{type(e).__name__}: {e}"))
-        ok = bool(self.results) and all(flag for flag, _ in self.results)
+            self.fatal = True
         self.progress.emit(100)
-        self.done.emit(ok, self.results)
+        self.done.emit(not self.fatal, self.results)
 
     # ------------------------------
     def _build(self):
@@ -84,6 +95,7 @@ class BuildWorker(QThread):
             )
             self.results.append((True, f"配置已写入：{paths.CONFIG_FILE}"))
         except OSError as e:
+            self.fatal = True
             self.results.append((False, f"写配置失败：{e}（可能是目录没权限）"))
 
         # 2) 建目录
@@ -94,6 +106,7 @@ class BuildWorker(QThread):
             self._step(16, f"项目目录：{projects}")
             self.results.append((True, f"项目目录就绪：{projects}"))
         except OSError as e:
+            self.fatal = True
             self.results.append((False, f"建项目目录失败：{e}"))
             return
 
@@ -134,9 +147,21 @@ class BuildWorker(QThread):
                                  "浏览器内核没装成功（可以重跑安装向导再试）"))
             self._step(88)
 
-        # 5) 快捷方式
-        self._step(90, "正在建快捷方式…")
-        target = _install_target(plan, self.results)
+        # 5) 装进系统：把程序复制到安装目录、建快捷方式、登记卸载入口。
+        #    先探一下能不能装：装不了（没权限写安装目录 / 写不了注册表）就退成
+        #    免安装模式——程序留在原地，只构建数据目录和环境，一个字节都不写系统。
+        self._step(90, "正在准备安装位置…")
+        can_copy, can_reg, reason = self._probe()
+        self.portable = not (can_copy and can_reg)
+        if self.portable:
+            self.log.emit(f"免安装模式：{reason}")
+            self.log.emit("程序就留在原地用；以后卸载时直接把程序文件夹删掉就行。")
+            self.results.append((True, f"免安装模式（不写入系统）：{reason}"))
+            target = shortcut.launch_target()
+        else:
+            target = self._copy_program() or shortcut.launch_target()
+
+        self._step(92, "正在建快捷方式…")
         icon = paths.icon_file()
         icon_text = str(icon) if icon.is_file() else ""
         lnk_paths: List[str] = []
@@ -153,25 +178,87 @@ class BuildWorker(QThread):
                 lnk_paths.append(r["path"])
                 self.results.append((True, f"{label}：{r['path']}"))
             else:
+                # 快捷方式建不上不算事：桌面/开始菜单权限被锁的机器照样能用
                 self.results.append(
-                    (False, f"{label}创建失败：{r['error']}（可以稍后手动建）"))
+                    (False, f"{label}创建失败：{r['error']}（不影响使用，可手动建）"))
 
-        # 6) 登记到 Windows 的卸载列表（不登记的话用户在系统里找不到卸载入口）
+        # 6) 记下装到哪儿 + 登记到 Windows 卸载列表
         self._step(96, "正在登记卸载信息…")
         install_dir = ""
-        if not str(target.get("args") or "").strip():      # 打包版：exe 所在目录
+        if not self.portable and not str(target.get("args") or "").strip():
             install_dir = str(Path(target["target"]).resolve().parent)
         paths.save_config(install_dir=install_dir,
                           shortcut_paths=lnk_paths,
+                          portable=self.portable,
                           installed_at=f"{datetime.now():%Y-%m-%d %H:%M}")
-        size = uninstall_reg.dir_size(install_dir) if install_dir else 0
-        info = uninstall_reg.register(target, size_bytes=size)
-        if info["ok"]:
+        if self.portable or not can_reg:
             self.results.append(
-                (True, "已登记到系统卸载列表（设置 → 应用 → 小邹RPA 里可以卸载）"))
+                (True, "没有登记系统卸载入口：卸载时删掉程序文件夹即可"
+                       f"（程序在 {paths.app_dir()}）"))
         else:
-            self.results.append((False, f"登记卸载信息失败：{info['error']}"))
+            size = uninstall_reg.dir_size(install_dir) if install_dir else 0
+            info = uninstall_reg.register(target, size_bytes=size)
+            if info["ok"]:
+                self.results.append(
+                    (True, "已登记到系统卸载列表（设置 → 应用 → 小邹RPA 里可以卸载）"))
+            else:
+                # 登记失败也能用：告诉用户手动删目录就是卸载
+                self.results.append(
+                    (False, f"登记卸载入口失败：{info['error']}"
+                            f"（不影响使用，卸载时删掉 {paths.app_dir()} 即可）"))
         self._step(98)
+
+        # 程序被复制到别的位置：记下来，构建完直接启动那边的，别在这边"假装装好了"
+        if not self.portable and \
+                str(target["target"]) != str(shortcut.launch_target()["target"]):
+            self.new_target = target
+
+    # ------------------------------
+    def _probe(self) -> Tuple[bool, bool, str]:
+        """探一探这台机器能不能「装进系统」：能否复制程序、能否写卸载列表。
+
+        返回 (能复制程序?, 能写注册表?, 说明)。装不了不算失败——降级免安装即可。
+        """
+        want = str(self.plan.get("install_dir") or "").strip()
+        frozen = bool(self.plan.get("frozen"))
+        can_reg = uninstall_reg.can_register()
+        no_reg = "" if can_reg else "这台机器写不了注册表（受限账户或组策略限制）"
+        if not frozen:
+            return True, can_reg, no_reg or "源码运行：不复制程序文件"
+        if not want:
+            return True, can_reg, no_reg or "程序已经在当前位置"
+        want_path = Path(want).expanduser()
+        try:
+            same = want_path.resolve() == paths.app_dir().resolve()
+        except OSError:
+            same = False
+        if same:
+            return True, can_reg, no_reg or "程序已经在安装目录里"
+        if not _dir_writable(want_path):
+            return False, can_reg, f"往 {want_path} 里写不进东西（通常要管理员权限）"
+        return True, can_reg, no_reg
+
+    def _copy_program(self) -> Optional[Dict[str, str]]:
+        """把程序文件复制到安装目录（就是自己复制自己），返回那边的启动目标。"""
+        want = str(self.plan.get("install_dir") or "").strip()
+        if not want:
+            return None
+        want_path = Path(want).expanduser()
+        here = paths.app_dir()
+        try:
+            if want_path.resolve() == here.resolve():
+                self.results.append((True, f"程序就在安装目录里：{here}"))
+                return None
+            shutil.copytree(here, want_path, dirs_exist_ok=True)
+        except OSError as e:
+            # 复制不了也不报错：退回免安装模式
+            self.portable = True
+            self.results.append((False, f"复制程序到 {want_path} 失败：{e}"))
+            self.log.emit("复制不过去，改用免安装模式：程序留在原地用。")
+            return None
+        self.results.append((True, f"程序已复制到：{want_path}"))
+        return {"target": str(want_path / Path(sys.executable).name), "args": "",
+                "workdir": str(want_path)}
 
     def _browser_log(self, text: str):
         """下载浏览器的输出：日志照发，进度条也跟着动一动。"""
@@ -181,28 +268,17 @@ class BuildWorker(QThread):
         self._bar = min(86, self._bar + 1)
 
 
-def _install_target(plan: Dict, results: List[Tuple[bool, str]]) -> Dict[str, str]:
-    """算快捷方式该指向谁（打包版可能会先复制程序文件到安装目录）。"""
-    target = shortcut.launch_target()
-    if not plan.get("frozen"):
-        results.append((True, "源码运行模式：跳过复制程序文件（打包成 exe 后才会复制）"))
-        return target
-    want = str(plan.get("install_dir") or "").strip()
-    if not want:
-        return target
-    want_path = Path(want).expanduser()
-    here = paths.app_dir()
-    if want_path.resolve() == here.resolve():
-        results.append((True, f"程序就在安装目录里：{here}"))
-        return target
+def _dir_writable(path: Path) -> bool:
+    """这个目录能不能写（不存在就顺手建一下）。装到 Program Files 时用得上：
+    没有管理员权限的机器写不进去，那就别硬装，直接走免安装模式。"""
     try:
-        shutil.copytree(here, want_path, dirs_exist_ok=True)
-    except OSError as e:
-        results.append((False, f"复制程序到 {want_path} 失败：{e}（可能要管理员权限）"))
-        return target
-    results.append((True, f"程序已复制到：{want_path}"))
-    return {"target": str(want_path / Path(sys.executable).name), "args": "",
-            "workdir": str(want_path)}
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".小邹RPA-写入测试.tmp"
+        probe.write_text("x", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
 
 
 def _fix_project_paths(project_dir: Path) -> List[str]:
@@ -285,7 +361,9 @@ class _DirsPage(QWizardPage):
         hint = QLabel(
             "· 用户数据目录：你的项目（含账号密码）、图片库、采集结果、登录态 cookie、\n"
             "  崩溃日志都放这里。换电脑或做备份，只拷这一个目录就够了。\n"
-            + ("· 程序安装目录：程序文件会复制到这里（建议用默认的 Program Files）。"
+            + ("· 程序安装目录：程序文件会复制到这里（建议用默认的 Program Files）。\n"
+               "  这个目录要管理员权限；写不进去的话会自动改用免安装模式：程序留在原地、\n"
+               "  不写注册表，只把用户数据目录和环境构建好，卸载时删掉程序文件夹即可。"
                if wizard.frozen else
                f"· 程序现在在：{paths.app_dir()}"
                "（源码运行时不会复制程序文件；打包成 exe 后才会复制）"))
@@ -301,8 +379,12 @@ class _DirsPage(QWizardPage):
             return False
         try:
             Path(text).expanduser().mkdir(parents=True, exist_ok=True)
+            probe = Path(text).expanduser() / ".小邹RPA-写入测试.tmp"
+            probe.write_text("x", encoding="utf-8")
+            probe.unlink()
         except OSError as e:
-            QMessageBox.warning(self, "这个目录用不了", f"{text}\n\n{e}")
+            QMessageBox.warning(self, "这个目录用不了",
+                                f"{text}\n\n{e}\n\n换一个能写的目录吧。")
             return False
         return True
 
@@ -321,8 +403,13 @@ class _OptionsPage(QWizardPage):
         self.chk_start.setChecked(bool(cfg.get("startmenu_shortcut", True)))
         self.chk_browser = QCheckBox("下载浏览器内核 Chromium（约 150 MB，跑网页自动化必装）")
         self.chk_browser.setChecked(True)
-        self.chk_launch = QCheckBox("安装完成后立即启动程序")
+        # 第一次运行时，向导关掉就直接进主界面（由 main.py 接管），不需要再启动一次，
+        # 否则会同时开两个程序
+        self.chk_launch = QCheckBox(
+            "构建完成后直接进入程序" if wizard.first_run else "安装完成后立即启动程序")
         self.chk_launch.setChecked(True)
+        if wizard.first_run:
+            self.chk_launch.setEnabled(False)
         for w in (self.chk_desktop, tip, self.chk_start, self.chk_browser, self.chk_launch):
             lay.addWidget(w)
         lay.addStretch(1)
@@ -334,6 +421,10 @@ class _BuildPage(QWizardPage):
     def __init__(self, wizard):
         super().__init__()
         self.wizard_ref = wizard
+        #: 关键步骤都成了没（写配置、建数据目录）——决定构建完能不能直接用
+        self.can_continue = False
+        #: 程序被复制到别的位置时的启动目标
+        self.new_target: Optional[Dict[str, str]] = None
         self.setTitle("正在安装 / 环境构建")
         self.setSubTitle("喝口水，装完这里会写清楚每一步的结果")
         lay = QVBoxLayout(self)
@@ -379,17 +470,30 @@ class _BuildPage(QWizardPage):
             self.log_box.verticalScrollBar().maximum())
 
     def _on_done(self, ok: bool, results: list):
+        """ok = 关键步骤都成了（非关键的那几步失败也能接着用）。"""
         self.wizard_ref.results = results
+        self.can_continue = ok
+        self.new_target = getattr(self.worker, "new_target", None)
         lines = [("✓ " if flag else "✗ ") + text for flag, text in results]
+        warn = [l for l in lines if l.startswith("✗")]
         self.log_box.appendPlainText("\n" + "\n".join(lines))
-        self.status.setText("全部完成 ✓ 点【完成】就行" if ok else
-                            "有几步没成功（上面带 ✗ 的那些），点【完成】关闭后可以重跑")
+        if ok and not warn:
+            self.status.setText("全部完成 ✓ 点【完成】就行")
+        elif ok:
+            self.status.setText("可以用了 ✓ 上面带 ✗ 的那几步没成功，不影响使用")
+        else:
+            self.status.setText("关键步骤没成功（上面带 ✗ 的），先别急着用，点【完成】后可以重跑")
         self.wizard_ref.button(QWizard.WizardButton.FinishButton).setEnabled(True)
         self.wizard_ref.button(QWizard.WizardButton.BackButton).setEnabled(not ok)
         self.wizard_ref.button(QWizard.WizardButton.CancelButton).setEnabled(True)
         if not ok:
             QMessageBox.warning(self, "有步骤没成功",
-                                "\n".join(l for l in lines if l.startswith("✗")))
+                                "\n".join(warn) +
+                                "\n\n（点【完成】关掉向导后可以重跑一次）")
+        elif warn and self.wizard_ref.first_run:
+            QMessageBox.information(
+                self, "装好了，有几处没成功",
+                "\n".join(warn) + "\n\n这些不影响使用，程序照常打开。")
 
 
 class SetupWizard(QWizard):
@@ -400,6 +504,8 @@ class SetupWizard(QWizard):
         self.first_run = first_run
         self.frozen = bool(getattr(sys, "frozen", False))
         self.results: List[Tuple[bool, str]] = []
+        #: 程序被复制到别的安装目录时，那边的启动目标（main.py 用它来重新启动）
+        self.relaunch_target: Optional[Dict[str, str]] = None
         self.default_data_dir = self._default_data_dir()
         self.default_install_dir = self._default_install_dir()
 
@@ -464,14 +570,27 @@ class SetupWizard(QWizard):
 
     # ------------------------------
     def accept(self):
-        """点【完成】：可选立即启动，然后关闭向导。"""
-        super().accept()
-        if self.results and all(flag for flag, _ in self.results) \
-                and self.page_options.chk_launch.isChecked():
-            self._launch()
+        """点【完成】：关掉向导，必要时启动（或换个位置启动）程序。
 
-    def _launch(self):
-        t = shortcut.launch_target()
+        · 第一次运行：不在这里启动——main.py 会接着往下走（或者按 relaunch_target
+          去启动新位置的程序），免得同时开出两个程序；
+        · 手动重跑向导：按【选项】里的勾选决定要不要启动。
+        """
+        page = self.page_build
+        can_continue = page.can_continue
+        if can_continue and page.new_target:
+            # 程序被复制到了安装目录：去那边启动
+            self.relaunch_target = page.new_target
+        super().accept()
+        if not can_continue:
+            return
+        if self.first_run:
+            return                       # 交给 main.py 处理
+        if self.page_options.chk_launch.isChecked():
+            self._launch(self.relaunch_target or shortcut.launch_target())
+
+    def _launch(self, target: Optional[Dict[str, str]] = None):
+        t = target or shortcut.launch_target()
         try:
             subprocess.Popen([t["target"]] + ([t["args"]] if t["args"] else []),
                              cwd=t["workdir"],

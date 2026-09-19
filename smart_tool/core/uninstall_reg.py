@@ -177,6 +177,29 @@ def is_registered() -> bool:
     return bool(read_entry())
 
 
+def can_register() -> bool:
+    """试写一次再删掉：这台机器（当前用户）到底能不能写卸载列表。
+
+    受限账户、注册表被组策略锁住的机器写不了。写不了就别硬来——安装向导会
+    退成免安装模式（程序留在原地，卸载时删文件夹），而不是给用户报一堆错。
+    """
+    if not supported():
+        return False
+    winreg = _winreg()
+    test_path = f"{UNINSTALL_ROOT}\\{key_name()}-写入测试"
+    try:
+        key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, test_path, 0,
+                                 winreg.KEY_WRITE)
+        try:
+            winreg.SetValueEx(key, "Test", 0, winreg.REG_SZ, "1")
+        finally:
+            winreg.CloseKey(key)
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, test_path)
+        return True
+    except OSError:
+        return False
+
+
 def unregister() -> dict:
     """把卸载列表里的这一条删掉（卸载程序最后一步）。"""
     if not supported():

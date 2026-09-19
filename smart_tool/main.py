@@ -5,6 +5,10 @@
     第一次运行 → 先弹【安装向导】（选目录、构建环境、建快捷方式）
     → 显示启动海报（加载完才让点，或者 8 秒后自动进）
     → 主窗口（默认载入演示项目，删了就是空项目）。
+
+两种情况不启动主界面：
+    · 用户在向导里点了【取消】；
+    · 程序被复制到了安装目录 —— 改为启动那边的程序（当前进程退出）。
 """
 import sys
 import traceback
@@ -53,20 +57,28 @@ def install_crash_handler():
     sys.excepthook = hook
 
 
-def run_first_time_setup() -> bool:
-    """第一次运行先弹安装向导（选目录、构建环境、建捷径）。
+def run_first_time_setup() -> str:
+    """第一次运行先弹安装向导（选目录、构建环境、建捷径、登记卸载入口）。
 
-    用户取消也不拦着——直接标成「已处理过」，用默认目录继续，免得每次启动都弹。
+    返回接下来该干什么：
+        "continue"  正常继续（装过了 / 装好了，就地运行）
+        "relaunch"  程序已经复制到安装目录 → 去启动那边的，当前进程退出
+        "quit"      用户取消了安装向导 → 什么都不做，直接退出
+
+    用户取消就不再往下走（不会偷偷启动程序，也不会把取消记成"装过了"）——
+    下次运行还会弹向导。
     """
     if paths.load_config().get("installed"):
-        return False
+        return "continue"
     from smart_tool.setup_wizard import SetupWizard
 
     wizard = SetupWizard(first_run=True)
-    finished = wizard.exec() == QDialog.DialogCode.Accepted
-    if not finished:
-        paths.save_config(installed=True)
-    return True
+    if wizard.exec() != QDialog.DialogCode.Accepted:
+        return "quit"
+    if wizard.relaunch_target:
+        wizard._launch(wizard.relaunch_target)
+        return "relaunch"
+    return "continue"
 
 
 def main():
@@ -75,6 +87,11 @@ def main():
     if "--uninstall" in sys.argv[1:]:
         from smart_tool.uninstall import main as uninstall_main
         sys.exit(uninstall_main())
+
+    # 重跑安装向导（补装浏览器内核、改数据目录、重建快捷方式都用它）
+    if "--setup" in sys.argv[1:]:
+        from smart_tool.setup_wizard import main as setup_main
+        sys.exit(setup_main())
 
     app = QApplication(sys.argv)
     # Windows 下显式指定中文字体，避免回退到无 CJK 字形的字体
@@ -89,7 +106,10 @@ def main():
     install_crash_handler()
 
     # 第一次运行：先把环境装好（数据目录、演示项目、浏览器内核、快捷方式）
-    run_first_time_setup()
+    # 用户点了取消 → 直接退出，什么都不启动
+    action = run_first_time_setup()
+    if action in ("quit", "relaunch"):
+        return
 
     # 启动海报：先画出来，再去建主窗口（建窗口最慢，海报上会写进度）
     splash = AdSplash.try_create()
