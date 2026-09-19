@@ -3,6 +3,7 @@
 
 纯 Python 实现，不依赖 PyQt6，可在命令行或 QThread 中运行。
 """
+import ast
 import fnmatch
 import json
 import re
@@ -41,8 +42,6 @@ DESKTOP_IMAGE_WAIT_S = 10.0
 PAUSE_POLL_INTERVAL = 0.5
 # 等待期间日志节流（秒），避免刷屏
 PAUSE_LOG_INTERVAL = 10
-# Playwright 页面默认超时（毫秒）。脚本节点会临时改小，用完恢复到这个值。
-DEFAULT_PAGE_TIMEOUT_MS = 30000
 # 打开网页的默认等待上限（秒）。站点慢的时候「load」事件迟迟不触发，
 # 所以只等到 DOM 解析完成就算打开，页面是否稳定交给步骤里的「步骤后等待」。
 # 每条【打开网页】可以在步骤编辑器里单独改这个秒数。
@@ -245,6 +244,41 @@ def build_script_source(code: str, params: List[Tuple[str, str]]) -> str:
     return (f"def __run__({names}):\n"
             f"{_indent_code(code)}\n"
             f"    return {{'{_LOCALS_KEY}': locals()}}\n")
+
+
+class _ScriptTimeout(BaseException):
+    """脚本超时的内部信号。
+
+    故意继承 BaseException：这样脚本自己写的 try/except Exception 不会把它吃掉。
+    """
+
+    def __init__(self, line: int):
+        super().__init__(f"脚本超时（第 {line} 行附近）")
+        self.line = line
+
+
+class _LoopGuard(ast.NodeTransformer):
+    """给每个循环体、函数体开头插一句 `__tick__(行号)`——超时了就在那儿抛异常。
+
+    这样 Python 死循环能真的被打断（不用子进程，`page` 照样能用）；
+    缺点是卡在 time.sleep / 浏览器调用这种「等外部」的写法上时还得等它返回。
+    插进去的语句沿用原节点的行号，所以报错行号跟用户看到的一致。
+    """
+
+    def _tick(self, node) -> ast.Expr:
+        call = ast.Expr(value=ast.Call(
+            func=ast.Name(id="__tick__", ctx=ast.Load()),
+            args=[ast.Constant(value=max(1, int(node.lineno) - 1))],   # 减掉包裹层那一行
+            keywords=[]))
+        return ast.copy_location(call, node)
+
+    def _guard(self, node):
+        self.generic_visit(node)
+        node.body.insert(0, self._tick(node))
+        return node
+
+    visit_While = visit_For = visit_AsyncFor = _guard
+    visit_FunctionDef = visit_AsyncFunctionDef = _guard
 
 
 def step_var_fields(step: Step) -> List[str]:
@@ -1135,33 +1169,56 @@ class StepExecutor:
         """进程内 exec；代码整体缩进塞进一个函数里，所以 return 能正常用。
 
         返回值：(更新后的 vars, 日志, 脚本 return 的值｜None)。
-        注意：Python 脚本无法强制中断，超时只提示（请自行避免死循环）。
+
+        超时：编译前会给每个循环 / 函数体插一句「到点没」的检查，
+        所以死循环、超长循环会在超时那一刻被打断（进程内执行，page 照样能用）。
+        例外：卡在 time.sleep(600) 或浏览器调用这种「等外部返回」的写法上，
+        只能等它自己返回——所以页面上等元素请用 page.xxx(..., timeout=毫秒)。
         """
         src = build_script_source(code, params)
+        filename = f"<脚本节点{step.id}>"
         try:
-            compiled = compile(src, f"<脚本节点{step.id}>", "exec")
+            tree = ast.parse(src, filename)
         except SyntaxError as e:
             line = max(1, int(e.lineno or 1) - 1)    # 减去包在外面的那一行
             raise ValueError(f"Python 脚本语法错误（第 {line} 行）：{e.msg}")
+        tree = _LoopGuard().visit(tree)
+        ast.fix_missing_locations(tree)
+        compiled = compile(tree, filename, "exec")
 
         logs: List[str] = []
+        deadline = time.monotonic() + timeout
+
+        def __tick__(line: int):
+            if time.monotonic() > deadline:
+                raise _ScriptTimeout(line)
+
         ns: Dict[str, Any] = {
             "vars": dict(scope),
             "log": lambda m: logs.append(str(m)),
             "page": self._page,
             "current_url": self._current_url(),
             "project_dir": str(self.project_dir) if self.project_dir else "",
+            "__tick__": __tick__,
         }
         started = time.monotonic()
         exec(compiled, ns)          # noqa: S102 - 运行用户自己的本地脚本
         try:
             returned = ns["__run__"](**args)
+        except _ScriptTimeout as e:
+            raise ValueError(
+                f"Python 脚本超时：超过设定的 {timeout} 秒，已在第 {e.line} 行"
+                "附近中断。\n"
+                "    （循环里的等待请用 page.xxx(..., timeout=毫秒)；"
+                "time.sleep 这种系统等待没法中断，只能等它自己醒）"
+            ) from None
         except Exception as e:
             raise ValueError(f"Python 脚本出错{_script_line(e, step.id)}："
                              f"{type(e).__name__}: {e}") from e
         used = time.monotonic() - started
         if used > timeout:
-            self.log(f"  提示：脚本耗时 {used:.1f}s，已超过设定 {timeout}s")
+            self.log(f"  提示：脚本耗时 {used:.1f}s，已超过设定 {timeout}s"
+                     "（卡在等外部返回的调用上时没法中断）")
 
         out = dict(ns.get("vars") or {})
         locals_snapshot = {}
@@ -1181,31 +1238,46 @@ class StepExecutor:
         if self._page is None:
             raise RuntimeError("JavaScript 节点需要浏览器页面，但浏览器未启动")
         names = ", ".join(p for _v, p in params)
+        # 超时用「赛跑」实现：脚本那边（可能是 await 一个不返回的 Promise）
+        # 跟一个到点就失败的计时器比谁先结束。同步死循环会把页面卡死，那种拦不住。
         wrapper = (
-            "(arg) => {\n"
+            "async (arg) => {\n"
             "  const logs = [];\n"
             "  const log = (m) => logs.push(String(m));\n"
             "  const vars = arg.vars;\n"
             "  const url = arg.url;\n"
-            "  const ret = (function(" + names + "){\n"
+            "  let timer = null;\n"
+            "  const limit = new Promise((_ok, bad) => {\n"
+            "    timer = setTimeout(() => bad(new Error('__SCRIPT_TIMEOUT__')),\n"
+            "                       arg.timeout);\n"
+            "  });\n"
+            "  let ret;\n"
+            "  try {\n"
+            "    ret = await Promise.race([\n"
+            "      Promise.resolve().then(() =>\n"
+            "        (async function(" + names + "){\n"
             + code +
-            "\n  }).apply(null, arg.args);\n"
-            "  return { vars: vars, logs: logs,"
-            " ret: ret === undefined ? null : ret };\n"
+            "\n      }).apply(null, arg.args)),\n"
+            "      limit,\n"
+            "    ]);\n"
+            "  } finally { clearTimeout(timer); }\n"
+            "  return { vars: vars, logs: logs,\n"
+            "           ret: ret === undefined ? null : ret };\n"
             "}"
         )
-        old_timeout = DEFAULT_PAGE_TIMEOUT_MS
-        self._page.set_default_timeout(timeout * 1000)
         try:
             res = self._page.evaluate(
                 wrapper,
                 {"vars": dict(scope), "url": self._current_url(),
+                 "timeout": timeout * 1000,
                  "args": [args.get(p, "") for _v, p in params]},
             )
         except Exception as e:
+            if "__SCRIPT_TIMEOUT__" in str(e):
+                raise ValueError(
+                    f"JavaScript 脚本超时：超过设定的 {timeout} 秒，已中断。"
+                ) from None
             raise RuntimeError(f"JavaScript 脚本执行失败：{e}")
-        finally:
-            self._page.set_default_timeout(old_timeout)
 
         res = res or {}
         out = dict(res.get("vars") or {})

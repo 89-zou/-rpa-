@@ -111,8 +111,10 @@ SCRIPT_HINT_PY = (
     "【报错】脚本抛异常会让这一步失败、流程停下（出错信息带行号）。\n"
     "「某条数据不规整就跳过」这类场景，自己在脚本里 try/except 包一层。\n"
     "\n"
-    "【注意】Python 脚本无法强制中断：死循环会让流程卡在这一步，\n"
-    "「执行超时」只做事后提示，不会真把它掐掉。"
+    "【执行超时】到点会真的把这步掐掉：脚本里每进一次循环都会看一眼\n"
+    "「到点了没」，所以死循环、超长循环能在超时那一刻停下并告诉你在第几行。\n"
+    "唯一的例外是「等外部返回」的写法（time.sleep(600)、page.click() 卡住），\n"
+    "那种只能等它自己返回——所以页面上等元素请写 page.xxx(..., timeout=毫秒)。"
 )
 SCRIPT_HINT_JS = (
     "在网页里执行 JavaScript，直接操作 DOM。同样当函数用：入口参数是形参、\n"
@@ -137,7 +139,9 @@ SCRIPT_HINT_JS = (
     "【注意】\n"
     "· JS 跑在页面里，刷新页面就没了；要跨步骤留值就放到 vars 里。\n"
     "· 桌面场景没有浏览器页面，JS 节点用不了（用 Python）。\n"
-    "· 取到的文本是页面原始文本，该 trim() 就 trim()。"
+    "· 取到的文本是页面原始文本，该 trim() 就 trim()。\n"
+    "· 执行超时会中断「await 等着不回来」的写法；但如果脚本里写的是\n"
+    "  同步死循环（while(true){}），页面本身就被卡住了，那种拦不住。"
 )
 
 #: 【?】里的说明（界面上只留一句摘要）
@@ -967,7 +971,7 @@ class StepEditDialog(QDialog):
             self.script_help_btn.set_content(
                 "JavaScript 脚本" if is_js else "Python 脚本",
                 SCRIPT_HINT_JS if is_js else SCRIPT_HINT_PY)
-        self.script_timeout.setSuffix(" 秒" + ("" if is_js else "（仅提示，不强制中断）"))
+        self.script_timeout.setSuffix(" 秒")
 
     # ------------------------------
     # 条件分支表
