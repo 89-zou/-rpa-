@@ -70,6 +70,12 @@ def run_first_time_setup() -> bool:
 
 
 def main():
+    # 卸载入口：系统「设置 → 应用 → 小邹RPA → 卸载」执行的就是这条
+    # （注册表里的 UninstallString 写着 "<本程序>" --uninstall）
+    if "--uninstall" in sys.argv[1:]:
+        from smart_tool.uninstall import main as uninstall_main
+        sys.exit(uninstall_main())
+
     app = QApplication(sys.argv)
     # Windows 下显式指定中文字体，避免回退到无 CJK 字形的字体
     font = QFont("Microsoft YaHei", 9)

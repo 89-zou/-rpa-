@@ -11,6 +11,8 @@
           · 把内置的演示项目复制到你的数据目录（启动后会默认打开它）
           · 下载浏览器内核 Chromium（打包版没有自带，约 150 MB）
           · 建桌面 / 开始菜单快捷方式（带 logo 图标）
+          · 登记到 Windows 的卸载列表（设置 → 应用 里能看到「小邹RPA」，点卸载走
+            `smart_tool/uninstall.py`，会把快捷方式、程序文件、配置一并清掉）
     5. 完成后可以直接启动程序。
 
 另外也能当独立入口跑：`python -m smart_tool.setup_wizard`（随时重跑，比如补装浏览器）。
@@ -18,6 +20,7 @@
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -30,7 +33,7 @@ from PyQt6.QtWidgets import (
 )
 
 from smart_tool import paths
-from smart_tool.core import browser_setup, shortcut
+from smart_tool.core import browser_setup, shortcut, uninstall_reg
 
 
 # ============================================================
@@ -136,6 +139,7 @@ class BuildWorker(QThread):
         target = _install_target(plan, self.results)
         icon = paths.icon_file()
         icon_text = str(icon) if icon.is_file() else ""
+        lnk_paths: List[str] = []
         for where, want, label in (("desktop", plan.get("desktop"), "桌面快捷方式"),
                                    ("startmenu", plan.get("startmenu"), "开始菜单快捷方式")):
             if not want:
@@ -146,10 +150,27 @@ class BuildWorker(QThread):
                 workdir=target["workdir"], where=where,
                 description=f"{paths.APP_NAME} ｜ {paths.AUTHOR}")
             if r["ok"]:
+                lnk_paths.append(r["path"])
                 self.results.append((True, f"{label}：{r['path']}"))
             else:
                 self.results.append(
                     (False, f"{label}创建失败：{r['error']}（可以稍后手动建）"))
+
+        # 6) 登记到 Windows 的卸载列表（不登记的话用户在系统里找不到卸载入口）
+        self._step(96, "正在登记卸载信息…")
+        install_dir = ""
+        if not str(target.get("args") or "").strip():      # 打包版：exe 所在目录
+            install_dir = str(Path(target["target"]).resolve().parent)
+        paths.save_config(install_dir=install_dir,
+                          shortcut_paths=lnk_paths,
+                          installed_at=f"{datetime.now():%Y-%m-%d %H:%M}")
+        size = uninstall_reg.dir_size(install_dir) if install_dir else 0
+        info = uninstall_reg.register(target, size_bytes=size)
+        if info["ok"]:
+            self.results.append(
+                (True, "已登记到系统卸载列表（设置 → 应用 → 小邹RPA 里可以卸载）"))
+        else:
+            self.results.append((False, f"登记卸载信息失败：{info['error']}"))
         self._step(98)
 
     def _browser_log(self, text: str):
