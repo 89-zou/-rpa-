@@ -37,7 +37,7 @@ def main():
           + ("（真实鼠标：开）" if real else ""))
     executor = StepExecutor(
         steps, variables, headless=False, project_dir=store.dir,
-        real_mouse=real, scene=scene,
+        real_mouse=real, scene=scene, auth=store.load_auth(),
     )
     try:
         executor.run()
