@@ -64,7 +64,8 @@ class _StepCard(QWidget):
 
     def __init__(self, step: Step, indent: int = 0,
                  branch_text: str = "", collapsed: bool = False,
-                 hidden_count: int = 0, on_toggle=None, parent=None):
+                 hidden_count: int = 0, on_toggle=None, number: str = "",
+                 parent=None):
         super().__init__(parent)
         self.setFixedHeight(CARD_H)
         name, color = ACTION_META.get(step.action, (step.action, "#888888"))
@@ -105,9 +106,11 @@ class _StepCard(QWidget):
             prefix = "⤴ "
         elif step.action == "branch":
             prefix = "⑂ "
-        # 自定义名称优先，后面跟上类型名（如「登录页（打开网页）」）
+        # 自定义名称优先，后面跟上类型名（如「登录页（打开网页）」）；
+        # 编号用显示编号：组合是「2-4」这种范围，它自己不占号
         shown = f"{step.title}（{name}）" if step.title else name
-        title = QLabel(f"{prefix}{step.id}. {shown}")
+        head = f"{number}. " if number else ""
+        title = QLabel(f"{prefix}{head}{shown}")
         title_font = QFont()
         title_font.setBold(True)
         title.setFont(title_font)
@@ -263,6 +266,7 @@ class FlowEditorDialog(QDialog):
         self._spans = blocks.spans(self._steps)
         depths = blocks.depths(self._steps)
         span_by_start = {sp.start: sp for sp in self._spans}
+        numbers = blocks.step_numbers(self._steps)
         # 「＋ 点击创建新节点」放在每个循环体 / 分支 / 组合的末尾
         add_at = {sp.insert_pos: sp for sp in self._spans
                   if sp.kind in ("loop", "branch", "group")}
@@ -276,7 +280,8 @@ class FlowEditorDialog(QDialog):
                 continue
             if i in add_at:
                 self._append_add_row(add_at[i], depths[i])
-            self._append_step_row(i, depths[i], span_by_start.get(i))
+            self._append_step_row(i, depths[i], span_by_start.get(i),
+                                  numbers[i])
         self.list_widget.blockSignals(False)
 
         if select_index is not None:
@@ -286,7 +291,7 @@ class FlowEditorDialog(QDialog):
                     break
         self._update_buttons()
 
-    def _append_step_row(self, idx: int, depth: int, span=None):
+    def _append_step_row(self, idx: int, depth: int, span=None, number: str = ""):
         """加一行卡片；span 只在「块的开始标记」这一行传进来（要挂展开按钮）。"""
         collapsed = False
         hidden_count = 0
@@ -304,7 +309,8 @@ class FlowEditorDialog(QDialog):
                             branch_text=_branch_text(self._steps, idx),
                             collapsed=collapsed,
                             hidden_count=hidden_count,
-                            on_toggle=on_toggle)
+                            on_toggle=on_toggle,
+                            number=number)
         )
         self._rows.append(("step", idx))
 
@@ -501,7 +507,10 @@ class FlowEditorDialog(QDialog):
             f"，{groups} 个组合" if groups else "",
             f"，{folded} 个已收起" if folded else "",
         ])
-        self.count_label.setText(f"共 {len(self._steps)} 个步骤" + extra)
+        # 编号按「显示编号」数：组合不占号（显示 2-4），所以不写死成行数
+        top = blocks.last_number(self._steps)
+        head = f"编号 1~{top}" if top else "还没有节点"
+        self.count_label.setText(head + extra)
 
     # ------------------------------
     # 块里的「＋ 点击创建新节点」
@@ -727,8 +736,10 @@ class FlowEditorDialog(QDialog):
             self.status_label.setText(f"已自动保存；但{problem}")
             self.status_label.setStyleSheet("color:#c62828;")
             return
+        # 显示编号的最大值（组合不占号，所以不一定是行数）
+        top = blocks.last_number(self._steps) or "0"
         self.status_label.setText(
-            f"已自动保存（{len(self._steps)} 个步骤，编号 1~{len(self._steps)}）"
+            f"已自动保存（{len(self._steps)} 行，编号 1~{top}）"
         )
         self.status_label.setStyleSheet("color:#2e7d32;")
 

@@ -113,6 +113,7 @@ class WebAutomationTab(QWidget):
         self._scene: str = "web"        # 当前项目的场景：web / desktop
         self._user_paused = False       # 小窗上手动暂停中
         self._flow_paused = False       # 流程里的「暂停等人工」节点正在等
+        self._step_labels: dict = {}    # 步骤 id → 显示编号（组合不占编号）
         self._init_ui()
         # 启动不自动载入项目：避免读盘/排版拖慢界面，由用户点【载入项目…】
         self._clear_project()
@@ -450,7 +451,8 @@ class WebAutomationTab(QWidget):
         dlg.exec()
         if dlg.changed:
             self._steps = dlg.get_steps()
-            self._persist(auto_layout=True)
+            # 不整体重排：用户摆好的画布布局要保住，新节点只补个空位
+            self._persist()
             self._append_log("流程已更新（改动已自动保存）。")
 
     def _auto_layout(self):
@@ -479,8 +481,8 @@ class WebAutomationTab(QWidget):
                  auto_layout: Optional[bool] = None):
         """统一保存：id 重排 → 写盘 → 重建画布。
 
-        结构变化（增/删/移动）传 auto_layout=True，让画布重新横向排列，
-        避免新节点与旧节点重叠；仅改内容时保持原有位置。
+        默认**不动画布布局**（新节点只补一个空位）：布局是用户自己摆的，
+        加/删/改一个节点就把整片打乱太难受。只有【自动排版】按钮才整体重排。
         """
         if not self._current_store:
             return
@@ -540,7 +542,7 @@ class WebAutomationTab(QWidget):
             new_steps.append(Step(id=0, action=blocks.BRANCH))
             new_steps.append(Step(id=0, action=blocks.COND_END))
         self._steps[pos:pos] = new_steps
-        self._persist(select_row=pos, auto_layout=True)
+        self._persist(select_row=pos)       # 新节点自己补空位，不动现有布局
 
     def _edit_selected_step(self):
         row = self._selected_row()
@@ -618,18 +620,19 @@ class WebAutomationTab(QWidget):
                 return
             blocks.drop_branch_entry(self._steps, block.start)
             del self._steps[block.start:block.end + 1]
-            self._persist(select_row=min(block.start, len(self._steps) - 1),
-                          auto_layout=True)
+            self._persist(select_row=min(block.start, len(self._steps) - 1))
             return
         step = self._steps[row]
+        num = blocks.number_of(self._steps, row)
+        cn = ACTION_META.get(step.action, (step.action, ""))[0]
+        label = f"{num}. {step.title or cn}" if num else (step.title or cn)
         reply = QMessageBox.question(
-            self, "删除步骤", f"确定删除步骤 {step.id}（{step.action}）？",
+            self, "删除步骤", f"确定删除这个步骤（{label}）？",
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
         self._steps.pop(row)
-        self._persist(select_row=min(row, len(self._steps) - 1),
-                      auto_layout=True)
+        self._persist(select_row=min(row, len(self._steps) - 1))
 
     def _move_bounds(self, idx: int) -> Tuple[int, int]:
         """该步骤允许上下移动到的下标范围（不许跨出自己所在的块）。"""
@@ -641,7 +644,7 @@ class WebAutomationTab(QWidget):
             return
         block = blocks.span_by_marker(blocks.spans(self._steps), row)
         if block is not None:
-            # 选中块的标记：整块上下移动
+            # 选中块的标记：整块上下移动（整块位置不动，想摆位置直接拖它的虚线框）
             a, b = block.start, block.end
             if delta < 0:
                 if a == 0:
@@ -657,15 +660,18 @@ class WebAutomationTab(QWidget):
                     [self._steps[b + 1]] + self._steps[a:b + 1]
                 )
                 target = a + 1
-            self._persist(select_row=target, auto_layout=True)
+            self._persist(select_row=target)
             return
         lo, hi = self._move_bounds(row)
         target = row + delta
         if not (lo <= target <= hi):
             return
-        # 交换执行顺序后重排，保证连线不再交叉
-        self._steps[row], self._steps[target] = self._steps[target], self._steps[row]
-        self._persist(select_row=target, auto_layout=True)
+        # 换了执行顺序，把这两个节点的画布坐标也对调一下：
+        # 这样画布上的先后位置跟编号仍然一致，其它节点一个都不动
+        a, b = self._steps[row], self._steps[target]
+        a.pos, b.pos = b.pos, a.pos
+        self._steps[row], self._steps[target] = b, a
+        self._persist(select_row=target)
 
     # ------------------------------
     # 画布右键菜单
@@ -752,7 +758,12 @@ class WebAutomationTab(QWidget):
         self._user_paused = False
         self._flow_paused = False
         name = self._current_store.name if self._current_store else ""
-        self.monitor.start(name, len(self._steps))
+        # 显示编号（组合不占号，标签是「2-4」这种范围）：小窗上的「第 N 步」
+        # 要跟画布上看到的数字一致；组合本身不会被执行到，所以只认纯数字
+        labels = blocks.step_numbers(self._steps)
+        self._step_labels = {s.id: n for s, n in zip(self._steps, labels)
+                             if n.isdigit()}
+        self.monitor.start(name, len(self._step_labels))
         win = self.window()
         if win is not self:
             win.hide()
@@ -783,7 +794,7 @@ class WebAutomationTab(QWidget):
         detail = " / ".join(step_summary(step)[:2])
         if step.title:
             detail = f"{step.title}｜{detail}" if detail else step.title
-        self.monitor.set_step(step_id, cn, detail)
+        self.monitor.set_step(self._step_labels.get(step_id, step_id), cn, detail)
 
     def _on_monitor_pause(self):
         """小窗上那个按钮：随当前状态既是「暂停」也是「继续」。"""
@@ -832,8 +843,9 @@ class WebAutomationTab(QWidget):
         self._show_home_window()
 
     def _on_pause(self, prompt: str, step_id: int):
+        num = self._step_labels.get(step_id, step_id)
         self._append_log(
-            f"暂停 [步骤 {step_id}] {prompt} —— 满足恢复条件会自动继续，"
+            f"暂停 [步骤 {num}] {prompt} —— 满足恢复条件会自动继续，"
             f"也可在小窗（或这里）点【继续】"
         )
         self.btn_continue.setEnabled(True)

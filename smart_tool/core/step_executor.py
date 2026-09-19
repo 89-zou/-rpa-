@@ -372,6 +372,10 @@ class StepExecutor:
         self._real_mouse = None
         self._stop = False
         self._page: Optional[Page] = None
+        # 显示编号：组合节点不占编号（显示成 2-4 这种范围），所以日志里不能直接用
+        # step.id，否则跟画布上看到的数字对不上
+        self._labels = {id(s): n for s, n
+                        in zip(steps, blocks.step_numbers(steps)) if n}
         # 用户在小窗上点【暂停】时置位：执行器在每个步骤开始前停住等它清掉
         self._pause_requested = threading.Event()
 
@@ -640,7 +644,7 @@ class StepExecutor:
     # 步骤分发
     # ------------------------------
     def _execute_step(self, step: Step):
-        self.log(f"[步骤 {step.id}] {step.action}")
+        self.log(f"[步骤 {self._labels.get(id(step), step.id)}] {step.action}")
         if self.on_step is not None:
             try:
                 self.on_step(step.id)      # 给运行小窗显示「跑到第几步了」
@@ -1252,7 +1256,8 @@ class StepExecutor:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(
-                    f"暂停等待人工操作超时（{timeout}s），步骤 {step.id} 未满足恢复条件："
+                    f"暂停等待人工操作超时（{timeout}s），"
+                    f"步骤 {self._labels.get(id(step), step.id)} 未满足恢复条件："
                     f"{self._describe_condition(step)}"
                 )
             # 5) 节流日志：让用户知道仍在等待
