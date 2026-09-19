@@ -198,9 +198,12 @@ class BuildWorker(QThread):
                           portable=self.portable,
                           installed_at=f"{datetime.now():%Y-%m-%d %H:%M}")
         if self.portable or not can_reg:
-            self.results.append(
-                (True, "没有登记系统卸载入口：卸载时把程序和数据文件夹删掉即可"
-                       f"（程序在 {Path(target['target']).parent}）"))
+            if paths.is_production():
+                msg = ("没有登记系统卸载入口：以后不想要了，删掉程序本体和文件夹即可"
+                       f"（程序在 {Path(target['target']).parent}）")
+            else:
+                msg = "开发版（源码运行）：不写系统卸载入口，只把项目目录和环境构建好"
+            self.results.append((True, msg))
         else:
             info = uninstall_reg.register(
                 target, size_bytes=uninstall_reg.dir_size(Path(target["target"])))
@@ -230,7 +233,9 @@ class BuildWorker(QThread):
         can_reg = uninstall_reg.can_register()
         no_reg = "" if can_reg else "这台机器写不了注册表（受限账户或组策略限制）"
         if not frozen:
-            return True, can_reg, no_reg or "源码运行：不复制程序文件"
+            # 开发版（源码运行）：只把项目目录和环境构建好。往系统里装东西
+            # （复制程序、登记卸载入口）是交付给用户时才做的事。
+            return True, False, "源码运行（开发版）：不复制程序文件、不写系统卸载入口"
         if not _dir_writable(target_dir):
             return False, can_reg, f"{target_dir} 里写不进东西（换个文件夹，或用管理员身份运行）"
         return True, can_reg, no_reg
