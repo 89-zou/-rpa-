@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from smart_tool.core import free_code, project_store
+from smart_tool.core import blocks, free_code, project_store
 from smart_tool.core.project_store import Locator, Step
 from smart_tool.ui.code_editor import CodeEditor
 from smart_tool.ui.collect_panel import CollectPanel
@@ -64,7 +64,7 @@ ACTION_LABELS = {
     "loop_end": "循环结束（设置与「循环开始」共用，点哪个都是编辑这个循环）",
     "condition_start": "条件 if/else（自动带上分支与「条件结束」，按结果走某个分支）",
     "condition_end": "条件结束（设置与「条件」共用，点哪个都是编辑这个条件）",
-    "branch": "分支（匹配值在「条件」节点里改，点它会打开那个条件）",
+    "branch": "分支（判断方式在「条件」节点里改，点它会打开那个条件）",
     "script": "自由代码 script（Python / JavaScript）",
     "call": "调用函数 call（调用【项目管理…】→【函数库】里定义好的函数）",
     # 桌面场景
@@ -78,9 +78,14 @@ DESKTOP_LABEL_SUFFIX = {
 }
 # 条件判断方式
 COND_MODES = [
-    ("equal", "变量相等（变量值跟分支的匹配值比，一样就走那个分支）"),
-    ("expr", "表达式（写 Python 表达式，如 {{loop.item.内容}} 含某个词）"),
+    ("rule", "规则（条件提供数据，每个分支选判断方式＋值）"),
+    ("expr", "表达式（写一段 Python，适合复杂判断）"),
 ]
+# 分支表的表头（按判断方式切换；第二列在表达式模式下藏着）
+BRANCH_HEADERS_RULE = ["分支名（自己看得懂就行）", "判断方式",
+                       "值（逗号分隔＝任一命中）"]
+BRANCH_HEADERS_EXPR = ["分支名（自己看得懂就行）", "判断方式",
+                       "匹配值（表达式是真/假时可留空）"]
 SCRIPT_LANGS = [("python", "Python（本地执行）"),
                 ("javascript", "JavaScript（在网页里执行）")]
 
@@ -213,14 +218,23 @@ LOOP_HELP = (
 )
 
 COND_HELP = (
-    "执行时会先算出「判断内容」的结果，然后从上往下找第一个匹配的分支，\n"
-    "只执行那个分支里的步骤；一个都不匹配就整段跳过（后面的步骤照常执行）。\n"
+    "执行时会先算出「判断的数据」，然后从上往下找第一个成立的分支，\n"
+    "只执行那个分支里的步骤；一个都不成立就整段跳过（后面的步骤照常执行）。\n"
     "\n"
-    "【判断方式】\n"
-    "· 变量相等：把「判断内容」渲染成文本，跟各分支的匹配值逐个比，一样就走那个分支。\n"
-    "  匹配值可以写多个，用逗号分隔（如 北京,上海,广州），命中任意一个就走。\n"
-    "· 表达式：写一段 Python 表达式，里面的 {{变量}} 会按数字 / 文本自动代入。\n"
-    "  结果是真 / 假 → 走第 1 / 第 2 个分支；算出来是别的值 → 按匹配值走。\n"
+    "【规则】（推荐）\n"
+    "「判断的数据」写一个变量（如 {{loop.item.标题}}），每个分支自己写条件：\n"
+    "· 判断方式：包含 / 不包含 / 等于 / 不等于 / 大于 / 小于 / 大于等于 / 小于等于；\n"
+    "· 值：要拿来做比较的内容。包含 / 不包含 / 等于 / 不等于 可以写多个，\n"
+    "  用逗号分隔（如 公示,公告），命中任意一个就成立；\n"
+    "· 大小比较按数字比，两边都要能当数字（比如 5 和 10）。\n"
+    "\n"
+    "【兜底】（判断方式选「兜底」）\n"
+    "这一条不判断、无条件成立，相当于 else —— 「前面都不满足」就往这里走。\n"
+    "所以它必须放在最后一个，否则排在它后面的分支永远轮不到。\n"
+    "\n"
+    "【表达式】（复杂判断才用）\n"
+    "写一段 Python 表达式，里面的 {{变量}} 会按数字 / 文本自动代入。\n"
+    "结果是真 / 假 → 走第 1 / 2 个分支；算出来是别的值 → 按匹配值走。\n"
     "\n"
     "【分支】\n"
     "· 分支的先后就是判断顺序（列表里从上到下）；\n"
@@ -648,31 +662,31 @@ class StepEditDialog(QDialog):
         form.addRow("判断方式：", self.cond_mode_combo)
 
         self.cond_expr_edit = QLineEdit()
-        self.cond_expr_edit.setPlaceholderText("要判断的变量，如 {{row.地区}}")
+        self.cond_expr_edit.setPlaceholderText("条件要判断的数据，如 {{loop.item.标题}}")
         self.cond_var_combo = QComboBox()
         self.cond_var_combo.setMinimumWidth(190)
-        self.cond_var_combo.setToolTip("选择后把变量插入到判断内容里")
+        self.cond_var_combo.setToolTip("选择后把变量插入到「判断的数据」里")
         self.cond_var_combo.activated.connect(self._insert_cond_var)
         self.cond_row = QWidget()
         cond_row_layout = QHBoxLayout(self.cond_row)
         cond_row_layout.setContentsMargins(0, 0, 0, 0)
         cond_row_layout.addWidget(self.cond_expr_edit, 1)
         cond_row_layout.addWidget(self.cond_var_combo)
-        form.addRow("判断内容：", self.cond_row)
+        form.addRow("判断的数据：", self.cond_row)
 
         self.cond_hint = QLabel("")
         self.cond_hint.setWordWrap(True)
         self.cond_hint.setStyleSheet("color: #888;")
         form.addRow("", self.cond_hint)
 
-        self.branch_table = QTableWidget(0, 2)
-        self.branch_table.setHorizontalHeaderLabels(
-            ["分支名（自己看得懂就行）", "匹配值（逗号分隔多个；表达式模式可留空）"]
-        )
+        self.branch_table = QTableWidget(0, 3)
+        self.branch_table.setHorizontalHeaderLabels(BRANCH_HEADERS_RULE)
         self.branch_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents)
         self.branch_table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch)
+            1, QHeaderView.ResizeMode.ResizeToContents)
+        self.branch_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch)
         self.branch_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
         self.branch_table.setMinimumHeight(120)
@@ -921,11 +935,11 @@ class StepEditDialog(QDialog):
         self.adjustSize()
 
     def _on_action_changed(self):
-        # 新建条件节点时先给两个空分支，省得用户还要手动加
+        # 新建条件节点时先给两个分支：一个待填条件的，一个兜底的
         if (not self._editing and self._current_action() == "condition_start"
                 and self.branch_table.rowCount() == 0):
-            self._add_branch_row("分支 1")
-            self._add_branch_row("分支 2")
+            self._add_branch_row("分支 1", op="contains")
+            self._add_branch_row("兜底", op="")
         self._on_cond_mode_changed()
         self._sync_visibility()
 
@@ -1060,23 +1074,23 @@ class StepEditDialog(QDialog):
         is_expr = self.cond_mode_combo.currentData() == "expr"
         self.cond_expr_edit.setPlaceholderText(
             "Python 表达式，如 len({{loop.item.内容}}) > 500"
-            if is_expr else "要判断的变量，如 {{loop.item.地区}}"
+            if is_expr else "条件要判断的数据，如 {{loop.item.标题}}"
         )
         self.cond_hint.setText(
             "表达式里可以直接写 {{变量}}（系统会按数字/文本自动代入）；\n"
-            "算出来是真/假 → 走第 1 / 第 2 个分支，算出来是别的值 → 按下面的匹配值走。"
+            "算出来是真/假 → 走第 1 / 2 个分支，算出来是别的值 → 按下面的匹配值走。"
             if is_expr else
-            "把「判断内容」渲染出来的值，跟各分支的匹配值逐个比，一样就走那个分支。"
+            "把「判断的数据」渲染出来，从上往下跟每个分支的条件比，\n"
+            "第一个成立的执行；都不成立就跳过。判断方式选「兜底」的分支无条件成立（放最后）。"
         )
-        self.branch_table.setHorizontalHeaderLabels([
-            "分支名（自己看得懂就行）",
-            "匹配值（表达式结果是真/假时可留空）" if is_expr
-            else "匹配值（逗号分隔多个）",
-        ])
+        # 表达式模式不分「判断方式」，把那一列藏起来
+        self.branch_table.setHorizontalHeaderLabels(
+            BRANCH_HEADERS_EXPR if is_expr else BRANCH_HEADERS_RULE)
+        self.branch_table.setColumnHidden(1, is_expr)
         self._update_branch_count()
 
     def _insert_cond_var(self, index: int):
-        """把选中的变量插入到「判断内容」光标处。"""
+        """把选中的变量插入到「判断的数据」光标处。"""
         name = self.cond_var_combo.itemData(index)
         if not name:
             return
@@ -1084,15 +1098,22 @@ class StepEditDialog(QDialog):
         self.cond_expr_edit.setFocus()
         self.cond_var_combo.setCurrentIndex(0)
 
-    def _add_branch_row(self, name: str = "", values: str = "",
-                        origin: int = -1) -> int:
+    def _add_branch_row(self, name: str = "", op: str = "",
+                        value: str = "", origin: int = -1) -> int:
         """加一行分支；origin 是它在原清单里的下标（新建的为 -1）。"""
         row = self.branch_table.rowCount()
         self.branch_table.insertRow(row)
         name_item = QTableWidgetItem(name)
         name_item.setData(Qt.ItemDataRole.UserRole, origin)
         self.branch_table.setItem(row, 0, name_item)
-        self.branch_table.setItem(row, 1, QTableWidgetItem(values))
+
+        op_combo = QComboBox()
+        for key, label in blocks.COND_OPS:
+            op_combo.addItem(label, key)
+        op_combo.setCurrentIndex(max(0, op_combo.findData(op)))
+        self.branch_table.setCellWidget(row, 1, op_combo)
+
+        self.branch_table.setItem(row, 2, QTableWidgetItem(value))
         self._update_branch_count()
         return row
 
@@ -1112,10 +1133,13 @@ class StepEditDialog(QDialog):
         out = []
         for r in range(self.branch_table.rowCount()):
             name_item = self.branch_table.item(r, 0)
-            value_item = self.branch_table.item(r, 1)
+            op_combo = self.branch_table.cellWidget(r, 1)
+            value_item = self.branch_table.item(r, 2)
             out.append({
                 "name": (name_item.text() if name_item else "").strip(),
-                "values": (value_item.text() if value_item else "").strip(),
+                "op": (op_combo.currentData() if isinstance(op_combo, QComboBox)
+                       else "") or "",
+                "value": (value_item.text() if value_item else "").strip(),
             })
         return out
 
@@ -1363,12 +1387,13 @@ class StepEditDialog(QDialog):
         self.click_times_combo.setCurrentIndex(max(
             0, self.click_times_combo.findData(int(s.click_times or 1))))
 
-        mode_idx = self.cond_mode_combo.findData(s.cond_mode or "equal")
+        mode_idx = self.cond_mode_combo.findData(s.cond_mode or "rule")
         self.cond_mode_combo.setCurrentIndex(max(0, mode_idx))
         self.cond_expr_edit.setText(s.cond_expr or "")
         self.branch_table.setRowCount(0)
         for i, m in enumerate(s.cond_branches or []):
-            self._add_branch_row(m.get("name", ""), m.get("values", ""), origin=i)
+            self._add_branch_row(m.get("name", ""), m.get("op", ""),
+                                 m.get("value", ""), origin=i)
         self._on_cond_mode_changed()
 
         self.note_edit.setText(s.note)
@@ -1476,19 +1501,26 @@ class StepEditDialog(QDialog):
         elif action == "condition_start":
             if not self.cond_expr_edit.text().strip():
                 errors.append(
-                    "条件节点必须填写「判断内容」"
-                    "（变量相等就填变量，如 {{loop.item.地区}}；表达式就写 Python 表达式）"
+                    "条件节点必须填写「判断的数据」"
+                    "（规则模式填变量，如 {{loop.item.标题}}；表达式模式写 Python 表达式）"
                 )
             branches = self._read_branches()
             if not branches:
                 errors.append("条件节点至少要有一个分支（点【＋ 添加分支】）")
-            elif self.cond_mode_combo.currentData() == "equal":
-                empty = [str(i + 1) for i, b in enumerate(branches)
-                         if not b["values"]]
-                if empty:
+            elif self.cond_mode_combo.currentData() != "expr":
+                miss = [str(i + 1) for i, b in enumerate(branches)
+                        if b["op"] and not b["value"]]
+                if miss:
                     errors.append(
-                        "「变量相等」模式下每个分支都要填匹配值，"
-                        f"第 {'、'.join(empty)} 个分支还是空的"
+                        "第 " + "、".join(miss)
+                        + " 个分支选了判断方式，但没填要比较的值"
+                    )
+                early = [i + 1 for i, b in enumerate(branches[:-1])
+                         if not b["op"]]
+                if early:
+                    errors.append(
+                        f"第 {early[0]} 个分支是兜底（无条件成立），"
+                        "排在它后面的分支永远轮不到——兜底要放在最后一个"
                     )
         elif action == "script":
             code = self.script_code.toPlainText()

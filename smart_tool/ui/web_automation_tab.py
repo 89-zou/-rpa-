@@ -587,8 +587,8 @@ class WebAutomationTab(QWidget):
             new_steps.append(Step(id=0, action=blocks.LOOP_END))
         elif step.action == "condition_start":
             if not step.cond_branches:
-                step.cond_branches = [blocks.new_branch("分支 1"),
-                                      blocks.new_branch("分支 2")]
+                step.cond_branches = [blocks.new_branch("分支 1", op="contains"),
+                                      blocks.new_branch("兜底")]
             new_steps.append(Step(id=0, action=blocks.BRANCH))
             new_steps.append(Step(id=0, action=blocks.BRANCH))
             new_steps.append(Step(id=0, action=blocks.COND_END))

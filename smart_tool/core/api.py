@@ -201,14 +201,17 @@ ACTION_SPECS: Dict[str, Dict[str, Any]] = {
     "condition_start": {
         "label": "条件 if/else", "scenes": [SCENE_WEB, SCENE_DESKTOP],
         "desc": "条件判断（系统会自动补上「分支」标记与「条件结束」）。"
-                "equal＝把 cond_expr 渲染成文本跟各分支的匹配值比；"
+                "rule＝条件只提供数据，每个分支自带判断方式与值；"
                 "expr＝Python 表达式，结果 真/假 走第 1/2 个分支。",
         "fields": [
-            f("cond_mode", "str", "判断方式", default="equal", choices=["equal", "expr"]),
-            f("cond_expr", "str", "判断内容，如 {{loop.item.地区}} 或 "
-              "len({{loop.item.内容}}) > 500", True),
-            f("cond_branches", "list", "分支：[{\"name\":\"北京\",\"values\":\"北京,上海\"}]"
-              "（values 逗号分隔可多个；expr 模式下前两个分支的 values 可留空）", True),
+            f("cond_mode", "str", "判断方式", default="rule",
+              choices=["rule", "expr"]),
+            f("cond_expr", "str", "判断的数据（rule，如 {{loop.item.标题}}）"
+              "或 Python 表达式（expr，如 len({{loop.item.内容}}) > 500）", True),
+            f("cond_branches", "list",
+              "分支：[{\"name\":\"公示公告\",\"op\":\"contains\",\"value\":\"公示\"}]"
+              "（op 见 blocks.COND_OPS：contains / not_contains / eq / ne / "
+              "gt / lt / ge / le；op 留空＝兜底，必须放最后一个）", True),
         ],
     },
     "group_start": {
@@ -655,7 +658,8 @@ def _step_from_dict(d: Dict[str, Any]) -> Step:
         else:
             raise ApiError("locator 要么写 XPath 字符串，要么写 {type,value,image}")
     if action == "condition_start" and not d.get("cond_branches"):
-        kw["cond_branches"] = [blocks.new_branch("分支 1"), blocks.new_branch("分支 2")]
+        kw["cond_branches"] = [blocks.new_branch("分支 1", op="contains"),
+                               blocks.new_branch("兜底")]
     if action == "collect" and d.get("collect_fields"):
         kw["collect_fields"] = [dict(x) for x in d["collect_fields"] if isinstance(x, dict)]
     if action == "read_data" and d.get("data_cfg"):
@@ -797,26 +801,32 @@ def add_loop(project: str, loop_expr: str, body: Optional[List[Dict]] = None,
 
 def add_condition(project: str, cond_expr: str,
                   branches: Optional[List[Dict[str, Any]]] = None,
-                  cond_mode: str = "equal", at: Optional[int] = None,
+                  cond_mode: str = "rule", at: Optional[int] = None,
                   title: str = "", note: str = "") -> Dict[str, Any]:
     """加一个条件判断（自动补「分支」标记与「条件结束」）。
 
-    branches：[{"name": "北京", "values": "北京,上海", "steps": [...步骤...]}, ...]
-    · equal 模式：values 是匹配值（逗号分隔可多个，必填）；
-    · expr 模式：cond_expr 算出来 真/假 → 走第 1/2 个分支（values 可留空）。
-    都不匹配就整段跳过。
+    branches：[{"name": "公示公告", "op": "contains", "value": "公示",
+                "steps": [...这一步里的步骤...]}, ...]
+    · rule 模式：cond_expr 是「判断的数据」（如 {{loop.item.标题}}），
+      每个分支自带判断方式 op 与值 value（op 取值见 blocks.COND_OPS）；
+      op 留空＝兜底（无条件成立，必须放最后一个）。
+    · expr 模式：cond_expr 算出来 真/假 → 走第 1/2 个分支；
+      算出来是别的值 → 跟各分支的 value（逗号分隔可多个）比。
+    都不成立就整段跳过。
     """
     store = _store(project)
     steps = store.load_steps()
     pos = len(steps) if at is None else int(at)
-    items = branches or [{"name": "分支 1"}, {"name": "分支 2"}]
+    items = branches or [{"name": "分支 1", "op": "contains"}, {"name": "兜底"}]
     if len(items) < 1:
         raise ApiError("至少要有一个分支")
     new: List[Step] = [Step(id=0, action="condition_start", cond_mode=cond_mode,
                             cond_expr=str(cond_expr), title=title, note=note,
                             cond_branches=[blocks.new_branch(
                                 str(x.get("name") or f"分支 {i + 1}"),
-                                str(x.get("values") or "")) for i, x in enumerate(items)])]
+                                str(x.get("op") or ""),
+                                str(x.get("value") or ""))
+                                for i, x in enumerate(items)])]
     body_ranges = []
     for item in items:
         new.append(Step(id=0, action="branch"))
@@ -931,7 +941,7 @@ def _connect_roundtrip(steps: List[Step]) -> List[str]:
         if a == "loop_start" and not (s.loop_expr or "").strip():
             out.append(f"第 {i} 步（循环）没填循环内容")
         if a == "condition_start" and not (s.cond_expr or "").strip():
-            out.append(f"第 {i} 步（条件）没填判断内容")
+            out.append(f"第 {i} 步（条件）没填判断的数据")
         if a == "pause_for_human":
             if s.resume_condition in ("url_changed", "url_and_element") \
                     and not (s.resume_url or "").strip():

@@ -99,6 +99,17 @@ def _literal(value: str) -> str:
     return repr(text)
 
 
+def _as_number(text: str) -> Optional[float]:
+    """能当数字就当数字，否则 None（条件的「大于 / 小于」用）。"""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 def _to_text(value: Any) -> str:
     """任意值转成可注入 {{变量}} 的文本。"""
     if value is None:
@@ -253,8 +264,9 @@ def step_var_fields(step: Step) -> List[str]:
     path = (step.data_cfg or {}).get("path")
     if isinstance(path, str):
         texts.append(path)
-    # 条件分支的匹配值也允许写 {{变量}}（运行时先渲染再比）
-    texts += [m.get("values", "") for m in (step.cond_branches or [])]
+    # 条件分支要比较的值也允许写 {{变量}}（运行时先渲染再比）
+    texts += [blocks.condition_branch_value(step, i)
+              for i in range(len(step.cond_branches or []))]
     # 「采集数据」的行定位、字段定位与属性名里也允许写 {{变量}}
     texts.append(step.collect_row)
     for item in step.collect_fields or []:
@@ -474,6 +486,19 @@ def check_variables(steps: List[Step],
         if s.action == "loop_start" and not (s.loop_expr or "").strip():
             add(s.id, "「循环」节点还没填循环内容（双击节点填写：数字＝跑几次，"
                       "或 {{变量}}＝按它的长度跑）")
+        if s.action == "condition_start" and (s.cond_mode or "rule") != "expr":
+            if not (s.cond_expr or "").strip():
+                add(s.id, "「条件」节点还没填「判断的数据」"
+                          "（双击节点填写，如 {{loop.item.标题}}）")
+            ops = [blocks.condition_branch_op(s, i)
+                   for i in range(len(s.cond_branches or []))]
+            for i, op in enumerate(ops):
+                if op and not blocks.condition_branch_value(s, i).strip():
+                    add(s.id, f"「条件」第 {i + 1} 个分支选了"
+                              f"「{blocks.COND_OP_CN[op]}」，但没填要比较的值")
+                if not op and i < len(ops) - 1:
+                    add(s.id, f"「条件」第 {i + 1} 个分支是兜底（无条件成立），"
+                              "排在它后面的分支永远轮不到——兜底要放在最后一个")
         for text in step_var_fields(s):
             for name in VAR_PATTERN.findall(text):
                 if name.startswith(LOOP_PREFIX):
@@ -817,25 +842,75 @@ class StepExecutor:
             self._run_nodes(block.nodes)
 
     def _run_condition(self, block: Block):
-        """条件节点：先算出结果，再走第一个匹配的分支；都不匹配就整块跳过。"""
+        """条件节点：算出结果，从上往下走第一个成立的分支；都不成立就整块跳过。"""
         step = block.start
-        result, is_bool = self._condition_result(step)
-        mode = "表达式" if (step.cond_mode or "equal") == "expr" else "变量"
-        self.log(f"[条件] {mode} {step.cond_expr} → 结果「{result}」")
+        if (step.cond_mode or "rule") == "expr":
+            result, is_bool = self._condition_result(step)
+            self.log(f"[条件] 表达式 {step.cond_expr} → 结果「{result}」")
+            for i, br in enumerate(block.branches):
+                if self._branch_hit(step, i, result, is_bool):
+                    self.log(f"  走分支「{blocks.condition_branch_name(step, i)}」")
+                    self._run_nodes(br.nodes)
+                    return
+            self.log("  没有分支匹配，跳过条件体。")
+            return
+
+        data = self._condition_data(step)
+        self.log(f"[条件] 数据 {step.cond_expr} → 「{data}」")
         for i, br in enumerate(block.branches):
-            if self._branch_hit(step, i, result, is_bool):
-                self.log(f"  走分支「{blocks.condition_branch_name(step, i)}」")
+            why = self._rule_hit(step, i, data)
+            if why:
+                self.log(f"  走分支「{blocks.condition_branch_name(step, i)}」"
+                         f"（{why}）")
                 self._run_nodes(br.nodes)
                 return
         self.log("  没有分支匹配，跳过条件体。")
 
+    def _condition_data(self, step: Step) -> str:
+        """规则模式：条件节点提供的那份数据（渲染掉 {{变量}} 再取文本）。"""
+        raw = (step.cond_expr or "").strip()
+        if not raw:
+            raise ValueError("条件节点还没填「判断的数据」，请点开条件节点填写")
+        return self._resolve_value(raw).strip()
+
+    def _rule_hit(self, step: Step, index: int, data: str) -> str:
+        """规则模式：第 index 个分支成立吗？成立返回一句原因（写日志用）。
+
+        · 判断方式留空＝兜底分支，无条件成立；
+        · 包含 / 不包含 / 等于 / 不等于：值支持逗号分隔多个，命中任意一个就算；
+        · 大于 / 小于 / 大于等于 / 小于等于：两边都要能当数字。
+        """
+        op = blocks.condition_branch_op(step, index)
+        if not op:
+            return "兜底"
+        raw = self._resolve_value(blocks.condition_branch_value(step, index)).strip()
+        if not raw:
+            return ""                       # 值没填 → 不成立（保存时会提示补上）
+        if op in blocks.COND_NUMBER_OPS:
+            left, right = _as_number(data), _as_number(raw)
+            if left is None or right is None:
+                raise ValueError(
+                    f"条件分支「{blocks.condition_branch_name(step, index)}」要按数字比，"
+                    f"但「{data}」和「{raw}」不都是数字")
+            hit = {"gt": left > right, "lt": left < right,
+                   "ge": left >= right, "le": left <= right}[op]
+            return f"{blocks.COND_OP_CN[op]} {raw}" if hit else ""
+        items = [x.strip() for x in raw.replace("，", ",").split(",") if x.strip()]
+        if op == "contains":
+            hit = any(v in data for v in items)
+        elif op == "not_contains":
+            hit = all(v not in data for v in items)
+        elif op == "eq":
+            hit = any(data == v for v in items)
+        else:                               # ne
+            hit = all(data != v for v in items)
+        return f"{blocks.COND_OP_CN.get(op, op)} {raw}" if hit else ""
+
     def _condition_result(self, step: Step):
-        """算出条件的结果，返回 (文本, 是否布尔值)；布尔值 None 表示按值匹配分支。"""
+        """表达式模式的结果，返回 (文本, 是否布尔值)；布尔值 None 表示按值匹配分支。"""
         raw = (step.cond_expr or "").strip()
         if not raw:
             raise ValueError("条件节点还没填判断内容，请点开条件节点填写")
-        if (step.cond_mode or "equal") != "expr":
-            return self._resolve_value(raw).strip(), None
         code = VAR_PATTERN.sub(
             lambda m: _literal(self.variables.get(m.group(1), "")), raw
         )

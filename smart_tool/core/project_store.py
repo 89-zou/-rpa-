@@ -98,12 +98,16 @@ class Step:
     # 其他文本         按行/逗号切分成多项；只有一项就只跑一次
     loop_expr: str = ""
     # ---- condition_start 专用：条件分支 ----
-    # cond_mode: equal  把 cond_expr 渲染成文本，跟分支的匹配值比相等
-    #            expr   Python 表达式（能当数字的变量按数字代入），
-    #                   结果为 True/False 时走第 1/2 个分支，其他结果按值匹配
-    cond_mode: str = "equal"
+    # cond_mode: rule  条件节点只提供「数据」（cond_expr 写 {{变量}}），
+    #                  每个分支自带判断方式（op）与值（value）：
+    #                  从上往下比，第一个成立的执行；op 为空＝兜底（else）
+    #            expr  Python 表达式（能当数字的变量按数字代入），
+    #                  结果为 True/False 时走第 1/2 个分支，其他结果按值匹配
+    cond_mode: str = "rule"
     cond_expr: str = ""
-    # 分支清单，顺序＝各分支块的先后： [{"name": "北京", "values": "北京,上海"}, ...]
+    # 分支清单，顺序＝各分支块的先后：
+    #   [{"name": "公示公告", "op": "contains", "value": "公示"}, …]
+    # op 的取值见 core/blocks.py 的 COND_OPS；空串＝兜底，必须放最后
     cond_branches: List[Dict[str, str]] = field(default_factory=list)
     # ---- 桌面场景专用（scene=desktop）----
     win_title: str = ""                  # win_activate：窗口标题里的一小段
@@ -240,7 +244,7 @@ class Step:
             collect_fields=[dict(f) for f in d.get("collect_fields", [])
                             if isinstance(f, dict)],
             loop_expr=d.get("loop_expr", ""),
-            cond_mode=d.get("cond_mode", "equal") or "equal",
+            cond_mode=d.get("cond_mode") or "rule",
             cond_expr=d.get("cond_expr", ""),
             cond_branches=[dict(m) for m in d.get("cond_branches", [])
                            if isinstance(m, dict)],
@@ -754,6 +758,36 @@ def _remap_endpoint(value: Any, id_map: Dict[Any, int]) -> Any:
     return id_map.get(value, value)
 
 
+def _migrate_conditions(steps: List[Dict[str, Any]]) -> None:
+    """条件节点升级成新写法（每次 load 都会跑）。
+
+    旧版只有「变量相等 / 表达式」两种判断方式，分支里存一个 `values`（匹配值，
+    逗号分隔）。现在条件节点只负责提供「数据」，判断方式下沉到每个分支：
+
+        变量相等：判断内容 {{作者}} + 分支匹配值 "J.K. Rowling, Jane Austen"
+        →  规则：判断数据 {{作者}} + 分支「等于」"J.K. Rowling, Jane Austen"
+
+    匹配值本来就是「命中任意一个就行」，跟新写法的逗号多值语义一致，
+    所以只换字段名（values → value），不改变任何行为。
+    """
+    for s in steps:
+        if s.get("action") != "condition_start":
+            continue
+        if not s.get("cond_mode") or s.get("cond_mode") == "equal":
+            s["cond_mode"] = "rule"
+        for m in (s.get("cond_branches") or []):
+            if not isinstance(m, dict):
+                continue
+            if "values" in m:                        # 旧字段：匹配值
+                old = str(m.pop("values") or "")
+                if not m.get("value"):
+                    m["value"] = old
+                if "op" not in m and s.get("cond_mode") == "rule":
+                    m["op"] = "eq"                   # 旧行为就是「相等」
+            m.setdefault("op", "")
+            m.setdefault("value", "")
+
+
 def migrate_project(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """旧项目自动升级（每次 load 都会跑，结果直到下次 save 才落盘）。
 
@@ -769,6 +803,7 @@ def migrate_project(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     ds = data.pop("data_source", None) or {}
     steps = [dict(s) for s in (data.get("steps") or []) if isinstance(s, dict)]
     data["steps"] = steps
+    _migrate_conditions(steps)                   # 条件节点的新旧写法升级
     if not (ds.get("type") and ds.get("path")):
         return data
 
