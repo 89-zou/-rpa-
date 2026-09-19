@@ -6,16 +6,21 @@
 - 取什么：文字 / 属性 / 链接 / HTML / 图片 / 文件 / 截图
 - 定位：XPath；**列表模式下是在「当前行」里找**（Playwright 的嵌套 XPath
   就是元素内定位，写 //h2 或 .//h2 都行）
-- 附加：取属性时＝属性名（src / title / data-xxx）；
-        截图时＝留空＝截这个元素、写「整页」、或写 x,y,宽,高 截区域
+- 附加：**不是备注**，是「取什么」的可选参数——取属性时＝属性名（src / title /
+  data-xxx）；截图时＝留空＝截这个元素、写「整页」、或写 x,y,宽,高 截区域。
+  表头就写两个字，详细填法放在表头的悬停提示里，免得挤掉定位列。
+
+列表模式的「每行的定位」可以直接用【捕获元素…】抓：打开浏览器点一下页面上
+「一行」的位置就行（捕获到的通常带 [1] 这类序号，去掉它才能匹配所有行）。
 """
 from typing import Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QAbstractItemView, QComboBox, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
-    QWidget,
+    QLineEdit, QMenu, QPushButton, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from smart_tool.core.project_store import Step
@@ -30,7 +35,18 @@ KIND_OPTIONS = [
     ("file", "文件（下载到 data/files/）", "留空＝取 href，也可填别的属性"),
     ("shot", "截图（存到 data/files/）", "留空＝截这个元素；「整页」；或 x,y,宽,高"),
 ]
-KIND_BY_KEY = {k: label for k, label, _ in KIND_OPTIONS}
+# 「＋ 添加字段」下拉里的常用字段：(菜单文字, 字段名, 取什么)
+QUICK_FIELDS = [
+    ("标题（文字）", "标题", "text"),
+    ("正文（文字）", "正文", "text"),
+    ("链接（自动补全成完整网址）", "链接", "link"),
+    ("属性（src / data-xxx）", "属性", "attr"),
+    ("HTML（元素内部源码）", "HTML", "html"),
+    ("图片（下载到 data/files/）", "图片", "image"),
+    ("文件（下载到 data/files/）", "文件", "file"),
+    ("截图（存成 png）", "截图", "shot"),
+]
+EXTRA_TIP_DEFAULT = "取属性时＝属性名（如 src）；截图时＝留空＝截元素、「整页」、或 x,y,宽,高"
 COL_NAME, COL_KIND, COL_LOC, COL_EXTRA = 0, 1, 2, 3
 
 MODES = [
@@ -44,7 +60,9 @@ HINT = (
     "· 列表模式下，字段的定位是在「当前行」里找（写 //h2 就是这一行里的 h2）；"
     "采到的数据会变成 {{变量}}（JSON 数组），配「循环」节点逐行遍历，"
     "循环里用 {{loop.item.字段}}。\n"
-    "· 所有数据都会追加到项目的 data/records.jsonl，点主界面【数据…】可以查看 / 导出。\n"
+    "· 「附加」不是备注：取属性时填属性名（如 src），截图时填「整页」或 x,y,宽,高。\n"
+    "· 所有数据都会追加到项目的 data/records.jsonl，"
+    "在【项目管理…】→【采集数据】里可以查看 / 导出 Excel。\n"
     "· XPath 小坑：@class='a' 是「class 整个等于 a」，元素写的是 "
     "class=\"star-rating Three\" 就匹配不上，要用 //p[contains(@class,'star-rating')]。"
 )
@@ -54,6 +72,8 @@ class CollectPanel(QWidget):
     """采集节点的配置。"""
 
     changed = pyqtSignal()
+    #: 点了【捕获元素…】（行定位）：由外面的步骤对话框去开捕获窗口
+    capture_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -79,28 +99,36 @@ class CollectPanel(QWidget):
         row.addStretch()
         root.addLayout(row)
 
-        self.row_widget = QWidget()
-        rl = QHBoxLayout(self.row_widget)
-        rl.setContentsMargins(0, 0, 0, 0)
+        # 列表模式才有：每行的定位（可以直接捕获）
+        self.row_area = QWidget()
+        ra = QVBoxLayout(self.row_area)
+        ra.setContentsMargins(0, 0, 0, 0)
+        ra.setSpacing(4)
+        rl = QHBoxLayout()
         rl.addWidget(QLabel("每行的定位："))
         self.row_edit = QLineEdit()
         self.row_edit.setPlaceholderText("XPath，能命中多行，如 //div[@class='item']")
         self.row_edit.textChanged.connect(self._on_edited)
         rl.addWidget(self.row_edit, 1)
-        root.addWidget(self.row_widget)
+        self.btn_row_capture = QPushButton("捕获元素…")
+        self.btn_row_capture.setToolTip(
+            "打开浏览器，点一下页面上「一行」的位置，XPath 自动填进来。\n"
+            "捕获到的通常带 [1] 这样的序号——去掉它才能匹配所有行。"
+        )
+        self.btn_row_capture.clicked.connect(self.capture_requested.emit)
+        rl.addWidget(self.btn_row_capture)
+        ra.addLayout(rl)
+        self.capture_hint = QLabel("")
+        self.capture_hint.setWordWrap(True)
+        self.capture_hint.setStyleSheet("color: #0f766e;")
+        ra.addWidget(self.capture_hint)
+        root.addWidget(self.row_area)
 
         btns = QHBoxLayout()
-        self.btn_add = QPushButton("＋ 添加字段")
-        self.btn_add.clicked.connect(lambda: self.add_field())
+        self.btn_add = QPushButton("＋ 添加字段 ▾")
+        self.btn_add.setToolTip("点开选一个常用字段；或选「空字段」自己填名字和定位")
+        self.btn_add.setMenu(self._build_add_menu())
         btns.addWidget(self.btn_add)
-        for name, kind, loc in (("标题", "text", ""), ("正文", "text", ""),
-                                ("链接", "link", ""), ("图片", "image", ""),
-                                ("截图", "shot", "")):
-            btn = QPushButton(name)
-            btn.setToolTip(f"快速加一个「{KIND_BY_KEY[kind]}」字段")
-            btn.clicked.connect(
-                lambda _=False, n=name, k=kind, l=loc: self.add_field(n, k, l))
-            btns.addWidget(btn)
         self.btn_del = QPushButton("－ 删除选中行")
         self.btn_del.clicked.connect(self.remove_selected)
         btns.addWidget(self.btn_del)
@@ -109,29 +137,45 @@ class CollectPanel(QWidget):
 
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(
-            ["字段名", "取什么", "定位（XPath）", "附加（属性名 / 截图范围）"])
+            ["字段名", "取什么", "定位（XPath）", "附加"])
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(COL_KIND, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(COL_LOC, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(COL_EXTRA, QHeaderView.ResizeMode.ResizeToContents)
+        # 「附加」给个够用的固定宽度（别按内容撑，不然会挤掉定位列）
+        header.setSectionResizeMode(COL_EXTRA, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(COL_EXTRA, 130)
         self.table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setMinimumHeight(160)
         self.table.itemChanged.connect(lambda _i: self._on_edited())
         root.addWidget(self.table, 1)
+        self._refresh_extra_hint()
 
         hint = QLabel(HINT)
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#777777;")
         root.addWidget(hint)
 
+    def _build_add_menu(self) -> QMenu:
+        menu = QMenu(self)
+        act = QAction("空字段（自己填名字和定位）", menu)
+        act.triggered.connect(lambda: self.add_field())
+        menu.addAction(act)
+        menu.addSeparator()
+        for label, name, kind in QUICK_FIELDS:
+            act = QAction(label, menu)
+            act.triggered.connect(
+                lambda _=False, n=name, k=kind: self.add_field(n, k))
+            menu.addAction(act)
+        return menu
+
     def _on_mode_changed(self, _index=None):
         self._sync_row_visible()
         self._on_edited()
 
     def _sync_row_visible(self):
-        self.row_widget.setVisible(self.mode_combo.currentData() == "list")
+        self.row_area.setVisible(self.mode_combo.currentData() == "list")
 
     def _on_edited(self, *_a):
         if not self._loading:
@@ -150,6 +194,7 @@ class CollectPanel(QWidget):
             combo.addItem(label, key)
         combo.setCurrentIndex(max(0, combo.findData(kind)))
         combo.currentIndexChanged.connect(self._on_edited)
+        combo.currentIndexChanged.connect(self._refresh_extra_hint)
         self.table.setCellWidget(row, COL_KIND, combo)
         self.table.setItem(row, COL_LOC, QTableWidgetItem(locator))
         self.table.setItem(row, COL_EXTRA, QTableWidgetItem(""))
@@ -167,20 +212,28 @@ class CollectPanel(QWidget):
         for row in rows:
             self.table.removeRow(row)
         self._loading = False
+        self._refresh_extra_hint()
         self._on_edited()
 
-    def _refresh_extra_hint(self):
-        """「附加」那一列的表头随「取什么」变化，提示该填什么。"""
+    def set_row_locator(self, xpath: str, note: str = ""):
+        """捕获回来后填「每行的定位」（由步骤对话框调用）。"""
+        self.row_edit.setText(xpath)
+        self.capture_hint.setText(note)
+
+    def _refresh_extra_hint(self, *_a):
+        """「附加」表头保持短，详细填法放进悬停提示（免得挤掉定位列）。"""
         kinds = {self._kind_at(r) for r in range(self.table.rowCount())}
-        tips = [tip for key, _label, tip in KIND_OPTIONS if key in kinds]
-        uniq = []
-        for t in tips:
-            if t not in uniq:
-                uniq.append(t)
-        self.table.setHorizontalHeaderItem(
-            COL_EXTRA, QTableWidgetItem(
-                "附加（" + " / ".join(uniq) + "）" if uniq
-                else "附加（属性名 / 截图范围）"))
+        tips: List[str] = []
+        for key, _label, tip in KIND_OPTIONS:
+            if key in kinds and tip != "不用填" and tip not in tips:
+                tips.append(tip)
+        item = QTableWidgetItem("附加")
+        if tips:
+            text = "这一列有用，不是备注：\n" + "\n".join(f"· {t}" for t in tips)
+        else:
+            text = "这一列有用，不是备注：" + EXTRA_TIP_DEFAULT
+        item.setToolTip(text)
+        self.table.setHorizontalHeaderItem(COL_EXTRA, item)
 
     def _kind_at(self, row: int) -> str:
         combo = self.table.cellWidget(row, COL_KIND)

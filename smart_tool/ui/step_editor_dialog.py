@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
 from smart_tool.core.project_store import Locator, Step
 from smart_tool.ui.collect_panel import CollectPanel
 from smart_tool.ui.desktop_picker import DesktopPickerDialog
-from smart_tool.ui.element_picker_dialog import ElementPickerDialog
+from smart_tool.ui.element_picker_dialog import drop_capture_image, pick_element
 from smart_tool.ui.read_data_panel import ReadDataPanel
 from smart_tool.ui.screen_capture import ScreenCaptureDialog
 
@@ -233,6 +233,7 @@ class StepEditDialog(QDialog):
 
         # --- collect 组：把页面上的东西采下来（存 data/ + 进变量）---
         self.collect_panel = CollectPanel()
+        self.collect_panel.capture_requested.connect(self._capture_collect_row)
         form.addRow("采集什么：", self.collect_panel)
 
         # --- 桌面动作专用 ---
@@ -748,7 +749,7 @@ class StepEditDialog(QDialog):
         else:
             self.value_hint.setText(
                 "暂无变量：在【项目管理…】→【变量清单】里加自定义变量，"
-                "或者新增一个「读取数据」节点让它产出变量。"
+                "或者新增一个「读取数据」/「采集数据」节点让它产出变量。"
             )
 
     def _insert_variable(self, index: int):
@@ -923,10 +924,9 @@ class StepEditDialog(QDialog):
     def _capture_web_element(self, target: str):
         """网页场景：打开浏览器点元素 → 拿到 XPath + 元素图（截图进兜底栏）。"""
         url = self.url_edit.text().strip() or self._default_url
-        dlg = ElementPickerDialog(url, self.project_dir, self)
-        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+        data = pick_element(self, url, self.project_dir)
+        if not data:
             return
-        data = dlg.result_data
         xpath = (data.get("xpath") or "").strip()
         image = data.get("image") or ""
         count = data.get("count", 1)
@@ -951,6 +951,35 @@ class StepEditDialog(QDialog):
         if image:
             self._show_preview(self.project_dir / image)
         self._sync_visibility()
+
+    def _capture_collect_row(self):
+        """采集节点里点【捕获元素…】：抓页面上「一行」的 XPath 当行定位。"""
+        try:
+            url = self.url_edit.text().strip() or self._default_url
+            if not url:
+                QMessageBox.information(
+                    self, "先填网址",
+                    "这一步（或项目里第一个「打开网页」）还没有网址，\n"
+                    "捕获器不知道该打开哪个页面。",
+                )
+                return
+            data = pick_element(self, url, self.project_dir)
+            if not data:
+                return
+            xpath = (data.get("xpath") or "").strip()
+            if not xpath:
+                QMessageBox.information(self, "没抓到 XPath",
+                                        "换个元素再点一下试试。")
+                return
+            count = data.get("count", 1)
+            note = f"已捕获：{data.get('desc') or '元素'} → {xpath}　命中 {count} 个"
+            if count <= 1:
+                note += ("；只命中 1 个——列表定位要能圈住每一行，"
+                         "把 XPath 里 [1] 这样的序号删掉试试")
+            self.collect_panel.set_row_locator(xpath, note)
+            drop_capture_image(self.project_dir, data)     # 只要 XPath，不要那张图
+        except Exception as e:
+            QMessageBox.critical(self, "捕获失败", f"{type(e).__name__}: {e}")
 
     def _capture_desktop_control(self, target: str):
         """桌面场景的捕获：划到哪高亮哪，点一下自动裁图当模板。"""

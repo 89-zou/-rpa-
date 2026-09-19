@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""项目管理对话框：项目列表 + 变量清单 + 图片库。
+"""项目管理对话框：项目列表 + 变量清单 + 图片库 + 登录态 + 采集数据。
 
-左边选项目，右边两个页签：
+左边选项目，右边按页签看这个项目的东西：
 
 - 【变量清单】变量从哪来——「读取数据」节点产出的列表变量，以及手工加的自定义
   变量。循环里的 {{loop.item}} / {{loop.index}} 是运行时自动有的，不在这里列。
@@ -9,6 +9,9 @@
   请去画布上双击那个「读取数据」节点。
 - 【图片库】项目 img/ 目录里的元素截图：能预览、能看「被哪几步引用」、
   能导入/替换/删除。删除前先看引用列，免得删掉正在用的模板。
+- 【登录态】cookie / localStorage：登录一次以后就不用再登（AuthDialog）。
+- 【采集数据】「采集数据」节点采到的东西（DataDialog）：看记录、导出 Excel。
+  后两个页签直接复用那两个面板（embedded=True），所以关掉主界面上的按钮也能用。
 """
 import shutil
 from pathlib import Path
@@ -25,7 +28,12 @@ from PyQt6.QtWidgets import (
 from smart_tool.core import data_sources, project_store, step_executor
 from smart_tool.core.data_sources import DataSourceConfig
 from smart_tool.core.project_store import ProjectStore, Step, list_projects
+from smart_tool.ui.auth_dialog import AuthDialog
+from smart_tool.ui.data_dialog import DataDialog
 from smart_tool.ui.step_editor_dialog import StepEditDialog
+
+# 页签下标
+TAB_VARS, TAB_IMAGES, TAB_AUTH, TAB_DATA = 0, 1, 2, 3
 
 # 变量行类型（存在「来源」列的 UserRole 里，用来区分增删改行为）
 KIND_DATA, KIND_PROJECT = "data", "project"
@@ -87,6 +95,11 @@ class ProjectManagerDialog(QDialog):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_var_page(), "变量清单")
         self.tabs.addTab(self._build_image_page(), "图片库")
+        # 这两个页签复用独立窗口里的同一套面板（embedded：不当独立窗口、不要关闭键）
+        self.auth_panel = AuthDialog(None, None, self, embedded=True)
+        self.tabs.addTab(self.auth_panel, "登录态")
+        self.data_panel = DataDialog(None, self, embedded=True)
+        self.tabs.addTab(self.data_panel, "采集数据")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         right.addWidget(self.tabs, 1)
 
@@ -109,12 +122,14 @@ class ProjectManagerDialog(QDialog):
         lay.setContentsMargins(0, 6, 0, 0)
 
         tip = QLabel(
-            "步骤里用 {{变量名}} 引用。变量只有两个来源：\n"
+            "步骤里用 {{变量名}} 引用。变量只有三个来源：\n"
             "· 读取节点 ＝「读取数据」节点从文件/文件夹读到的："
             "第一行是它产出的列表变量（如 数据列表），"
             "下面几行是每个文件的字段（如 loop.item.标题）。\n"
+            "· 采集节点 ＝「采集数据」节点从网页上采到的：列表采集配「循环」逐项遍历"
+            "（循环里用 {{loop.item.字段}}），采当前页面用 {{变量.字段}}。\n"
             "  这两类都是**只读展示**，不能在这里改或删；"
-            "点某行的【来源】就能跳进那个节点，换文件夹、改字段名都在那里做"
+            "点某行的【来源】就能跳进那个节点，换文件夹 / 改字段名都在那里做"
             "（改名后别处的引用会自动跟着改）。\n"
             "· 自定义创建 ＝ 手工加的（账号密码之类），可增删改，改完立即保存。\n"
             "循环里的 {{loop.index}}（第几轮）不用配置。"
@@ -484,28 +499,36 @@ class ProjectManagerDialog(QDialog):
             self.status_label.clear()
             self.img_status.clear()
             self._show_image_preview()
+            self.auth_panel.set_project(None, None)
+            self.data_panel.set_project(None)
             return
         self.header_label.setText(
             f"项目：{one.name}　｜　场景："
             + ("桌面应用（截图定位 + 鼠标键盘）" if one.is_desktop
                else "网页自动化（浏览器）")
         )
+        # 桌面项目没有浏览器，也就没有登录态可言
+        self.tabs.setTabEnabled(TAB_AUTH, not one.is_desktop)
         self._on_tab_changed(self.tabs.currentIndex())
 
     def _on_tab_changed(self, index: int):
         """切页签 / 换项目时刷新当前页，保证看到的都是同一份最新数据。"""
         if self._store is None:
             return
-        if index == 0:
+        if index == TAB_VARS:
             self._load_var_list()
-        else:
+        elif index == TAB_IMAGES:
             self._load_images()
+        elif index == TAB_AUTH:
+            self.auth_panel.set_project(self._store, self._store.load_steps())
+        else:
+            self.data_panel.set_project(self._store)
 
     # ------------------------------
     # 变量清单
     # ------------------------------
     def _load_var_list(self):
-        """刷新变量清单：读取节点产出的变量 + 自定义变量。"""
+        """刷新变量清单：读取 / 采集节点产出的变量 + 自定义变量。"""
         if self._store is None:
             return
         steps = self._store.load_steps()
@@ -514,14 +537,19 @@ class ProjectManagerDialog(QDialog):
         self._loading = True
         self.var_table.setRowCount(0)
         readers = [s for s in steps if s.action == "read_data"]
+        collectors = [s for s in steps
+                      if s.action == "collect" and (s.output_var or "").strip()]
         for s in readers:
             self._append_data_node(s)
+        for s in collectors:
+            self._append_collect_node(s)
         for k, v in variables.items():
             self._append_row(k, v, "自定义创建", KIND_PROJECT)
         self._loading = False
         self.data_label.setText(self._data_summary(readers))
         self._set_status(
-            f"{len(readers)} 个读取节点、{len(variables)} 个自定义变量"
+            f"{len(readers)} 个读取节点、{len(collectors)} 个采集节点、"
+            f"{len(variables)} 个自定义变量"
         )
 
     def _append_data_node(self, node: Step):
@@ -547,6 +575,27 @@ class ProjectManagerDialog(QDialog):
                 f"loop.item.{field}", PLACEHOLDER,
                 f"读取节点：{where} 的字段（每个文件一项，读的是 "
                 f"{self._source_label(cfg.type, m.get('field', ''))}）",
+                KIND_DATA, node.id,
+            )
+
+    def _append_collect_node(self, node: Step):
+        """一个「采集数据」节点：列出它产出的变量与每个字段，同样只读展示。"""
+        var = (node.output_var or "").strip()
+        is_list = (node.collect_mode or "page") == "list"
+        mode = "列表采集（每行一条）" if is_list else "采当前页面（一条记录）"
+        fields = [str(f.get("name") or "").strip()
+                  for f in (node.collect_fields or [])
+                  if isinstance(f, dict)]
+        fields = [f for f in fields if f]
+        source = f"采集节点：{mode}，{len(fields)} 个字段"
+        tip = (f"循环节点里填 {{{{{var}}}}} 就能逐项遍历" if is_list
+               else "每条记录都自动带 _time / _url / _step")
+        self._append_row(var, PLACEHOLDER, f"{source}\n{tip}", KIND_DATA, node.id)
+        prefix = "loop.item." if is_list else f"{var}."
+        for field in fields:
+            self._append_row(
+                f"{prefix}{field}", PLACEHOLDER,
+                f"采集节点：{mode}的字段「{field}」→ 数据也在 data/ 里",
                 KIND_DATA, node.id,
             )
 
@@ -594,7 +643,7 @@ class ProjectManagerDialog(QDialog):
         src_item.setData(Qt.ItemDataRole.UserRole, kind)
         src_item.setData(Qt.ItemDataRole.UserRole + 1, node_id)
         src_item.setToolTip(
-            source + "\n（点一下可以跳进这个「读取数据」节点改名 / 换文件夹）"
+            source + "\n（点一下可以跳进这个节点改名 / 换来源）"
             if kind == KIND_DATA else source
         )
         self.var_table.setItem(row, COL_SRC, src_item)
@@ -616,7 +665,7 @@ class ProjectManagerDialog(QDialog):
         self._save_variables()
 
     def _on_var_clicked(self, row: int, col: int):
-        """点「来源」列：跳进那个「读取数据」节点（改名 / 换文件夹都在那做）。"""
+        """点「来源」列：跳进那个「读取数据」/「采集数据」节点去改配置。"""
         if col != COL_SRC or self._row_kind(row) != KIND_DATA:
             return
         node_id = self._row_node_id(row)
@@ -624,7 +673,7 @@ class ProjectManagerDialog(QDialog):
             self._edit_reader_node(node_id)
 
     def _edit_reader_node(self, node_id: int):
-        """打开「读取数据」节点；改完写回，并把它改名导致的引用一起改掉。"""
+        """打开产出变量的那个节点（读取 / 采集）；改完写回，顺带修引用。"""
         if self._store is None:
             return
         steps = self._store.load_steps()
@@ -690,8 +739,8 @@ class ProjectManagerDialog(QDialog):
         if any(self._row_kind(r) == KIND_DATA for r in rows):
             QMessageBox.information(
                 self, "提示",
-                "「读取节点」的变量不在这里删：\n"
-                "点它那一行的【来源】跳进节点，把对应字段的勾去掉就行。",
+                "「读取 / 采集节点」的变量不在这里删：\n"
+                "点它那一行的【来源】跳进节点，把对应字段删掉就行。",
             )
         project_rows = [r for r in rows if self._row_kind(r) == KIND_PROJECT]
         if project_rows:
