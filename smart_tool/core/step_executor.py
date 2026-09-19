@@ -556,6 +556,8 @@ class StepExecutor:
                         in zip(steps, blocks.step_numbers(steps)) if n}
         # 用户在小窗上点【暂停】时置位：执行器在每个步骤开始前停住等它清掉
         self._pause_requested = threading.Event()
+        # 自由代码节点写出过哪些变量：循环里这些变量要跨轮保留（累加器 / 拼接）
+        self._script_written: set = set()
 
     # ------------------------------
     # 对外控制
@@ -625,6 +627,7 @@ class StepExecutor:
         体检不过＝失效：把整条流程重跑一遍（这一遍不带登录态，会走完整的登录步骤），
         跑完把最新 cookie 存回去。第一次运行时文件还不存在，会自动创建。
         """
+        self._script_written.clear()        # 每一轮执行重新统计脚本产出的变量
         nodes = blocks.parse(self.steps)
         if self.desktop:
             self._run_desktop(nodes)
@@ -840,6 +843,8 @@ class StepExecutor:
             return
 
         base_vars = dict(self.variables)
+        # 循环体里「自由代码」写出的变量要跨轮保留（累加器、拼接清单之类），
+        # 其余变量每轮都重置回循环开始前的样子（免得带上一轮的脏值）。
         total = len(records)
         self.log(f"[循环开始] {source_label}，共 {total} 项")
         for i, rec in enumerate(records, start=1):
@@ -847,13 +852,19 @@ class StepExecutor:
                 self.log("已停止。")
                 break
             self.log(f"──── 循环 {i}/{total} ────")
-            self.variables = {**base_vars, **rec, "loop.index": str(i)}
+            carried_script = {
+                k: v for k, v in self.variables.items()
+                if k in self._script_written and not k.startswith(LOOP_PREFIX)
+            }
+            self.variables = {**base_vars, **carried_script, **rec,
+                              "loop.index": str(i)}
             self._run_nodes(block.nodes)
         self.log(f"[循环结束] 完成 {total} 项")
-        # 恢复循环外的变量；但保留脚本在循环里新造的变量（累加器之类）
+        # 恢复循环外的变量；但脚本产出的（新造的 / 改过值的）保留最后一次的值
         carried = {
             k: v for k, v in self.variables.items()
-            if not k.startswith(LOOP_PREFIX) and k not in base_vars
+            if not k.startswith(LOOP_PREFIX)
+            and (k not in base_vars or k in self._script_written)
         }
         self.variables = {**base_vars, **carried}
 
@@ -1085,6 +1096,10 @@ class StepExecutor:
             text = _to_var_text(v)
             if self.variables.get(str(k)) != text:
                 changed.append(str(k))
+            # 脚本「产出」的变量：新造的，或者改过值的。
+            # 记下来是为了让它在循环里跨轮保留（入口参数原样传回去的不算）。
+            if str(k) not in scope or _to_var_text(scope.get(str(k))) != text:
+                self._script_written.add(str(k))
             self.variables[str(k)] = text
 
         # 返回值
@@ -1111,6 +1126,7 @@ class StepExecutor:
         text = _to_var_text(value)
         if self.variables.get(name) != text and changed is not None:
             changed.append(name)
+        self._script_written.add(name)      # 脚本产出的：循环里要跨轮保留
         self.variables[name] = text
 
     def _exec_python(self, step: Step, code: str, scope: Dict[str, str],
