@@ -409,6 +409,7 @@ class StepEditDialog(QDialog):
         form.addRow("产出变量名：", self.output_var_edit)
 
         self.read_panel = ReadDataPanel()
+        self.read_panel.project_dir = self.project_dir    # 路径失效时按文件名去项目里找
         form.addRow("读什么：", self.read_panel)
 
         # --- collect 组：把页面上的东西采下来（存 data/ + 进变量）---

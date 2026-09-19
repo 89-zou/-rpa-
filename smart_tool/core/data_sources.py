@@ -27,6 +27,38 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 TXT_EXTS = {".txt", ".md", ".csv", ".log"}
 ENCODING_TRY = ("utf-8-sig", "utf-8", "gbk", "gb18030")
 
+#: 当前在跑的是哪个项目 —— 数据源里写死的路径找不到时，按文件名去项目里找同名文件。
+#: （项目换台电脑、被拷到别的盘、或者从别人那儿拿到示例项目，路径就失效了，
+#:   但文件通常还老老实实躺在项目目录里，按文件名找一找基本都能找回来。）
+_current_project_dir: Optional[Path] = None
+
+
+def set_project_dir(project_dir) -> None:
+    """告诉数据源模块：接下来读的是哪个项目（找不到文件时按文件名在项目里找）。"""
+    global _current_project_dir
+    try:
+        _current_project_dir = Path(project_dir) if project_dir else None
+    except TypeError:
+        _current_project_dir = None
+
+
+def resolve_path(raw: str) -> Tuple[Path, str]:
+    """把配置里的路径变成能用的路径，返回 (路径, 说明)。
+
+    路径不存在时，在项目目录里找同名文件（找到就用它，说明里会写清楚），
+    这样「项目搬家」「别人拿到你的项目」之后不用手工改路径。
+    """
+    path = Path(str(raw or ""))
+    if path.is_file() or path.is_dir() or not path.name:
+        return path, ""
+    if not _current_project_dir or not _current_project_dir.is_dir():
+        return path, ""
+    for found in _current_project_dir.rglob(path.name):
+        if found.is_file():
+            return found, (f"原来写的路径找不到了（{path}），"
+                           f"已在项目里找到同名文件：{found}")
+    return path, ""
+
 # 文件类数据源可读取的字段（field key → 中文名），用于挑选变量并自定义命名
 FILE_FIELDS = [
     ("content", "文件内容"),
@@ -158,7 +190,7 @@ def _read_xls(path: Path, cfg: DataSourceConfig,
 
 
 def load_excel(cfg: DataSourceConfig) -> List[Dict[str, str]]:
-    path = Path(cfg.path)
+    path, _note = resolve_path(cfg.path)
     if not path.is_file():
         raise DataSourceError(f"Excel 文件不存在：{path}")
     ext = path.suffix.lower()
@@ -204,7 +236,7 @@ def load_excel(cfg: DataSourceConfig) -> List[Dict[str, str]]:
 # JSON
 # ------------------------------
 def load_json(cfg: DataSourceConfig) -> List[Dict[str, str]]:
-    path = Path(cfg.path)
+    path, _note = resolve_path(cfg.path)
     if not path.is_file():
         raise DataSourceError(f"JSON 文件不存在：{path}")
     try:
@@ -293,7 +325,7 @@ def _apply_field_map(base: Dict[str, str], cfg: DataSourceConfig) -> Dict[str, s
 
 
 def load_txt(cfg: DataSourceConfig) -> List[Dict[str, str]]:
-    path = Path(cfg.path)
+    path, _note = resolve_path(cfg.path)
     if not path.is_file():
         raise DataSourceError(f"文本文件不存在：{path}")
     return [_apply_field_map(
@@ -303,7 +335,7 @@ def load_txt(cfg: DataSourceConfig) -> List[Dict[str, str]]:
 
 
 def load_folder(cfg: DataSourceConfig) -> List[Dict[str, str]]:
-    folder = Path(cfg.path)
+    folder, _note = resolve_path(cfg.path)
     if not folder.is_dir():
         raise DataSourceError(f"文件夹不存在：{folder}")
     walker = folder.rglob if cfg.recursive else folder.glob
@@ -367,7 +399,7 @@ def raw_columns(cfg: DataSourceConfig) -> List[str]:
         return []
     try:
         if cfg.type == "excel":
-            path = Path(cfg.path)
+            path, _note = resolve_path(cfg.path)
             if not path.is_file():
                 return []
             if path.suffix.lower() == ".xlsx":
@@ -383,7 +415,7 @@ def raw_columns(cfg: DataSourceConfig) -> List[str]:
                         for i, h in enumerate(first)]
             return [f"row.col_{i+1}" for i in range(len(first))]
         if cfg.type == "json":
-            path = Path(cfg.path)
+            path, _note = resolve_path(cfg.path)
             if not path.is_file():
                 return []
             data = json.loads(read_text_file(path, cfg.encoding))

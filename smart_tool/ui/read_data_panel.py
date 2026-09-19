@@ -54,6 +54,8 @@ class ReadDataPanel(QWidget):
         self._vars_picked = False         # 挑过（哪怕勾成空的）＝只产出清单里的
         self._loading = False
         self._table_type: Optional[str] = None
+        #: 这个面板是在哪个项目里用的（路径失效时按文件名去项目里找）；由调用方填
+        self.project_dir = None
         self._init_ui()
         self.load({})
 
@@ -327,6 +329,12 @@ class ReadDataPanel(QWidget):
             QMessageBox.warning(self, "提示", "请先填写或选择路径。")
             return False
         try:
+            # 路径失效时按文件名去项目里找（项目搬家/别人给的项目都能读）
+            data_sources.set_project_dir(getattr(self, "project_dir", None))
+            found, note = data_sources.resolve_path(cfg.path)
+            if note:
+                cfg.path = str(found)
+                self.path_edit.setText(cfg.path)
             rows, total, columns = data_sources.preview(cfg, n=3)
         except Exception as e:
             self.summary_label.setText("读取失败")
