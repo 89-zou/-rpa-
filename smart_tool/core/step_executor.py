@@ -504,7 +504,8 @@ class StepExecutor:
         elif block.kind == "condition":
             self._run_condition(block)
         else:
-            self._run_nodes(block.nodes)      # 分支（正常只出现在条件里）
+            # 分支、组合：结构壳子，按顺序把里面的节点跑一遍就行
+            self._run_nodes(block.nodes)
 
     def _run_condition(self, block: Block):
         """条件节点：先算出结果，再走第一个匹配的分支；都不匹配就整块跳过。"""

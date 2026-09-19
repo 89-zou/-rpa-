@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """步骤结构解析：把线性的 steps 列表解析成「块树」，执行与界面共用同一套规则。
 
-容器（块）有三种：
+容器（块）有四种：
 - 循环   `loop_start` … `loop_end`            配置存在「循环开始」节点上
 - 条件   `condition_start` … `condition_end`  配置存在「条件」节点上（判断方式 + 分支清单）
 - 分支   `branch` 是条件块内部的段落标记：从它到下一个 `branch`（或条件结束）
          之间的步骤属于这个分支
+- 组合   `group_start` … `group_end`          把连着的一串步骤收成一个、起个名字，
+         画布上只显示一张卡片；名字存在「组合开始」节点的 title 上
 
 块可以互相嵌套（分支里放循环、循环里放条件……）。
 
@@ -20,21 +22,32 @@ from smart_tool.core.project_store import Step
 LOOP_START, LOOP_END = "loop_start", "loop_end"
 COND_START, COND_END = "condition_start", "condition_end"
 BRANCH = "branch"
+GROUP_START, GROUP_END = "group_start", "group_end"
 
 # 容器：开始标记 → (块类型, 结束标记)
 CONTAINERS = {
     LOOP_START: ("loop", LOOP_END),
     COND_START: ("condition", COND_END),
+    GROUP_START: ("group", GROUP_END),
 }
 # 结束标记 → 块类型
-END_KINDS = {LOOP_END: "loop", COND_END: "condition"}
+END_KINDS = {LOOP_END: "loop", COND_END: "condition", GROUP_END: "group"}
 # 所有结构标记（不是真正的动作步骤）
-MARKERS = (LOOP_START, LOOP_END, COND_START, COND_END, BRANCH)
+MARKERS = (LOOP_START, LOOP_END, COND_START, COND_END, BRANCH,
+           GROUP_START, GROUP_END)
+# 成对标记的「结束端」：画布上不画卡片（流程编辑里能看到）
+END_MARKERS = tuple(END_KINDS)
+# 可以套虚线框、能整块拖动的块类型（组合不套框：它本身就是一张卡片）
+REGION_KINDS = ("loop", "condition")
 
 ACTION_CN = {
     LOOP_START: "循环开始", LOOP_END: "循环结束",
     COND_START: "条件", COND_END: "条件结束", BRANCH: "分支",
+    GROUP_START: "组合", GROUP_END: "组合结束",
 }
+
+#: 组合节点没起名时显示的占位名字
+DEFAULT_GROUP_NAME = "组合"
 
 
 class StructureError(ValueError):
@@ -114,11 +127,19 @@ def _parse_nodes(steps: List[Step], i: int,
                 )
             nodes.append(Block("loop", s, steps[j], inner, i, j))
             i = j + 1
+        elif a == GROUP_START:
+            inner, j = _parse_nodes(steps, i + 1, (GROUP_END,))
+            if j >= len(steps):
+                raise StructureError(
+                    f"步骤 {s.id} 的「组合」缺少配对的「组合结束」"
+                )
+            nodes.append(Block("group", s, steps[j], inner, i, j))
+            i = j + 1
         elif a == COND_START:
             block, j = _parse_condition(steps, i)
             nodes.append(block)
             i = j + 1
-        elif a in (LOOP_END, COND_END, BRANCH):
+        elif a in (LOOP_END, COND_END, BRANCH, GROUP_END):
             raise StructureError(
                 f"步骤 {s.id} 的「{ACTION_CN.get(a, a)}」没有对应的开始标记"
                 "（是不是被挪到外面了？）"
@@ -273,6 +294,91 @@ def depths(steps: List[Step]) -> List[int]:
 def descendant_ids(block: Block) -> List[int]:
     """块内所有步骤的 id（含嵌套块）。"""
     return [s.id for s in block.steps]
+
+
+# ------------------------------
+# 组合（把连着的一串步骤收成一个节点）
+# ------------------------------
+def group_spans(all_spans: List[Span]) -> List[Span]:
+    """所有组合块的范围。"""
+    return [sp for sp in all_spans if sp.kind == "group"]
+
+
+def card_hidden_indices(steps: List[Step]) -> set:
+    """画布上**不画卡片**的行号。
+
+    两类：成对标记的结束端（循环结束 / 条件结束 / 组合结束），
+    以及组合体内部的所有行——组合在画布上只留「组合开始」那一张卡片。
+    """
+    hidden = {i for i, s in enumerate(steps) if s.action in END_MARKERS}
+    for sp in spans(steps):
+        if sp.kind != "group":
+            continue
+        hidden.update(range(sp.inner_lo, sp.end + 1))
+    return hidden
+
+
+def inner_count(sp: Span) -> int:
+    """块里有几个步骤（写「已收起 N 个步骤」用）。"""
+    return max(0, sp.inner_hi - sp.inner_lo)
+
+
+def can_group(steps: List[Step], lo: int, hi: int) -> Optional[str]:
+    """[lo, hi] 这几行能不能合成一个组合：能返回 None，否则返回中文原因。"""
+    if lo > hi:
+        return "请先选中要合并的节点。"
+    if hi - lo < 1:
+        return "至少要选中两个节点才能合并。"
+    problem = validate(steps)
+    if problem:
+        return f"当前步骤结构不完整（{problem}），先修好循环 / 条件的配对标记再合并。"
+    all_spans = spans(steps)
+    if any(s.action in (GROUP_START, GROUP_END) for s in steps[lo:hi + 1]):
+        return ("选中的范围里已经有组合节点了：\n"
+                "请先对它【取消组合】，或者只选组合外面的节点。")
+    for sp in all_spans:
+        overlap = sp.start <= hi and sp.end >= lo
+        inside = lo <= sp.start and sp.end <= hi
+        if overlap and not inside:
+            name = {"loop": "循环", "condition": "条件",
+                    "branch": "分支", "group": "组合"}.get(sp.kind, sp.kind)
+            return (f"选中的范围把一个「{name}」切成了两半：\n"
+                    "要么把整个块一起选上，要么只选它里面的步骤。")
+    return None
+
+
+def make_group(steps: List[Step], lo: int, hi: int, name: str) -> str:
+    """把 [lo, hi] 这几行包成一个组合，返回最终用的名字。
+
+    两个标记就地插进去：`group_start`（带名字）在 lo 前面、`group_end` 在 hi 后面。
+    坐标继承第一 / 最后一个被包住的步骤，这样画布上不会因为「缺位置」而整片重排。
+    """
+    name = (name or "").strip() or DEFAULT_GROUP_NAME
+    first_pos = list(steps[lo].pos) if steps[lo].pos else None
+    last_pos = list(steps[hi].pos) if steps[hi].pos else None
+    start = Step(id=0, action=GROUP_START, title=name, pos=first_pos)
+    end = Step(id=0, action=GROUP_END, pos=last_pos)
+    steps[lo:lo] = [start]
+    steps.insert(hi + 2, end)       # 前面插了一个，原来的 hi 往后挪了一位
+    return name
+
+
+def ungroup(steps: List[Step], index: int) -> Optional[str]:
+    """拆掉 index 处的组合：只去掉两个标记，里面的步骤原样留着。
+
+    index 可以是组合的开始或结束标记（点哪一端都行）。返回组合原来的名字。
+    """
+    sp = span_by_marker(spans(steps), index)
+    if sp is None or sp.kind != "group":
+        return None
+    name = steps[sp.start].title
+    # 组合卡片被拖动过的话，坐标交给里面第一个步骤，画布上位置看着不变
+    if sp.inner_hi > sp.inner_lo and steps[sp.start].pos:
+        if not steps[sp.inner_lo].pos:
+            steps[sp.inner_lo].pos = list(steps[sp.start].pos)
+    del steps[sp.end]
+    del steps[sp.start]
+    return name
 
 
 def condition_branch_values(step: Step, index: int) -> List[str]:

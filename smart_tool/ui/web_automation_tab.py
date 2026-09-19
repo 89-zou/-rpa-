@@ -558,6 +558,15 @@ class WebAutomationTab(QWidget):
             return
         row = blocks.marker_owner_index(self._steps, row)
         old = self._steps[row]
+        if old.action == blocks.GROUP_START:
+            # 组合的结构改动（合并 / 取消 / 改名 / 展开）只在【流程编辑】里做
+            QMessageBox.information(
+                self, "组合节点",
+                f"「{old.title or '组合'}」是一个组合节点，画布上只显示这张卡片。\n\n"
+                "想展开看里面的步骤、改名、或者取消组合，"
+                "请点上方【流程编辑…】，在列表里操作。",
+            )
+            return
         dlg = self._make_step_dialog(old)
         try:
             if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -584,6 +593,19 @@ class WebAutomationTab(QWidget):
         if row < 0:
             return
         block = blocks.span_by_marker(blocks.spans(self._steps), row)
+        if block is not None and block.kind == "group":
+            # 组合上按「删除」＝取消组合：里面的步骤一个都不删
+            gname = self._steps[block.start].title or "组合"
+            reply = QMessageBox.question(
+                self, "取消组合",
+                f"「{gname}」是组合节点。\n"
+                "取消组合只是去掉这一层壳，里面的步骤一个都不会删。\n确定取消吗？",
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            blocks.ungroup(self._steps, block.start)
+            self._persist(select_row=min(block.start, len(self._steps) - 1))
+            return
         if block is not None:
             # 只有选中块的「标记」才整块删；块里的普通步骤只删自己
             cn = blocks.ACTION_CN.get(self._steps[row].action, "结构节点")
