@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""项目管理对话框：项目列表 + 变量清单 + 图片库 + 登录态 + 采集数据。
+"""项目管理对话框：项目列表 + 变量清单 + 图片库 + 登录态 + 采集数据 + 函数库。
 
 左边选项目，右边按页签看这个项目的东西：
 
@@ -12,17 +12,20 @@
 - 【登录态】cookie / localStorage：登录一次以后就不用再登（AuthDialog）。
 - 【采集数据】「采集数据」节点采到的东西（DataDialog）：看记录、导出 Excel。
   后两个页签直接复用那两个面板（embedded=True），所以关掉主界面上的按钮也能用。
+- 【函数库】写一次、到处调用的一段代码：流程里用「调用函数」节点引用它，
+  改了这里所有调用一起变（改名会自动同步到那些节点）。
 """
 import shutil
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QFont, QPixmap
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QDialog, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
-    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QTableWidget,
-    QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+    QAbstractItemView, QComboBox, QDialog, QFileDialog, QFormLayout,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMessageBox, QPlainTextEdit, QPushButton, QTableWidget, QTableWidgetItem,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from smart_tool.core import data_sources, project_store, step_executor
@@ -34,7 +37,7 @@ from smart_tool.ui.help_tip import help_row
 from smart_tool.ui.step_editor_dialog import StepEditDialog
 
 # 页签下标
-TAB_VARS, TAB_IMAGES, TAB_AUTH, TAB_DATA = 0, 1, 2, 3
+TAB_VARS, TAB_IMAGES, TAB_AUTH, TAB_DATA, TAB_FUNCS = 0, 1, 2, 3, 4
 
 #: 【?】里的完整说明（界面上只留一句摘要，其余收进弹窗）
 VARS_HELP = (
@@ -73,6 +76,28 @@ IMAGES_HELP = (
     "\n"
     "一个技巧：XPath 是主定位、截图是兜底。页面小改动时截图还能顶一阵，\n"
     "但别只靠图——图对分辨率 / 缩放敏感，换台机器可能就匹配不上了。"
+)
+
+FUNCS_HELP = (
+    "函数＝写一次、到处调用的一段代码。流程里用「调用函数」节点引用它，\n"
+    "改这里的代码，所有调用它的地方一起变（不用满流程去找）。\n"
+    "\n"
+    "【什么时候用】同一段处理要在多个地方做（清洗标题、算价格、补零、\n"
+    "失败重试…），或者流程里塞了太多「自由代码」节点看着乱的时候。\n"
+    "只在一个地方用的话，直接用「自由代码」节点更省事。\n"
+    "\n"
+    "【入口参数】写形参名，逗号分隔（如 `单价, 倍数`）。\n"
+    "调用那边按 `形参名=值` 传（值可以写 {{变量}}）；没传的形参＝空文本。\n"
+    "\n"
+    "【代码】和「自由代码」节点一样：\n"
+    "· 用形参名拿参数；return 的东西就是「调用函数」节点的返回值；\n"
+    "· vars / log() / page / current_url / project_dir 都能用；\n"
+    "· Python 超时会真的掐断（JS 里同步死循环拦不住）。\n"
+    "\n"
+    "【语言】Python 在本机跑、JS 在网页里跑（JS 需要浏览器页面）。\n"
+    "\n"
+    "注意：函数改名后，已经用到它的「调用函数」节点会被一起改成新名字，\n"
+    "所以放心改。删函数则会让那些节点报「找不到函数」，需要重新选一个。"
 )
 
 # 变量行类型（存在「来源」列的 UserRole 里，用来区分增删改行为）
@@ -146,6 +171,7 @@ class ProjectManagerDialog(QDialog):
         self.tabs.addTab(self.auth_panel, "登录态")
         self.data_panel = DataDialog(None, self, embedded=True)
         self.tabs.addTab(self.data_panel, "采集数据")
+        self.tabs.addTab(self._build_func_page(), "函数库")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         right.addWidget(self.tabs, 1)
 
@@ -262,6 +288,278 @@ class ProjectManagerDialog(QDialog):
         btns.addWidget(self.img_status)
         lay.addLayout(btns)
         return page
+
+    # ------------------------------
+    # 函数库（一处定义、多处调用）
+    # ------------------------------
+    def _build_func_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 6, 0, 0)
+
+        lay.addWidget(help_row(
+            "写一次、到处调用：流程里用「调用函数」节点引用它。",
+            "函数库", FUNCS_HELP))
+
+        body = QHBoxLayout()
+
+        left = QVBoxLayout()
+        self.func_list = QListWidget()
+        self.func_list.setMaximumWidth(220)
+        self.func_list.setWordWrap(False)
+        self.func_list.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.func_list.itemSelectionChanged.connect(self._on_func_selected)
+        left.addWidget(self.func_list, 1)
+        fbtns = QHBoxLayout()
+        self.btn_func_add = QPushButton("新建函数")
+        self.btn_func_add.clicked.connect(self._add_function)
+        fbtns.addWidget(self.btn_func_add)
+        self.btn_func_del = QPushButton("删除选中")
+        self.btn_func_del.clicked.connect(self._del_function)
+        fbtns.addWidget(self.btn_func_del)
+        left.addLayout(fbtns)
+        body.addLayout(left, 2)
+
+        right = QVBoxLayout()
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self.func_name = QLineEdit()
+        self.func_name.setPlaceholderText("如：清洗标题（调用节点里按这个名字找）")
+        self.func_name.editingFinished.connect(self._save_functions)
+        form.addRow("函数名：", self.func_name)
+
+        self.func_lang = QComboBox()
+        self.func_lang.addItem("Python（本机执行）", "python")
+        self.func_lang.addItem("JavaScript（在网页里执行）", "javascript")
+        self.func_lang.currentIndexChanged.connect(self._save_functions)
+        form.addRow("语言：", self.func_lang)
+
+        self.func_params = QLineEdit()
+        self.func_params.setPlaceholderText("形参名，逗号分隔，如：单价, 倍数（留空＝没有参数）")
+        self.func_params.editingFinished.connect(self._save_functions)
+        form.addRow("入口参数：", self.func_params)
+
+        self.func_desc = QLineEdit()
+        self.func_desc.setPlaceholderText("选填：一句话说明它干什么，调用的时候鼠标停上去能看到")
+        self.func_desc.editingFinished.connect(self._save_functions)
+        form.addRow("说明：", self.func_desc)
+        right.addLayout(form)
+
+        self.func_code = QPlainTextEdit()
+        self.func_code.setPlaceholderText(
+            "# 例：\n"
+            "#   标题 = 标题.strip()\n"
+            "#   return 标题 + '（已处理）'"
+        )
+        self.func_code.setMinimumHeight(150)
+        mono = QFont("Consolas")
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        self.func_code.setFont(mono)
+        self.func_code.textChanged.connect(self._on_func_code_changed)
+        right.addWidget(QLabel("函数代码："))
+        right.addWidget(self.func_code, 1)
+
+        fbottom = QHBoxLayout()
+        fbottom.addStretch()
+        self.func_save_btn = QPushButton("保存函数")
+        self.func_save_btn.clicked.connect(self._save_functions)
+        fbottom.addWidget(self.func_save_btn)
+        right.addLayout(fbottom)
+        body.addLayout(right, 5)
+        lay.addLayout(body, 1)
+
+        self.func_status = QLabel("")
+        self.func_status.setStyleSheet("color: #2e7d32;")
+        lay.addWidget(self.func_status)
+
+        # 编辑时自动存：代码打字停下来 1 秒就写盘（不必记得点保存）
+        self._funcs: List[Dict[str, str]] = []
+        self._func_row = -1
+        self._loading_func = False
+        self._saved_funcs: List[Dict[str, str]] = []
+        self._func_timer = QTimer(self)
+        self._func_timer.setSingleShot(True)
+        self._func_timer.setInterval(1000)
+        self._func_timer.timeout.connect(self._save_functions)
+        return page
+
+    def _load_functions(self):
+        """刷新函数库列表（第一个函数默认选中）。
+
+        换项目 / 换页签时先把 _func_row 清掉：否则右边表单里留着上一个项目的
+        内容，会被当成「这个函数被编辑了」写进新项目的函数库。
+        """
+        self._func_timer.stop()
+        self._func_row = -1
+        if self._store is None:
+            self._funcs = []
+            self._saved_funcs = []
+            self._loading_func = True
+            self.func_list.clear()
+            self._loading_func = False
+            self._show_function(None)
+            return
+        self._funcs = self._store.load_functions()
+        self._saved_funcs = [dict(f) for f in self._funcs]
+        self._loading_func = True
+        self.func_list.clear()
+        for f in self._funcs:
+            self.func_list.addItem(self._func_item_text(f))
+        self.func_list.setCurrentRow(0 if self._funcs else -1)
+        self._loading_func = False
+        self._show_function(self._funcs[0] if self._funcs else None,
+                            0 if self._funcs else -1)
+        self.func_status.setText(
+            f"共 {len(self._funcs)} 个函数；改完自动保存。")
+
+    @staticmethod
+    def _func_item_text(f: Dict[str, str]) -> str:
+        lang = "JS" if str(f.get("lang")).lower() == "javascript" else "Python"
+        return f"{f.get('name') or '（未命名）'}（{lang}）"
+
+    def _on_func_selected(self):
+        if self._loading_func:
+            return
+        self._save_functions()          # 先把上一个函数正在编辑的内容存下来
+        row = self.func_list.currentRow()
+        self._show_function(
+            self._funcs[row] if 0 <= row < len(self._funcs) else None, row)
+
+    def _show_function(self, f: Optional[Dict[str, str]], row: int = -1):
+        """把某个函数显示到右边表单（None＝没有可编辑的函数）。"""
+        self._func_row = row
+        self._loading_func = True
+        has = f is not None
+        for w in (self.func_name, self.func_params, self.func_desc,
+                  self.func_lang, self.func_code, self.func_save_btn):
+            w.setEnabled(has)
+        self.func_name.setText((f or {}).get("name", ""))
+        idx = self.func_lang.findData((f or {}).get("lang", "python"))
+        self.func_lang.setCurrentIndex(max(0, idx))
+        self.func_params.setText((f or {}).get("params", ""))
+        self.func_desc.setText((f or {}).get("desc", ""))
+        self.func_code.setPlainText((f or {}).get("code", ""))
+        self._loading_func = False
+
+    def _on_func_code_changed(self):
+        if self._loading_func:
+            return
+        self._func_timer.start()
+
+    def _collect_function(self) -> bool:
+        """把右边表单写回 self._funcs；返回有没有改动。"""
+        if self._loading_func or not (0 <= self._func_row < len(self._funcs)):
+            return False
+        new = {
+            "name": self.func_name.text().strip(),
+            "lang": self.func_lang.currentData() or "python",
+            "params": self.func_params.text().strip(),
+            "desc": self.func_desc.text().strip(),
+            "code": self.func_code.toPlainText(),
+        }
+        if new == self._funcs[self._func_row]:
+            return False
+        self._funcs[self._func_row] = new
+        return True
+
+    def _save_functions(self):
+        """写盘（顺便把「改了名字」同步到所有「调用函数」节点）。"""
+        if self._store is None:
+            return
+        if self._func_timer.isActive():
+            self._func_timer.stop()
+        changed = self._collect_function()
+        if not changed and self._funcs == self._saved_funcs:
+            return
+        row = self._func_row
+        old_name = ""
+        if 0 <= row < len(self._saved_funcs):
+            old_name = str(self._saved_funcs[row].get("name") or "")
+        new_name = str(self._funcs[row].get("name") or "") if row >= 0 else ""
+        self._store.save_functions(self._funcs)
+        note = ""
+        if old_name and new_name and old_name != new_name:
+            note = self._rename_in_steps(old_name, new_name)
+        self._saved_funcs = [dict(f) for f in self._funcs]
+        # 列表上的名字 / 语言跟着变
+        if 0 <= row < self.func_list.count():
+            self._loading_func = True
+            self.func_list.item(row).setText(self._func_item_text(self._funcs[row]))
+            self._loading_func = False
+        self.func_status.setText(
+            f"已保存 {len(self._funcs)} 个函数"
+            + (f"；{note}" if note else "")
+            + "。调用它的节点会自动用最新代码。"
+        )
+
+    def _rename_in_steps(self, old: str, new: str) -> str:
+        """函数改名：把流程里所有调用它的节点一起改掉。"""
+        steps = self._store.load_steps()
+        hit = 0
+        for s in steps:
+            if s.action == "call" and (s.func_name or "").strip() == old:
+                s.func_name = new
+                hit += 1
+        if not hit:
+            return ""
+        self._store.save(steps)
+        self._changed_project = self._store.name
+        return f"{hit} 个「调用函数」节点已改成新名字"
+
+    def _add_function(self):
+        if self._store is None:
+            return
+        self._save_functions()
+        base = "新函数"
+        names = {f.get("name") for f in self._funcs}
+        name, i = base, 2
+        while name in names:
+            name, i = f"{base}{i}", i + 1
+        self._funcs.append({"name": name, "lang": "python", "params": "",
+                            "code": "", "desc": ""})
+        self._store.save_functions(self._funcs)
+        self._saved_funcs = [dict(f) for f in self._funcs]
+        self._loading_func = True
+        self.func_list.addItem(self._func_item_text(self._funcs[-1]))
+        self._loading_func = False
+        self.func_list.setCurrentRow(len(self._funcs) - 1)   # 触发 _on_func_selected
+        self.func_name.setFocus()
+        self.func_name.selectAll()
+        self.func_status.setText("已新建一个空函数：先起名字、写参数和代码。")
+
+    def _del_function(self):
+        if self._store is None:
+            return
+        row = self.func_list.currentRow()
+        if not (0 <= row < len(self._funcs)):
+            return
+        name = self._funcs[row].get("name") or ""
+        users = [s for s in self._store.load_steps()
+                 if s.action == "call" and (s.func_name or "").strip() == name]
+        msg = f"删除函数「{name}」？"
+        if users:
+            msg += (f"\n\n注意：流程里有 {len(users)} 个「调用函数」节点在用它，"
+                    "删掉后那些节点运行时会报「找不到函数」，需要重新选一个。")
+        if QMessageBox.question(
+                self, "删除函数", msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._loading_func = True          # 别让切换事件把已删的又写回去
+        del self._funcs[row]
+        self._func_row = -1
+        self._loading_func = False
+        self._store.save_functions(self._funcs)
+        self._saved_funcs = [dict(f) for f in self._funcs]
+        self.func_list.blockSignals(True)
+        self.func_list.takeItem(row)
+        self.func_list.blockSignals(False)
+        if self._funcs:
+            self.func_list.setCurrentRow(min(row, len(self._funcs) - 1))
+            self._on_func_selected()
+        else:
+            self._show_function(None)
+        self.func_status.setText(f"已删除函数「{name}」。")
 
     def _load_images(self):
         """刷新图片库：列出 img/ 里的图片 + 各自被哪些步骤引用。"""
@@ -536,6 +834,7 @@ class ProjectManagerDialog(QDialog):
             self.data_label.setText("")
             self.status_label.clear()
             self.img_status.clear()
+            self._load_functions()      # 清空函数库那页（没有选中项目）
             self._show_image_preview()
             self.auth_panel.set_project(None, None)
             self.data_panel.set_project(None)
@@ -559,6 +858,8 @@ class ProjectManagerDialog(QDialog):
             self._load_images()
         elif index == TAB_AUTH:
             self.auth_panel.set_project(self._store, self._store.load_steps())
+        elif index == TAB_FUNCS:
+            self._load_functions()
         else:
             self.data_panel.set_project(self._store)
 

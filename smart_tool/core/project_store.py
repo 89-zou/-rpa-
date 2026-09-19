@@ -85,6 +85,11 @@ class Step:
     script_output: str = ""
     script_timeout: int = 30              # 秒；到点中断（卡在等外部返回时拦不住）
     script_vars: str = ""                 # 逗号分隔的变量名；空=传入全部变量
+    # ---- call 专用：调用「函数库」里的函数（项目管理→函数库，一处定义多处调用）----
+    # func_name ：函数名
+    # func_args ：实参，写法 `形参名=值`（值可写 {{变量}} 或字面量），逗号分隔
+    func_name: str = ""
+    func_args: str = ""
     # ---- read_data 专用：读文件 / 文件夹，产出一个「列表变量」 ----
     # data_cfg 的字段与 DataSourceConfig 一致（type/path/pattern/recursive/
     # encoding/sheet/has_header/field_map/vars_picked）
@@ -167,6 +172,13 @@ class Step:
                 d["script_vars"] = self.script_vars
             if self.script_output:
                 d["script_output"] = self.script_output
+        if self.action == "call":
+            d["func_name"] = self.func_name
+            d["script_timeout"] = self.script_timeout
+            if self.func_args:
+                d["func_args"] = self.func_args
+            if self.script_output:
+                d["script_output"] = self.script_output
         if self.action == "read_data":
             d["output_var"] = self.output_var
             d["data_cfg"] = dict(self.data_cfg or {})
@@ -231,6 +243,8 @@ class Step:
             script_output=d.get("script_output", ""),
             script_timeout=int(d.get("script_timeout", 30)),
             script_vars=d.get("script_vars", ""),
+            func_name=d.get("func_name", ""),
+            func_args=d.get("func_args", ""),
             output_var=d.get("output_var", ""),
             data_cfg=dict(d.get("data_cfg") or {}),
             collect_mode=d.get("collect_mode", "page") or "page",
@@ -300,6 +314,44 @@ class ProjectStore:
         merged.update(self.load_locators())
         return merged
 
+    def load_functions(self) -> List[Dict[str, Any]]:
+        """函数库：一处定义、多处调用（「调用函数」节点用）。
+
+        每一条：{"name": 函数名, "lang": python|javascript, "params": 形参（逗号分隔）,
+                 "code": 代码, "desc": 说明}
+        """
+        out: List[Dict[str, Any]] = []
+        for f in self.load().get("functions", []) or []:
+            if not isinstance(f, dict):
+                continue
+            name = str(f.get("name") or "").strip()
+            if not name:
+                continue
+            out.append({
+                "name": name,
+                "lang": str(f.get("lang") or "python"),
+                "params": str(f.get("params") or ""),
+                "code": str(f.get("code") or ""),
+                "desc": str(f.get("desc") or ""),
+            })
+        return out
+
+    def save_functions(self, functions: List[Dict[str, Any]]):
+        """只更新函数库，其余配置保持不变。"""
+        data = dict(self.load())
+        data["functions"] = [
+            {
+                "name": str(f.get("name") or "").strip(),
+                "lang": str(f.get("lang") or "python"),
+                "params": str(f.get("params") or ""),
+                "code": str(f.get("code") or ""),
+                "desc": str(f.get("desc") or ""),
+            }
+            for f in (functions or [])
+            if str(f.get("name") or "").strip()
+        ]
+        self._write(data)
+
     def load_layout_version(self) -> str:
         """画布排版版本；与当前版本不一致时自动重排为横向布局。"""
         return self.load().get("layout", "") or ""
@@ -325,6 +377,8 @@ class ProjectStore:
             data["auth"] = dict(old["auth"])   # 登录态配置同理
         if old.get("locators"):
             data["locators"] = dict(old["locators"])   # 元素定位同理
+        if old.get("functions"):
+            data["functions"] = list(old["functions"])   # 函数库同理（别被保存步骤弄丢）
         scene_val = normalize_scene(
             scene if scene is not None else old.get("scene"))
         if scene_val == SCENE_DESKTOP:

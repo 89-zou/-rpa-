@@ -94,6 +94,7 @@ ACTION_META = {
     "group_start": ("组合", "#0d7a6a"),
     "group_end": ("组合结束", "#0d7a6a"),
     "script": ("自由代码", "#475569"),
+    "call": ("调用函数", "#6d28d9"),
     # 桌面场景
     "win_activate": ("激活窗口", "#7c3aed"),
     "hotkey": ("按键", "#0d9488"),
@@ -249,6 +250,13 @@ def step_summary(s: Step, branch_text: str = "") -> List[str]:
                 first = line.strip()
                 break
         return [f"{lang} 脚本：{first[:40]}" if first else f"{lang} 脚本（未填代码）"]
+    if s.action == "call":
+        head = (f"调用：{(s.func_name or '').strip()}" if (s.func_name or "").strip()
+                else "（还没选函数）")
+        tail = (f"参数：{(s.func_args or '').strip()}" if (s.func_args or "").strip()
+                else "不传参数")
+        var = (s.script_output or "").strip()
+        return [head, tail + (f"　→ {{{{{var}}}}}" if var else "")]
     return []
 
 
