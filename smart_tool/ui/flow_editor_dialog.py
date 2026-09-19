@@ -138,7 +138,7 @@ class _StepCard(QWidget):
         elif step.action == "branch":
             prefix = "⑂ "
         # 自定义名称优先，后面跟上类型名（如「登录页（打开网页）」）；
-        # 编号用显示编号：组合是「2-4」这种范围，它自己不占号
+        # 编号用显示编号：组合是「2-4」这种范围，结束标记干脆没有编号
         shown = f"{step.title}（{name}）" if step.title else name
         head = f"{number}. " if number else ""
         title = QLabel(f"{prefix}{head}{shown}")
@@ -554,7 +554,7 @@ class FlowEditorDialog(QDialog):
             f"，{groups} 个组合" if groups else "",
             f"，{folded} 个已收起" if folded else "",
         ])
-        # 编号按「显示编号」数：组合不占号（显示 2-4），所以不写死成行数
+        # 编号按「显示编号」数：结束标记和组合都不占号，所以不写死成行数
         top = blocks.last_number(self._steps)
         head = f"编号 1~{top}" if top else "还没有节点"
         self.count_label.setText(head + extra)
@@ -785,7 +785,7 @@ class FlowEditorDialog(QDialog):
             self.status_label.setText(f"已自动保存；但{problem}")
             self.status_label.setStyleSheet("color:#c62828;")
             return
-        # 显示编号的最大值（组合不占号，所以不一定是行数）
+        # 显示编号的最大值（结束标记不占号，所以不一定是行数）
         top = blocks.last_number(self._steps) or "0"
         self.status_label.setText(
             f"已自动保存（{len(self._steps)} 行，编号 1~{top}）"

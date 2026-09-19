@@ -117,7 +117,7 @@ class WebAutomationTab(QWidget):
         self._scene: str = "web"        # 当前项目的场景：web / desktop
         self._user_paused = False       # 小窗上手动暂停中
         self._flow_paused = False       # 流程里的「暂停等人工」节点正在等
-        self._step_labels: dict = {}    # 步骤 id → 显示编号（组合不占编号）
+        self._step_labels: dict = {}    # 步骤 id → 显示编号（结构标记的结束端不占编号）
         self._init_ui()
         # 启动就打开一个项目：优先「安装时指定的默认项目」，没有就找内置演示项目；
         # 都没有（比如用户把演示项目删了）→ 保持空项目，自己去【新建项目…】。
@@ -825,8 +825,8 @@ class WebAutomationTab(QWidget):
         self._user_paused = False
         self._flow_paused = False
         name = self._current_store.name if self._current_store else ""
-        # 显示编号（组合不占号，标签是「2-4」这种范围）：小窗上的「第 N 步」
-        # 要跟画布上看到的数字一致；组合本身不会被执行到，所以只认纯数字
+        # 显示编号（组合标签是「2-4」这种范围、结束标记没有编号）：小窗上的「第 N 步」
+        # 要跟画布上看到的数字一致；组合和结束标记都不会被执行到，所以只认纯数字
         labels = blocks.step_numbers(self._steps)
         self._step_labels = {s.id: n for s, n in zip(self._steps, labels)
                              if n.isdigit()}
