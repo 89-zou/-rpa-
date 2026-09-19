@@ -431,11 +431,43 @@ def ungroup(steps: List[Step], index: int) -> Optional[str]:
     return name
 
 
-def condition_branch_values(step: Step, index: int) -> List[str]:
-    """条件节点第 index 个分支的匹配值清单（逗号分隔，已去空）。"""
+#: 分支的判断方式（key, 界面上的中文名）。
+#: 空串＝兜底分支：不判断，无条件命中（相当于 else），必须放在最后。
+COND_OPS = [
+    ("", "兜底（上面都不匹配时走这里）"),
+    ("contains", "包含"),
+    ("not_contains", "不包含"),
+    ("eq", "等于"),
+    ("ne", "不等于"),
+    ("gt", "大于"),
+    ("lt", "小于"),
+    ("ge", "大于等于"),
+    ("le", "小于等于"),
+]
+COND_OP_CN = dict(COND_OPS)
+#: 这几个判断方式的「值」支持逗号分隔多个：命中任意一个就算成立
+COND_MULTI_OPS = ("contains", "not_contains", "eq", "ne")
+#: 需要按数字比较的判断方式
+COND_NUMBER_OPS = ("gt", "lt", "ge", "le")
+
+
+def condition_branch_op(step: Step, index: int) -> str:
+    """条件节点第 index 个分支的判断方式（空串＝兜底）。"""
     if index < 0 or index >= len(step.cond_branches or []):
-        return []
-    raw = (step.cond_branches[index].get("values") or "").replace("，", ",")
+        return ""
+    return str(step.cond_branches[index].get("op") or "").strip()
+
+
+def condition_branch_value(step: Step, index: int) -> str:
+    """条件节点第 index 个分支要比较的值（原文，可含 {{变量}}）。"""
+    if index < 0 or index >= len(step.cond_branches or []):
+        return ""
+    return str(step.cond_branches[index].get("value") or "")
+
+
+def condition_branch_values(step: Step, index: int) -> List[str]:
+    """第 index 个分支的值清单（逗号分隔，已去空）。"""
+    raw = condition_branch_value(step, index).replace("，", ",")
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
@@ -447,9 +479,22 @@ def condition_branch_name(step: Step, index: int) -> str:
     return name or f"分支 {index + 1}"
 
 
-def new_branch(name: str = "", values: str = "") -> Dict[str, str]:
+def condition_branch_summary(step: Step, index: int) -> str:
+    """分支在画布 / 列表上的摘要文字（两种判断方式各有一套写法）。"""
+    name = condition_branch_name(step, index)
+    if (step.cond_mode or "rule") == "expr":
+        values = "、".join(condition_branch_values(step, index))
+        return f"{name}：{values}" if values else name
+    op = condition_branch_op(step, index)
+    if not op:
+        return f"{name}（兜底）"
+    value = condition_branch_value(step, index).strip()
+    return f"{name}（{COND_OP_CN.get(op, op)} {value}）"
+
+
+def new_branch(name: str = "", op: str = "", value: str = "") -> Dict[str, str]:
     """新建一条分支定义（界面用）。"""
-    return {"name": name, "values": values}
+    return {"name": name, "op": op, "value": value}
 
 
 # ------------------------------

@@ -80,9 +80,7 @@ def _branch_text(steps: List[Step], index: int) -> str:
             return ""
         bi = order.index(index)
         cond = steps[sp.start]
-        name = blocks.condition_branch_name(cond, bi)
-        values = "、".join(blocks.condition_branch_values(cond, bi))
-        return f"{name}：{values}" if values else name
+        return blocks.condition_branch_summary(cond, bi)
     return ""
 
 
@@ -624,10 +622,10 @@ class FlowEditorDialog(QDialog):
         if step.action == "loop_start":
             new_steps.append(Step(id=0, action=blocks.LOOP_END))
         elif step.action == "condition_start":
-            # 条件默认给两个分支，用户可在条件节点里增删
+            # 条件默认给「一个待填条件的 + 一个兜底」两个分支，可再增删
             if not step.cond_branches:
-                step.cond_branches = [blocks.new_branch("分支 1"),
-                                      blocks.new_branch("分支 2")]
+                step.cond_branches = [blocks.new_branch("分支 1", op="contains"),
+                                      blocks.new_branch("兜底")]
             new_steps.append(Step(id=0, action=blocks.BRANCH))
             new_steps.append(Step(id=0, action=blocks.BRANCH))
             new_steps.append(Step(id=0, action=blocks.COND_END))

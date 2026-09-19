@@ -210,12 +210,12 @@ def step_summary(s: Step, branch_text: str = "") -> List[str]:
     if s.action == "loop_end":
         return ["循环体到此结束"]
     if s.action == "condition_start":
-        mode = "表达式" if (s.cond_mode or "equal") == "expr" else "变量相等"
-        lines = [f"{mode}：{s.cond_expr or '（未填判断内容）'}"]
+        mode = "表达式" if (s.cond_mode or "rule") == "expr" else "规则"
+        lines = [f"{mode}：{s.cond_expr or '（未填判断的数据）'}"]
         lines.append(f"{len(s.cond_branches or [])} 个分支，命中哪个走哪个")
         return lines
     if s.action == "branch":
-        return [branch_text or "（匹配值在条件节点里改）"]
+        return [branch_text or "（判断方式在条件节点里改）"]
     if s.action == "condition_end":
         return ["条件体到此结束"]
     if s.action == "group_start":
@@ -1119,9 +1119,7 @@ class FlowCanvas(QWidget):
         if bi < 0:
             return ""
         cond_step = self._steps[cond.start]
-        name = blocks.condition_branch_name(cond_step, bi)
-        values = "、".join(blocks.condition_branch_values(cond_step, bi))
-        return f"{name}：{values}" if values else name
+        return blocks.condition_branch_summary(cond_step, bi)
 
     def _span_by_start(self, index: int):
         return next((sp for sp in self._spans if sp.start == index), None)
@@ -1451,7 +1449,7 @@ class FlowCanvas(QWidget):
             return f"↳ 分支（{self._branch_text_of(self._steps[sp.start])}）"
         if sp.kind == "condition":
             step = self._steps[sp.start]
-            mode = "表达式" if (step.cond_mode or "equal") == "expr" else "变量"
+            mode = "表达式" if (step.cond_mode or "rule") == "expr" else "规则"
             count = sum(1 for k in range(sp.inner_lo, sp.inner_hi)
                         if self._steps[k].action == "branch")
             return f"↳ 条件（{mode}：{step.cond_expr or '未填'}，{count} 个分支）"
