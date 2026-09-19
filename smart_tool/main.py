@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """程序入口（GUI）。
 
-开发版（源码运行 `python -m smart_tool.main`）：
+源码运行（开发版）：
     直接进主界面 —— 不弹安装向导、不显示启动海报、不往系统里写任何东西。
 
-生产版（PyInstaller 打出来的 exe，用户拿到的那个）：
+打包后的 exe（生产版）：
     第一次运行 → 先弹【安装向导】（选一个文件夹、构建环境、建快捷方式、登记卸载入口）
     → 每次启动显示启动海报（加载完才让点，或者 8 秒后自动进）
     → 主窗口（默认载入演示项目，删了就是空项目）。
@@ -16,6 +16,9 @@
 命令行（两个版本都支持）：
     --setup      重跑安装向导（补装浏览器内核、改安装位置、重建快捷方式）
     --uninstall  卸载（系统「设置 → 应用」里点卸载执行的就是这条）
+
+开源版没有「启动广告页」和「安装向导 / 卸载」这几个部件（作者发行版专用），
+所以它们的导入都是可选的：文件不在就照常进主界面，不影响写流程、跑流程。
 """
 import sys
 import traceback
@@ -27,7 +30,11 @@ from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 from smart_tool import paths
 from smart_tool.core import crash_guard
 from smart_tool.ui.main_window import MainWindow
-from smart_tool.ui.splash import AdSplash
+
+try:                     # 开源版不带启动广告页
+    from smart_tool.ui.splash import AdSplash
+except ImportError:      # pragma: no cover
+    AdSplash = None
 
 
 def install_crash_handler():
@@ -77,7 +84,10 @@ def run_first_time_setup() -> str:
     """
     if paths.load_config().get("installed"):
         return "continue"
-    from smart_tool.setup_wizard import SetupWizard
+    try:
+        from smart_tool.setup_wizard import SetupWizard
+    except ImportError:      # 开源版没有安装向导：直接进主界面
+        return "continue"
 
     wizard = SetupWizard(first_run=True)
     if wizard.exec() != QDialog.DialogCode.Accepted:
@@ -92,13 +102,21 @@ def main():
     # 卸载入口：系统「设置 → 应用 → 小邹RPA → 卸载」执行的就是这条
     # （注册表里的 UninstallString 写着 "<本程序>" --uninstall）
     if "--uninstall" in sys.argv[1:]:
-        from smart_tool.uninstall import main as uninstall_main
+        try:
+            from smart_tool.uninstall import main as uninstall_main
+        except ImportError:
+            print("这个版本不带卸载程序（那是作者发行版里的部件）。")
+            return
         sys.exit(uninstall_main())
 
     # 重跑安装向导（补装浏览器内核、改安装位置、重建快捷方式都用它）。
-    # 开发版也留着这条：想看那套流程就 `python -m smart_tool.main --setup`。
+    # 开发时也留着这条：想看那套流程就 `python -m smart_tool.main --setup`。
     if "--setup" in sys.argv[1:]:
-        from smart_tool.setup_wizard import main as setup_main
+        try:
+            from smart_tool.setup_wizard import main as setup_main
+        except ImportError:
+            print("这个版本不带安装向导：直接 `python -m smart_tool.main` 就能跑。")
+            return
         sys.exit(setup_main())
 
     app = QApplication(sys.argv)
@@ -126,7 +144,7 @@ def main():
             return
 
     # 启动海报：先画出来，再去建主窗口（建窗口最慢，海报上会写进度）
-    splash = AdSplash.try_create() if production else None
+    splash = AdSplash.try_create() if (production and AdSplash is not None) else None
     if splash is not None:
         splash.show()
         splash.set_status("正在加载界面…", 20)

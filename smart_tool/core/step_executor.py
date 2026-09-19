@@ -20,7 +20,7 @@ from playwright.sync_api import (
 )
 
 from smart_tool.core import (
-    auth_store, blocks, browser_setup, datastore, desktop, free_code,
+    auth_store, blocks, browser_setup, data_sources, datastore, desktop, free_code,
     image_locator, project_store,
 )
 from smart_tool.core import real_mouse as real_mouse_mod
@@ -1498,6 +1498,12 @@ class StepExecutor:
                 "   双击这个节点，选好路径并【读取预览】勾选字段。"
             )
         cfg.path = self._resolve_value(cfg.path).strip()
+        # 换机器 / 项目被搬走之后，写死的路径可能失效：按文件名在项目里找同名文件
+        data_sources.set_project_dir(self.project_dir)
+        found, note = data_sources.resolve_path(cfg.path)
+        if note:
+            self.log("  " + note)
+            cfg.path = str(found)
         rows = load_rows(cfg)
         if not rows:
             self.log(f"  没读到数据（{Path(cfg.path).name}），变量 {{{{{var}}}}} 是空的。")

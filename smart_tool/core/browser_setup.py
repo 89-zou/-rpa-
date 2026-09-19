@@ -97,10 +97,13 @@ def install(on_log: Optional[Callable[[str], None]] = None,
 
 def hint() -> str:
     """没装浏览器时给用户看的提示（中文，能照着做）。"""
-    return (
-        "还没装浏览器内核（Chromium），跑流程时启动不了浏览器。\n"
-        "   最简单的办法：跑一次安装向导，它会在「环境构建」这一步自动下载：\n"
-        "       小邹RPA.exe --setup                                  （打包版）\n"
-        "       .venv\\Scripts\\python -m smart_tool.setup_wizard      （源码运行）\n"
-        f"   下载后会装在：{browsers_dir()}"
-    )
+    from smart_tool import paths
+
+    if paths.is_production():
+        how = ("   最简单的办法：跑一次安装向导，它会在「环境构建」这一步自动下载：\n"
+               "       小邹RPA.exe --setup\n")
+    else:
+        how = ("   源码运行时装一次就行（约 150 MB）：\n"
+               "       .venv\\Scripts\\python -m playwright install chromium\n")
+    return ("还没装浏览器内核（Chromium），跑流程时启动不了浏览器。\n" + how +
+            f"   下载后会装在：{browsers_dir()}")
