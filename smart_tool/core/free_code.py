@@ -213,15 +213,38 @@ def analyze(code: str, lang: str = "python",
 def written_vars(code: str, lang: str = "python") -> List[str]:
     """静态看这段代码会写回哪些变量（给「变量没有来源」检查用）。
 
-    只看等号左边的 @名字，宽松一点没关系——宁可少报一个警告，
-    也别把用户自己脚本产出的变量报成「没有来源」。
+    只认「等号左边的 @名字」：
+    · Python 看语法树里的赋值目标；
+    · JS 看扫描时记下的写回标记。
+    字符串 / 注释里的 @class='x' 这种不会被误当成变量。
     """
+    if not (code or "").strip():
+        return []
+    lang = "javascript" if str(lang).lower().startswith("java") else "python"
+    try:
+        source, refs, _files, _errors = _scan(code, lang, (), (),
+                                             require_paths=False)
+    except Exception:
+        return []
     out: List[str] = []
-    for m in re.finditer(
-            r"@([A-Za-z0-9_\u4e00-\u9fff.]+)\s*(?:\+|-|\*|/|%|//)?=(?!=)", code or ""):
-        name = m.group(1)
-        if name and name not in out:
-            out.append(name)
+
+    def keep(holder: str):
+        ref = refs.get(holder)
+        if ref and ref[0] == KIND_VAR and ref[1] not in out:
+            out.append(ref[1])
+
+    if lang == "javascript":
+        for holder in refs:
+            if holder.startswith("__w_"):
+                keep(holder)
+        return out
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            keep(node.id)
     return out
 
 

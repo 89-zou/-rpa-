@@ -1968,9 +1968,9 @@ class StepExecutor:
             raise ValueError("select 步骤缺少 locator")
         if step.locator.type == "image":
             raise ValueError("select 动作暂不支持截图定位，请使用 XPath")
-        self._resolve_xpath(step.locator).select_option(
-            self._resolve_value(step.value), timeout=20000
-        )
+        value = self._resolve_value(step.value)
+        self.log(f"  下拉选择：{value}")
+        self._resolve_xpath(step.locator).select_option(value, timeout=20000)
 
     def _pause_for_human(self, step: Step):
         """暂停等待人工操作（验证码/人机验证）。
