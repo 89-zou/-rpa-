@@ -46,6 +46,21 @@ def app_dir() -> Path:
     return BUNDLE_DIR
 
 
+def is_production() -> bool:
+    """是不是**生产版**（用 PyInstaller 打出来的 exe）。
+
+    开发版（源码运行）与生产版的区别，只在这一处分：
+    · 开发版：入口直接进主界面 —— 不弹安装向导、不显示启动海报、
+      不往注册表/系统里写任何东西（那套只有交付给用户时才有意义）；
+    · 生产版：第一次运行弹安装向导（选文件夹、构建环境、建快捷方式、
+      登记卸载入口），之后每次启动显示启动海报再进主界面。
+
+    想手动测那套流程：开发版照样可以 `python -m smart_tool.setup_wizard`
+    或 `python -m smart_tool.main --setup`。
+    """
+    return bool(getattr(sys, "frozen", False))
+
+
 BUNDLE_DIR = _bundle_dir()
 #: 兼容旧名字：程序文件目录
 ROOT_DIR = BUNDLE_DIR

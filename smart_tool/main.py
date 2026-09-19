@@ -1,14 +1,21 @@
 # -*- coding: utf-8 -*-
-"""程序入口。
+"""程序入口（GUI）。
 
-启动顺序（用户拿到 exe 后看到的顺序）：
-    第一次运行 → 先弹【安装向导】（选目录、构建环境、建快捷方式）
-    → 显示启动海报（加载完才让点，或者 8 秒后自动进）
+开发版（源码运行 `python -m smart_tool.main`）：
+    直接进主界面 —— 不弹安装向导、不显示启动海报、不往系统里写任何东西。
+
+生产版（PyInstaller 打出来的 exe，用户拿到的那个）：
+    第一次运行 → 先弹【安装向导】（选一个文件夹、构建环境、建快捷方式、登记卸载入口）
+    → 每次启动显示启动海报（加载完才让点，或者 8 秒后自动进）
     → 主窗口（默认载入演示项目，删了就是空项目）。
 
 两种情况不启动主界面：
     · 用户在向导里点了【取消】；
     · 程序被复制到了安装目录 —— 改为启动那边的程序（当前进程退出）。
+
+命令行（两个版本都支持）：
+    --setup      重跑安装向导（补装浏览器内核、改安装位置、重建快捷方式）
+    --uninstall  卸载（系统「设置 → 应用」里点卸载执行的就是这条）
 """
 import sys
 import traceback
@@ -88,7 +95,8 @@ def main():
         from smart_tool.uninstall import main as uninstall_main
         sys.exit(uninstall_main())
 
-    # 重跑安装向导（补装浏览器内核、改数据目录、重建快捷方式都用它）
+    # 重跑安装向导（补装浏览器内核、改安装位置、重建快捷方式都用它）。
+    # 开发版也留着这条：想看那套流程就 `python -m smart_tool.main --setup`。
     if "--setup" in sys.argv[1:]:
         from smart_tool.setup_wizard import main as setup_main
         sys.exit(setup_main())
@@ -105,14 +113,20 @@ def main():
     paths.ensure_dirs()
     install_crash_handler()
 
-    # 第一次运行：先把环境装好（数据目录、演示项目、浏览器内核、快捷方式）
-    # 用户点了取消 → 直接退出，什么都不启动
-    action = run_first_time_setup()
-    if action in ("quit", "relaunch"):
-        return
+    # 开发版（源码运行）与生产版（打包 exe）从这里分开：
+    #   生产版：第一次运行弹安装向导 → 启动海报 → 主界面；
+    #   开发版：跳过这两样，直接开主界面（写代码时不用每次点一遍向导）。
+    production = paths.is_production()
+
+    if production:
+        # 第一次运行：先把环境装好（安装位置、演示项目、浏览器内核、快捷方式）
+        # 用户点了取消 → 直接退出，什么都不启动
+        action = run_first_time_setup()
+        if action in ("quit", "relaunch"):
+            return
 
     # 启动海报：先画出来，再去建主窗口（建窗口最慢，海报上会写进度）
-    splash = AdSplash.try_create()
+    splash = AdSplash.try_create() if production else None
     if splash is not None:
         splash.show()
         splash.set_status("正在加载界面…", 20)
