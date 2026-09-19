@@ -4,20 +4,22 @@
 - 每个步骤是一张可自由拖动的圆角卡片，按 steps 列表顺序连线
 - 默认【横向蛇形排版】：从左到右排列，超出宽度自动换行，
   下一行反向（右→左），使连线始终最短；可随时点【自动排版】重排
-- 「循环开始/结束」「条件/分支/条件结束」这类配套节点用虚线框圈在一起：
+- 「循环开始/结束」「条件/条件结束」这类配套节点用虚线框圈在一起：
   **结束端（循环结束 / 条件结束）在画布上不画卡片**（只在【流程编辑】里显示）
 - 自动连线只在**最外层**按「单元」顺序连：一个单元＝一个普通步骤卡片，或一个
   循环 / 条件（整块当一端，箭头直接落在它的虚线框上）；**块内部（循环体 /
-  条件体 / 分支体）一条自动箭头都不画**，先后顺序看编号就够了
+  条件体 / 组合里）一条自动箭头都不画**，先后顺序看编号就够了
+- **条件 → 它里面的每个动作节点**单独扇出一组蓝色箭头（动作之间不连线：
+  条件是「谁成立走谁」，连成顺序链就错了）
 - 想画框内的箭头：选中框内节点 → 点它右边出现的小箭头 → 再点另一个节点，
   连这一条（要再连一条就再操作一遍）；**双击**橙色箭头即可删掉它。
   纯画布展示，不动执行顺序（存在 steps.json 的 canvas_edges 里，执行器不读）
-- 虚线框只有循环（紫）和条件（蓝）两种：**分支不套框**（靠分支卡片区分）
+- 虚线框只有循环（紫）和条件（蓝）两种
 - **组合节点**：把连着的一串步骤合成一个、起个名字，画布上只显示一张卡片
   （内部的行不画，所以它内部的循环 / 条件也不画框）。合并 / 取消合并只能在
   【流程编辑】里做；画布上双击它只会提示去哪儿展开
 - **拖虚线框＝整块移动**（块里嵌套的块与所有卡片一起走）；拖单个卡片仍是单独移动
-- 块可以嵌套（分支里放循环等），框按层级一层层套
+- 块可以嵌套（条件里放循环等），框按层级一层层套
 - 位置持久化到每个步骤的 pos；执行顺序由步骤列表顺序决定
 """
 from pathlib import Path
@@ -75,6 +77,8 @@ TITLE_FONT_PT = 6.0
 BODY_FONT_PT = 5.0
 LABEL_FONT_PT = 6.0
 CARD_RADIUS = 3.5
+#: 卡片正文最多几行
+SUMMARY_LINES = 3
 
 ACTION_META = {
     # action: (中文名, 主题色)
@@ -88,7 +92,6 @@ ACTION_META = {
     "loop_end": ("循环结束", "#7a4fb5"),
     "condition_start": ("条件", "#2f6fb3"),
     "condition_end": ("条件结束", "#2f6fb3"),
-    "branch": ("分支", "#5b8fd0"),
     "collect": ("采集数据", "#9d174d"),
     "note": ("提示 / 日志", "#a16207"),
     "group_start": ("组合", "#0d7a6a"),
@@ -158,8 +161,21 @@ def wrap_for_card(text: str, cols: int = 19, max_lines: int = 3) -> List[str]:
     return lines[:max_lines]
 
 
-def step_summary(s: Step, branch_text: str = "") -> List[str]:
-    """卡片正文最多 3 行摘要（branch_text 是分支标记从所属条件里取的匹配值）。"""
+def step_summary(s: Step, rule_text: str = "") -> List[str]:
+    """卡片正文摘要。
+
+    rule_text：这个节点作为「条件里的动作节点」时的规则摘要（如「包含 公示」），
+    会顶在第一行——条件里的动作是并行的候选，规则得跟着动作放才看得懂。
+    """
+    lines = _step_summary_body(s)
+    if rule_text:
+        lines = [f"〔{rule_text}〕"] + list(lines)
+        del lines[SUMMARY_LINES:]
+    return lines
+
+
+def _step_summary_body(s: Step) -> List[str]:
+    """卡片正文最多 3 行摘要（不含条件规则那一行）。"""
     if s.action == "note":
         return wrap_for_card(s.text)
     if s.action == "navigate":
@@ -211,11 +227,8 @@ def step_summary(s: Step, branch_text: str = "") -> List[str]:
         return ["循环体到此结束"]
     if s.action == "condition_start":
         mode = "表达式" if (s.cond_mode or "rule") == "expr" else "规则"
-        lines = [f"{mode}：{s.cond_expr or '（未填判断的数据）'}"]
-        lines.append(f"{len(s.cond_branches or [])} 个分支，命中哪个走哪个")
-        return lines
-    if s.action == "branch":
-        return [branch_text or "（判断方式在条件节点里改）"]
+        return [f"{mode}：{s.cond_expr or '（未填判断的数据）'}",
+                "从上往下第一个成立的动作执行"]
     if s.action == "condition_end":
         return ["条件体到此结束"]
     if s.action == "group_start":
@@ -305,7 +318,7 @@ class NodeItem(QGraphicsItem):
     """步骤卡片。"""
 
     def __init__(self, step: Step, canvas: "FlowCanvas",
-                 branch_text: str = "", lines: Optional[List[str]] = None,
+                 rule_text: str = "", lines: Optional[List[str]] = None,
                  number: str = ""):
         super().__init__()
         self.step = step
@@ -313,7 +326,7 @@ class NodeItem(QGraphicsItem):
         self._canvas = canvas
         self._name, color = ACTION_META.get(step.action, (step.action, "#888888"))
         self._color = QColor(color)
-        self._lines = lines if lines is not None else step_summary(step, branch_text)
+        self._lines = lines if lines is not None else step_summary(step, rule_text)
         self._h = node_height_for(step, self._lines)
         # 显示编号：组合显示成「2-4」这种范围，见 blocks.step_numbers
         self._number = number or ""
@@ -555,7 +568,7 @@ def _region_pad(depth: int) -> Tuple[float, float, float, float]:
     return (-14 - d, -22 - d, 14 + d, 14 + d)
 
 
-# 会画虚线框的块：循环紫、条件蓝（分支不画框，靠卡片与扇出箭头区分）
+# 会画虚线框的块：循环紫、条件蓝
 REGION_COLORS = {
     "loop": "#7a4fb5",
     "condition": "#2f6fb3",
@@ -1033,11 +1046,12 @@ class FlowCanvas(QWidget):
         hidden = blocks.card_hidden_indices(self._steps)
         span_map = {sp.start: sp for sp in self._spans}
         numbers = blocks.step_numbers(self._steps)
+        rule_texts = self._rule_texts()
         for i, s in enumerate(self._steps):
             if i in hidden:
                 continue        # 结束端标记、以及组合体内部：画布上不画卡片
             node = NodeItem(s, self,
-                            branch_text=self._branch_text_of(s),
+                            rule_text=rule_texts.get(i, ""),
                             lines=self._card_lines(i, s, span_map),
                             number=numbers[i])
             # 块内的节点才给「连线小箭头」：最外层是自动连好的，不用手动连
@@ -1103,29 +1117,22 @@ class FlowCanvas(QWidget):
     # ------------------------------
     # 连线与块框
     # ------------------------------
-    def _branch_text_of(self, step: Step) -> str:
-        """分支标记的摘要文字：从它所属的条件的分支清单里取匹配值。"""
-        if step.action != "branch":
-            return ""
-        idx = next((i for i, s in enumerate(self._steps) if s is step
-                    or s.id == step.id), -1)
-        cond = next((sp for sp in self._spans
-                     if sp.kind == "condition" and sp.contains(idx)), None)
-        if cond is None:
-            return ""
-        order = [k for k in range(cond.inner_lo, cond.inner_hi)
-                 if self._steps[k].action == "branch"]
-        bi = order.index(idx) if idx in order else -1
-        if bi < 0:
-            return ""
-        cond_step = self._steps[cond.start]
-        return blocks.condition_branch_summary(cond_step, bi)
+    def _rule_texts(self) -> dict:
+        """条件里每个「动作节点」的规则摘要（按行号索引），画在卡片上。"""
+        out: dict = {}
+        for sp in self._spans:
+            if sp.kind != "condition":
+                continue
+            mode = self._steps[sp.start].cond_mode or "rule"
+            for k, row in enumerate(blocks.direct_children(self._spans, sp)):
+                out[row] = blocks.rule_summary(self._steps[row], k, mode)
+        return out
 
     def _span_by_start(self, index: int):
         return next((sp for sp in self._spans if sp.start == index), None)
 
     def _inside_block(self, step: Step) -> bool:
-        """这个步骤是不是在某个块（循环体 / 条件体 / 分支体）里面。"""
+        """这个步骤是不是在某个块（循环体 / 条件体 / 组合里）里面。"""
         idx = next((i for i, s in enumerate(self._steps) if s is step), -1)
         return idx >= 0 and blocks.enclosing_span(self._spans, idx) is not None
 
@@ -1135,7 +1142,6 @@ class FlowCanvas(QWidget):
         - loop box → 循环紫框；condition box → 条件蓝框：
           连接到「一个块」时直接接到它最外层的虚线框上，
           箭头不必伸进框里去够里面的卡片；
-        - branch box → 分支卡本身（分支不套框，没有框可接）；
         - group box → 组合那张卡片（组合不套框，画布上就一张卡片）。
         """
         if isinstance(ref, tuple):
@@ -1143,7 +1149,7 @@ class FlowCanvas(QWidget):
             sp = self._span_by_start(idx)
             if sp is None:
                 return None
-            if sp.kind in ("branch", "group"):
+            if sp.kind == "group":
                 return self._nodes.get(self._steps[idx].id)
             return _LoopBoxPort(self._span_rect(sp))
         return self._nodes.get(ref)
@@ -1151,20 +1157,16 @@ class FlowCanvas(QWidget):
     def _units_in(self, lo: int, hi: int) -> List[object]:
         """把 [lo, hi) 里的步骤按「单元」切开：块整块算一个单元。
 
-        块的端点见 _endpoint：循环 / 条件接到各自的虚线框上，分支接到分支卡上，
-        组合接到它自己那张卡片上。
+        块的端点见 _endpoint：循环 / 条件接到各自的虚线框上，组合接到它自己那张卡片上。
         """
         units: List[object] = []
         hidden = blocks.card_hidden_indices(self._steps)
         i = lo
         while i < hi:
             sp = self._span_by_start(i)
-            complete = sp is not None and (
-                sp.inner_hi <= hi if sp.kind == "branch" else sp.end < hi
-            )
-            if complete:
+            if sp is not None and sp.end < hi:
                 units.append(("box", i))
-                i = sp.inner_hi if sp.kind == "branch" else sp.end + 1
+                i = sp.end + 1
             elif i in hidden:
                 i += 1          # 不画卡片的行（结束标记 / 组合体内部），不参与连线
             else:
@@ -1173,19 +1175,40 @@ class FlowCanvas(QWidget):
         return units
 
     def _build_edges(self):
-        """自动连线：**只在最外层**按「单元」顺序连。
+        """自动连线。
 
-        - 一个单元＝一个普通步骤卡片，或者一个循环 / 条件（整块当一端，
-          箭头直接落在它的虚线框上），所以「4. 点击 → 5. 循环框」会连上；
-        - **块内部（循环体、条件体、分支体）一条自动箭头都不画**：
-          先后顺序看编号就够了，也不会把并行的分支画成顺序；
-        - 想画哪条，选中框内节点 → 点它右边的小箭头 → 再点另一个节点，
-          只连这一条（要再连一条就再操作一遍）。
+        - 最外层按「单元」顺序连：一个单元＝一个普通步骤卡片，或者一个循环 /
+          条件（整块当一端，箭头直接落在它的虚线框上）；
+        - **条件 → 它的每个动作节点**：另外扇出一组蓝色箭头。条件是「谁成立走谁」，
+          连成一条顺序链就错了；
+        - 块内部（循环体 / 组合里）不画自动箭头：先后顺序看编号就够了。
         """
         units = self._units_in(0, len(self._steps))
         for k in range(len(units) - 1):
             self._add_edge(units[k], units[k + 1])
+        self._build_condition_edges()
         self._build_manual_edges()
+
+    def _build_condition_edges(self):
+        """条件卡片 → 它里面的每个动作节点，一条蓝色箭头。"""
+        for sp in self._spans:
+            if sp.kind != "condition":
+                continue
+            src_id = self._steps[sp.start].id
+            if src_id not in self._nodes:
+                continue
+            for row in blocks.direct_children(self._spans, sp):
+                dst_id = self._steps[row].id
+                if dst_id not in self._nodes:
+                    continue
+                a, b = self._endpoint(src_id), self._endpoint(dst_id)
+                if a is None or b is None:
+                    continue
+                edge = EdgeItem(color=REGION_COLORS["condition"], width=1.2)
+                self._scene.addItem(edge)
+                edge.connect_nodes(a, b)
+                self._edges.append(edge)
+                self._edge_pairs.append((edge, src_id, dst_id))
 
     def _add_edge(self, ref_a, ref_b) -> None:
         """连一条灰色箭头（任一端拿不到就跳过）。"""
@@ -1352,7 +1375,7 @@ class FlowCanvas(QWidget):
         return f"{num}. {shown}" if num else shown
 
     def _build_regions(self):
-        """循环 / 条件各画一个虚线框（嵌套时框也嵌套）；分支、组合不画框。
+        """循环 / 条件各画一个虚线框（嵌套时框也嵌套）；组合不画框。
 
         组合里面收着的循环 / 条件也不画框——组合在画布上就是一张卡片，
         框画出来反而像是「组合里还有东西露在外面」。
@@ -1368,7 +1391,7 @@ class FlowCanvas(QWidget):
         pending: List[Tuple[LoopRegion, blocks.Span]] = []
         for sp in self._spans:
             if sp.kind not in REGION_COLORS:
-                continue        # 分支 / 组合不套框
+                continue        # 组合不套框
             if sp.start in in_group:
                 continue        # 被组合收起来了，不画
             region = LoopRegion(REGION_COLORS[sp.kind], self, sp)
@@ -1445,14 +1468,11 @@ class FlowCanvas(QWidget):
 
     def _region_label(self, sp) -> str:
         """块框左上角的说明文字。"""
-        if sp.kind == "branch":
-            return f"↳ 分支（{self._branch_text_of(self._steps[sp.start])}）"
         if sp.kind == "condition":
             step = self._steps[sp.start]
             mode = "表达式" if (step.cond_mode or "rule") == "expr" else "规则"
-            count = sum(1 for k in range(sp.inner_lo, sp.inner_hi)
-                        if self._steps[k].action == "branch")
-            return f"↳ 条件（{mode}：{step.cond_expr or '未填'}，{count} 个分支）"
+            count = len(blocks.direct_children(self._spans, sp))
+            return f"↳ 条件（{mode}：{step.cond_expr or '未填'}，{count} 个动作节点）"
         step = self._steps[sp.start]
         expr = (step.loop_expr or "").strip()
         if not expr:

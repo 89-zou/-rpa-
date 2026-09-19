@@ -110,6 +110,17 @@ def _as_number(text: str) -> Optional[float]:
         return None
 
 
+def _rule_step(node: Any) -> Step:
+    """节点的规则挂在谁身上：块挂在它的开始标记上（组合/循环/条件都一样）。"""
+    return node.start if isinstance(node, Block) else node
+
+
+def _node_label(node: Any) -> str:
+    """日志里怎么称呼一个节点。"""
+    step = _rule_step(node)
+    return step.title or blocks.ACTION_CN.get(step.action, step.action)
+
+
 def _to_text(value: Any) -> str:
     """任意值转成可注入 {{变量}} 的文本。"""
     if value is None:
@@ -264,9 +275,8 @@ def step_var_fields(step: Step) -> List[str]:
     path = (step.data_cfg or {}).get("path")
     if isinstance(path, str):
         texts.append(path)
-    # 条件分支要比较的值也允许写 {{变量}}（运行时先渲染再比）
-    texts += [blocks.condition_branch_value(step, i)
-              for i in range(len(step.cond_branches or []))]
+    # 作为「条件」里的一个动作节点时，它自带的值也可以写 {{变量}}
+    texts.append(step.cond_value)
     # 「采集数据」的行定位、字段定位与属性名里也允许写 {{变量}}
     texts.append(step.collect_row)
     for item in step.collect_fields or []:
@@ -464,6 +474,17 @@ def check_variables(steps: List[Step],
         seen.add(key)
         problems.append(f"步骤 {step_id}：{text}")
 
+    # 条件里「直属动作节点」的位置：下标 → (条件下标, 第几个, 一共几个, 判断方式)
+    cond_children: Dict[int, Tuple[int, int, int, str]] = {}
+    all_spans = blocks.spans(steps)
+    for sp in all_spans:
+        if sp.kind != "condition":
+            continue
+        mode = steps[sp.start].cond_mode or "rule"
+        kids = blocks.direct_children(all_spans, sp)
+        for k, row in enumerate(kids):
+            cond_children[row] = (sp.start, k, len(kids), mode)
+
     # 先看「读取数据」节点自身配全了没有
     for name, node in produced.items():
         if node.action != "read_data":
@@ -471,7 +492,19 @@ def check_variables(steps: List[Step],
         if not (node.data_cfg or {}).get("type") or not (node.data_cfg or {}).get("path"):
             add(node.id, f"「读取数据」节点还没选好文件 / 文件夹（它要产出 {{{{{name}}}}}）")
 
-    for s in steps:
+    # 条件节点自己：判断的数据填了没有、里面有没有动作节点
+    for sp in all_spans:
+        if sp.kind != "condition":
+            continue
+        cond = steps[sp.start]
+        if not (cond.cond_expr or "").strip():
+            add(cond.id, "「条件」节点还没填「判断的数据」"
+                         "（双击节点填写，如 {{loop.item.标题}}）")
+        if not blocks.direct_children(all_spans, sp):
+            add(cond.id, "「条件」里还没有动作节点"
+                         "（在条件里点【＋ 点击创建新节点】加一个）")
+
+    for idx, s in enumerate(steps):
         if s.action == "read_data" and not (s.output_var or "").strip():
             add(s.id, "「读取数据」节点还没填产出变量名（双击节点填写，如 文章列表）")
         if s.action == "collect":
@@ -486,19 +519,17 @@ def check_variables(steps: List[Step],
         if s.action == "loop_start" and not (s.loop_expr or "").strip():
             add(s.id, "「循环」节点还没填循环内容（双击节点填写：数字＝跑几次，"
                       "或 {{变量}}＝按它的长度跑）")
-        if s.action == "condition_start" and (s.cond_mode or "rule") != "expr":
-            if not (s.cond_expr or "").strip():
-                add(s.id, "「条件」节点还没填「判断的数据」"
-                          "（双击节点填写，如 {{loop.item.标题}}）")
-            ops = [blocks.condition_branch_op(s, i)
-                   for i in range(len(s.cond_branches or []))]
-            for i, op in enumerate(ops):
-                if op and not blocks.condition_branch_value(s, i).strip():
-                    add(s.id, f"「条件」第 {i + 1} 个分支选了"
-                              f"「{blocks.COND_OP_CN[op]}」，但没填要比较的值")
-                if not op and i < len(ops) - 1:
-                    add(s.id, f"「条件」第 {i + 1} 个分支是兜底（无条件成立），"
-                              "排在它后面的分支永远轮不到——兜底要放在最后一个")
+        rule = cond_children.get(idx)
+        if rule and rule[3] != "expr":
+            _cond, order, total, _mode = rule
+            op = blocks.rule_op(s)
+            if op and not blocks.rule_value(s).strip():
+                add(s.id, f"「条件」里的第 {order + 1} 个动作节点选了"
+                          f"「{blocks.COND_OP_CN[op]}」，但没填要比较的值")
+            if not op and order < total - 1:
+                add(s.id, f"「条件」里的第 {order + 1} 个动作节点是兜底"
+                          "（无条件成立），排在它后面的永远轮不到"
+                          "——兜底要放在最后一个")
         for text in step_var_fields(s):
             for name in VAR_PATTERN.findall(text):
                 if name.startswith(LOOP_PREFIX):
@@ -835,36 +866,39 @@ class StepExecutor:
         elif block.kind == "condition":
             self._run_condition(block)
         else:
-            # 分支：结构壳子，按顺序跑里面的节点
-            # 组合：如果是「登录用」的组合、而这次登录态还有效，整块跳过
+            # 组合：结构壳子，按顺序跑里面的节点
+            #（如果是「登录用」的组合、而这次登录态还有效，整块跳过）
             if block.kind == "group" and self._skip_group(block):
                 return
             self._run_nodes(block.nodes)
 
     def _run_condition(self, block: Block):
-        """条件节点：算出结果，从上往下走第一个成立的分支；都不成立就整块跳过。"""
+        """条件节点：算出结果，从上往下走第一个成立的动作节点；都不成立就整块跳过。
+
+        动作节点自带规则（判断方式 + 值）；它本身也可能是「组合」之类的块，
+        那就整块执行。
+        """
         step = block.start
         if (step.cond_mode or "rule") == "expr":
             result, is_bool = self._condition_result(step)
             self.log(f"[条件] 表达式 {step.cond_expr} → 结果「{result}」")
-            for i, br in enumerate(block.branches):
-                if self._branch_hit(step, i, result, is_bool):
-                    self.log(f"  走分支「{blocks.condition_branch_name(step, i)}」")
-                    self._run_nodes(br.nodes)
+            for i, node in enumerate(block.nodes):
+                if self._expr_hit(_rule_step(node), i, result, is_bool):
+                    self.log(f"  走「{_node_label(node)}」")
+                    self._run_nodes([node])
                     return
-            self.log("  没有分支匹配，跳过条件体。")
+            self.log("  没有动作节点匹配，跳过条件体。")
             return
 
         data = self._condition_data(step)
         self.log(f"[条件] 数据 {step.cond_expr} → 「{data}」")
-        for i, br in enumerate(block.branches):
-            why = self._rule_hit(step, i, data)
+        for node in block.nodes:
+            why = self._rule_hit(_rule_step(node), data)
             if why:
-                self.log(f"  走分支「{blocks.condition_branch_name(step, i)}」"
-                         f"（{why}）")
-                self._run_nodes(br.nodes)
+                self.log(f"  走「{_node_label(node)}」（{why}）")
+                self._run_nodes([node])
                 return
-        self.log("  没有分支匹配，跳过条件体。")
+        self.log("  没有动作节点匹配，跳过条件体。")
 
     def _condition_data(self, step: Step) -> str:
         """规则模式：条件节点提供的那份数据（渲染掉 {{变量}} 再取文本）。"""
@@ -873,24 +907,24 @@ class StepExecutor:
             raise ValueError("条件节点还没填「判断的数据」，请点开条件节点填写")
         return self._resolve_value(raw).strip()
 
-    def _rule_hit(self, step: Step, index: int, data: str) -> str:
-        """规则模式：第 index 个分支成立吗？成立返回一句原因（写日志用）。
+    def _rule_hit(self, step: Step, data: str) -> str:
+        """这个动作节点成立吗？成立返回一句原因（写日志用），不成立返回空串。
 
-        · 判断方式留空＝兜底分支，无条件成立；
+        · 判断方式留空＝兜底，无条件成立；
         · 包含 / 不包含 / 等于 / 不等于：值支持逗号分隔多个，命中任意一个就算；
         · 大于 / 小于 / 大于等于 / 小于等于：两边都要能当数字。
         """
-        op = blocks.condition_branch_op(step, index)
+        op = blocks.rule_op(step)
         if not op:
             return "兜底"
-        raw = self._resolve_value(blocks.condition_branch_value(step, index)).strip()
+        raw = self._resolve_value(blocks.rule_value(step)).strip()
         if not raw:
             return ""                       # 值没填 → 不成立（保存时会提示补上）
         if op in blocks.COND_NUMBER_OPS:
             left, right = _as_number(data), _as_number(raw)
             if left is None or right is None:
                 raise ValueError(
-                    f"条件分支「{blocks.condition_branch_name(step, index)}」要按数字比，"
+                    f"「{_node_label(step)}」要按数字比，"
                     f"但「{data}」和「{raw}」不都是数字")
             hit = {"gt": left > right, "lt": left < right,
                    "ge": left >= right, "le": left <= right}[op]
@@ -906,8 +940,17 @@ class StepExecutor:
             hit = all(data != v for v in items)
         return f"{blocks.COND_OP_CN.get(op, op)} {raw}" if hit else ""
 
+    def _expr_hit(self, step: Step, index: int, result: str,
+                  is_bool: Optional[bool]) -> bool:
+        """表达式模式：真走第 1 个动作节点、假走第 2 个；算出别的值就按「值」匹配。"""
+        if is_bool is not None:
+            return index == (0 if is_bool else 1)
+        values = [self._resolve_value(v).strip()
+                  for v in blocks.rule_values(step)]
+        return result in values
+
     def _condition_result(self, step: Step):
-        """表达式模式的结果，返回 (文本, 是否布尔值)；布尔值 None 表示按值匹配分支。"""
+        """表达式模式的结果，返回 (文本, 是否布尔值)；布尔值 None 表示按值匹配动作节点。"""
         raw = (step.cond_expr or "").strip()
         if not raw:
             raise ValueError("条件节点还没填判断内容，请点开条件节点填写")
@@ -922,16 +965,6 @@ class StepExecutor:
         if isinstance(value, bool):
             return ("是" if value else "否"), value
         return str(value).strip(), None
-
-    def _branch_hit(self, step: Step, index: int, result: str,
-                    is_bool: Optional[bool]) -> bool:
-        """第 index 个分支是否命中。"""
-        if is_bool is not None:
-            # 表达式结果是真/假：真走第 1 个分支，假走第 2 个
-            return index == (0 if is_bool else 1)
-        values = [self._resolve_value(v).strip()
-                  for v in blocks.condition_branch_values(step, index)]
-        return result in values
 
     def _run_loop(self, block: Block):
         """按循环内容逐项执行循环体。
@@ -1075,7 +1108,7 @@ class StepExecutor:
             elif step.action == "call":
                 self._run_call(step)
             elif step.action in ("loop_start", "loop_end", "condition_start",
-                                 "condition_end", "branch"):
+                                 "condition_end"):
                 # 结构标记，正常路径在 blocks.parse 阶段已被剥离
                 self.log(f"  {step.action} 为结构标记，跳过")
             else:

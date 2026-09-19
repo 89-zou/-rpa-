@@ -19,7 +19,7 @@ import re
 import shutil
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from smart_tool import paths
 
@@ -97,18 +97,18 @@ class Step:
     #                  取值为整数则按该数；每一项注入 {{loop.item}}
     # 其他文本         按行/逗号切分成多项；只有一项就只跑一次
     loop_expr: str = ""
-    # ---- condition_start 专用：条件分支 ----
-    # cond_mode: rule  条件节点只提供「数据」（cond_expr 写 {{变量}}），
-    #                  每个分支自带判断方式（op）与值（value）：
-    #                  从上往下比，第一个成立的执行；op 为空＝兜底（else）
+    # ---- condition_start 专用：条件判断 ----
+    # cond_mode: rule  条件节点只提供「判断的数据」（cond_expr 写 {{变量}}）；
+    #                  块里**直属的动作节点**各自带一条规则（cond_op + cond_value），
+    #                  从上往下比，第一个成立的执行；cond_op 为空＝兜底（else）。
     #            expr  Python 表达式（能当数字的变量按数字代入），
-    #                  结果为 True/False 时走第 1/2 个分支，其他结果按值匹配
+    #                  结果为 True/False 时走第 1/2 个动作节点，其他结果按值匹配
     cond_mode: str = "rule"
     cond_expr: str = ""
-    # 分支清单，顺序＝各分支块的先后：
-    #   [{"name": "公示公告", "op": "contains", "value": "公示"}, …]
-    # op 的取值见 core/blocks.py 的 COND_OPS；空串＝兜底，必须放最后
-    cond_branches: List[Dict[str, str]] = field(default_factory=list)
+    # ---- 动作节点的规则：它是「条件」里的一个直属节点时才有意义 ----
+    # cond_op 见 core/blocks.py 的 COND_OPS；空串＝兜底，必须放在最后一个
+    cond_op: str = ""
+    cond_value: str = ""
     # ---- 桌面场景专用（scene=desktop）----
     win_title: str = ""                  # win_activate：窗口标题里的一小段
     keys: str = ""                       # hotkey：要按的键，如 ctrl+s、enter
@@ -190,7 +190,10 @@ class Step:
             d["cond_mode"] = self.cond_mode
             if self.cond_expr:
                 d["cond_expr"] = self.cond_expr
-            d["cond_branches"] = [dict(m) for m in self.cond_branches]
+        if self.cond_op or self.cond_value:
+            # 这个动作节点摆在「条件」里，自带一条规则（判断方式 + 值）
+            d["cond_op"] = self.cond_op
+            d["cond_value"] = self.cond_value
         if self.action == "win_activate" and self.win_title:
             d["win_title"] = self.win_title
         if self.action == "hotkey" and self.keys:
@@ -246,8 +249,8 @@ class Step:
             loop_expr=d.get("loop_expr", ""),
             cond_mode=d.get("cond_mode") or "rule",
             cond_expr=d.get("cond_expr", ""),
-            cond_branches=[dict(m) for m in d.get("cond_branches", [])
-                           if isinstance(m, dict)],
+            cond_op=d.get("cond_op", ""),
+            cond_value=d.get("cond_value", ""),
             win_title=d.get("win_title", ""),
             keys=d.get("keys", ""),
             click_times=int(d.get("click_times", 1) or 1),
@@ -602,7 +605,7 @@ def rename_field_refs(steps: List[Step], old_node: Step, new_node: Step,
     for i, s in enumerate(steps):
         if i == skip:
             continue
-        # 直接改步骤对象自己的字段（url / value / cond_branches / data_cfg.path …）
+        # 直接改步骤对象自己的字段（url / value / cond_value / data_cfg.path …）
         _rename_in(s.__dict__, mapping, hits)
     return [f"{{{{{old}}}}} → {{{{{new}}}}}（{hits.get(old, 0)} 处）"
             for old, new in pairs if hits.get(old, 0)]
@@ -758,34 +761,172 @@ def _remap_endpoint(value: Any, id_map: Dict[Any, int]) -> Any:
     return id_map.get(value, value)
 
 
+#: 容器开始标记 → 结束标记（迁移时用来跳过整块）
+_BLOCK_STARTS = {"loop_start": "loop_end", "condition_start": "condition_end",
+                 "group_start": "group_end"}
+_BLOCK_ENDS = set(_BLOCK_STARTS.values())
+
+
 def _migrate_conditions(steps: List[Dict[str, Any]]) -> None:
-    """条件节点升级成新写法（每次 load 都会跑）。
+    """条件节点升级成「条件提供数据 + 动作节点自带规则」（每次 load 都会跑）。
 
-    旧版只有「变量相等 / 表达式」两种判断方式，分支里存一个 `values`（匹配值，
-    逗号分隔）。现在条件节点只负责提供「数据」，判断方式下沉到每个分支：
+    旧写法：条件体里用 `branch` 标记分段，每段的规则存在条件的 `cond_branches` 里。
 
-        变量相等：判断内容 {{作者}} + 分支匹配值 "J.K. Rowling, Jane Austen"
-        →  规则：判断数据 {{作者}} + 分支「等于」"J.K. Rowling, Jane Austen"
+        条件（判断内容 {{标题}}）
+          分支
+            点击 公示公告        ← 配置记在条件上：[{名: 公示公告, 包含, 公示}]
+          分支
+            点击 申报通知
+          条件结束
 
-    匹配值本来就是「命中任意一个就行」，跟新写法的逗号多值语义一致，
-    所以只换字段名（values → value），不改变任何行为。
+    新写法：没有分支标记了，条件体里的**直属动作节点**各自带一条规则
+    （`cond_op` / `cond_value`），从上往下第一个成立的就执行那一个：
+
+        条件（判断的数据 {{标题}}）
+          点击 公示公告          ← cond_op=contains cond_value=公示
+          点击 申报通知          ← cond_op=contains cond_value=申报
+          条件结束
+
+    一段里不止一个步骤的（示例项目里就有），自动收成一个「组合」、规则挂在组合上，
+    行为跟原来完全一致；空的段补一个记号节点，免得把规则弄丢。
+    旧的「变量相等」判断方式同时升级成「规则 + 等于」（匹配值本来就是
+    「命中任意一个就行」，跟逗号多值语义一致）。
     """
-    for s in steps:
-        if s.get("action") != "condition_start":
-            continue
-        if not s.get("cond_mode") or s.get("cond_mode") == "equal":
-            s["cond_mode"] = "rule"
-        for m in (s.get("cond_branches") or []):
-            if not isinstance(m, dict):
-                continue
-            if "values" in m:                        # 旧字段：匹配值
-                old = str(m.pop("values") or "")
-                if not m.get("value"):
-                    m["value"] = old
-                if "op" not in m and s.get("cond_mode") == "rule":
-                    m["op"] = "eq"                   # 旧行为就是「相等」
-            m.setdefault("op", "")
-            m.setdefault("value", "")
+    next_id = max([int(s.get("id") or 0) for s in steps] or [0]) + 1
+
+    def new_id() -> int:
+        nonlocal next_id
+        next_id += 1
+        return next_id - 1
+
+    def block_end(nodes: List[Dict[str, Any]], start: int) -> int:
+        """start 是容器开始标记 → 配对结束标记的下标（找不到就给最后一行）。"""
+        depth = 0
+        for k in range(start, len(nodes)):
+            a = nodes[k].get("action")
+            if a in _BLOCK_STARTS:
+                depth += 1
+            elif a in _BLOCK_ENDS:
+                depth -= 1
+                if depth == 0:
+                    return k
+        return len(nodes) - 1
+
+    def chunks(nodes: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any],
+                                                          Optional[List[Dict[str, Any]]],
+                                                          Optional[Dict[str, Any]],
+                                                          str]]:
+        """把一层里的节点切成「块」：(开始标记, 内部, 结束标记, 动作)。
+
+        普通步骤的内部与结束标记是 None；容器（循环 / 条件 / 组合）整块算一个。
+        只认本层的标记 —— 嵌套在里面的块由调用方递归处理，不会跟本层的
+        「分支」标记混在一起。
+        """
+        out = []
+        i = 0
+        while i < len(nodes):
+            s = nodes[i]
+            a = s.get("action")
+            if a in _BLOCK_STARTS:
+                end = block_end(nodes, i)
+                out.append((s, nodes[i + 1:end], nodes[end], a))
+                i = end + 1
+            else:
+                out.append((s, None, None, a))
+                i += 1
+        return out
+
+    def placeholder(op: str, value: str, index: int) -> Dict[str, Any]:
+        """旧写法里某一段一个步骤都没有 → 放个记号节点，把规则留着。"""
+        return {"id": new_id(), "action": "note", "text": "",
+                "title": f"（原来第 {index + 1} 个分支下面没有动作节点）",
+                "cond_op": op, "cond_value": value}
+
+    def wrap(seg: List[Dict[str, Any]], op: str, value: str,
+             index: int, name: str = "") -> List[Dict[str, Any]]:
+        """一段里不止一个步骤 → 收成一个组合，规则挂在组合开始上。
+
+        组合沿用旧分支的名字（如「已登录」），省得用户还想知道原来叫啥。
+        """
+        start: Dict[str, Any] = {
+            "id": new_id(), "action": "group_start",
+            "title": name or f"原来第 {index + 1} 个分支的步骤",
+            "cond_op": op, "cond_value": value,
+        }
+        if seg[0].get("pos"):
+            start["pos"] = list(seg[0]["pos"])
+        end: Dict[str, Any] = {"id": new_id(), "action": "group_end"}
+        if seg[-1].get("pos"):
+            end["pos"] = list(seg[-1]["pos"])
+        return [start] + seg + [end]
+
+    def rebuild(cond: Dict[str, Any],
+                inner: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把「分支标记分段」的老条件体，改成「动作节点自带规则」。
+
+        已经是新写法（没有分支标记、条件上也没有 cond_branches）的直接跳过 ——
+        每次 load 都会跑一遍迁移，不能把好好的结构再包一次组合。
+        """
+        if "cond_branches" not in cond and not any(
+                s.get("action") == "branch" for s in inner):
+            return walk(inner)
+
+        rules = [dict(m) for m in (cond.pop("cond_branches", None) or [])
+                 if isinstance(m, dict)]
+        was_equal = (cond.get("cond_mode") or "equal") == "equal"
+        if was_equal:
+            cond["cond_mode"] = "rule"
+
+        # 按本层的「分支」标记切段（嵌套在里面的块整体算一个节点）
+        segments: List[List[Any]] = [[]]
+        for chunk in chunks(inner):
+            if chunk[3] == "branch":
+                segments.append([])
+            else:
+                segments[-1].append(chunk)
+        if len(segments) > 1 and not segments[0]:
+            segments.pop(0)          # 第一个分支标记之前一定是空的，去掉这个空壳
+
+        out: List[Dict[str, Any]] = []
+        for k, seg in enumerate(segments):
+            rule = rules[k] if k < len(rules) else {}
+            op = str(rule.get("op") or "").strip()
+            value = rule.get("value")
+            if value is None:
+                value = rule.get("values") or ""
+            value = str(value)
+            if not op and was_equal:
+                op = "eq"
+            nodes: List[Dict[str, Any]] = []
+            for s, body, end, a in seg:
+                nodes.append(s)
+                if body is not None:
+                    nodes.extend(rebuild(s, body) if a == "condition_start"
+                                 else walk(body))
+                    nodes.append(end)
+            if not nodes:
+                out.append(placeholder(op, value, k))
+            elif len(seg) == 1:
+                nodes[0]["cond_op"] = op
+                nodes[0]["cond_value"] = value
+                out.extend(nodes)
+            else:
+                out.extend(wrap(nodes, op, value, k,
+                                str(rule.get("name") or "")))
+        return out
+
+    def walk(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """升级一个层级的节点列表（递归进循环 / 条件 / 组合）。"""
+        out: List[Dict[str, Any]] = []
+        for s, body, end, a in chunks(nodes):
+            out.append(s)
+            if body is not None:
+                out.extend(rebuild(s, body) if a == "condition_start"
+                           else walk(body))
+                out.append(end)
+        return out
+
+    steps[:] = walk(steps)
 
 
 def migrate_project(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:

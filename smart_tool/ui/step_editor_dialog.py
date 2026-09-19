@@ -41,16 +41,16 @@ from smart_tool.ui.screen_capture import ScreenCaptureDialog
 WEB_ACTIONS = [
     "navigate", "read_data", "collect", "click", "fill", "select",
     "note", "pause_for_human", "loop_start", "loop_end", "condition_start",
-    "condition_end", "branch", "script", "call",
+    "condition_end", "script", "call",
 ]
 # 桌面场景能用的动作（没有浏览器，也就没有 XPath / 下拉选择）
 DESKTOP_ACTIONS = [
     "win_activate", "click", "fill", "hotkey", "delay", "read_data",
     "note", "pause_for_human", "loop_start", "loop_end", "condition_start",
-    "condition_end", "branch", "script", "call",
+    "condition_end", "script", "call",
 ]
 # 新建步骤时不出现在菜单里的动作：这些标记由系统配对生成
-NEW_STEP_HIDDEN = {"loop_end", "condition_end", "branch"}
+NEW_STEP_HIDDEN = {"loop_end", "condition_end"}
 ACTION_LABELS = {
     "navigate": "打开网页 navigate",
     "read_data": "读取数据 read_data（读文件夹/文件 → 产出一个列表变量）",
@@ -62,9 +62,8 @@ ACTION_LABELS = {
     "pause_for_human": "暂停等人工 pause_for_human",
     "loop_start": "循环 loop（自动带上「循环结束」，夹在中间的步骤会重复执行）",
     "loop_end": "循环结束（设置与「循环开始」共用，点哪个都是编辑这个循环）",
-    "condition_start": "条件 if/else（自动带上分支与「条件结束」，按结果走某个分支）",
+    "condition_start": "条件 if/else（自动带上「条件结束」；块里的动作节点自带判断方式）",
     "condition_end": "条件结束（设置与「条件」共用，点哪个都是编辑这个条件）",
-    "branch": "分支（判断方式在「条件」节点里改，点它会打开那个条件）",
     "script": "自由代码 script（Python / JavaScript）",
     "call": "调用函数 call（调用【项目管理…】→【函数库】里定义好的函数）",
     # 桌面场景
@@ -78,14 +77,9 @@ DESKTOP_LABEL_SUFFIX = {
 }
 # 条件判断方式
 COND_MODES = [
-    ("rule", "规则（条件提供数据，每个分支选判断方式＋值）"),
+    ("rule", "规则（条件只提供数据，每个动作节点自带判断方式＋值）"),
     ("expr", "表达式（写一段 Python，适合复杂判断）"),
 ]
-# 分支表的表头（按判断方式切换；第二列在表达式模式下藏着）
-BRANCH_HEADERS_RULE = ["分支名（自己看得懂就行）", "判断方式",
-                       "值（逗号分隔＝任一命中）"]
-BRANCH_HEADERS_EXPR = ["分支名（自己看得懂就行）", "判断方式",
-                       "匹配值（表达式是真/假时可留空）"]
 SCRIPT_LANGS = [("python", "Python（本地执行）"),
                 ("javascript", "JavaScript（在网页里执行）")]
 
@@ -211,39 +205,41 @@ LOOP_HELP = (
     "· {{loop.index}}        —— 现在是第几轮（从 1 开始）\n"
     "\n"
     "【想多个循环嵌套】直接在里面再放一个循环就行；\n"
-    "【想循环里带条件】把「条件」节点放进去，它按结果走不同分支。\n"
+    "【想循环里带条件】把「条件」节点放进去，块里的每个动作节点自带判断方式。\n"
     "\n"
     "【循环跑几行】由「开始」和「结束」之间的步骤决定；\n"
     "想让某一步不参与循环，把它挪到「循环结束」后面去。"
 )
 
 COND_HELP = (
-    "执行时会先算出「判断的数据」，然后从上往下找第一个成立的分支，\n"
-    "只执行那个分支里的步骤；一个都不成立就整段跳过（后面的步骤照常执行）。\n"
+    "条件节点只负责给出「判断的数据」，判断方式写在块里的每个动作节点上。\n"
+    "执行时先算出这份数据，再从上往下看各动作节点，第一个成立的执行；\n"
+    "一个都不成立就整段跳过（后面的步骤照常执行）。\n"
+    "\n"
+    "【怎么摆】\n"
+    "条件节点下面直接放要做的事（在条件里点【＋ 点击创建新节点】加）。\n"
+    "一个动作要好几步？先选中那几步【合并成组合】，再让条件指向那个组合。\n"
+    "放在越前面的动作节点优先级越高。\n"
     "\n"
     "【规则】（推荐）\n"
-    "「判断的数据」写一个变量（如 {{loop.item.标题}}），每个分支自己写条件：\n"
+    "「判断的数据」写一个变量（如 {{loop.item.标题}}），\n"
+    "再双击块里的动作节点，填它的「条件判断」：\n"
     "· 判断方式：包含 / 不包含 / 等于 / 不等于 / 大于 / 小于 / 大于等于 / 小于等于；\n"
     "· 值：要拿来做比较的内容。包含 / 不包含 / 等于 / 不等于 可以写多个，\n"
     "  用逗号分隔（如 公示,公告），命中任意一个就成立；\n"
     "· 大小比较按数字比，两边都要能当数字（比如 5 和 10）。\n"
     "\n"
-    "【兜底】（判断方式选「兜底」）\n"
-    "这一条不判断、无条件成立，相当于 else —— 「前面都不满足」就往这里走。\n"
-    "所以它必须放在最后一个，否则排在它后面的分支永远轮不到。\n"
+    "【兜底】（判断方式留空）\n"
+    "这个动作不判断、无条件成立，相当于 else —— 「前面都不成立」就往这里走。\n"
+    "所以要放在块里的最后一个，否则排在它后面的动作永远轮不到。\n"
     "\n"
     "【表达式】（复杂判断才用）\n"
     "写一段 Python 表达式，里面的 {{变量}} 会按数字 / 文本自动代入。\n"
-    "结果是真 / 假 → 走第 1 / 2 个分支；算出来是别的值 → 按匹配值走。\n"
-    "\n"
-    "【分支】\n"
-    "· 分支的先后就是判断顺序（列表里从上到下）；\n"
-    "· 分支名只是给你自己看的，随便起；\n"
-    "· 点【添加分支】加一个，选中后可以删除——删分支会连同它里面的步骤一起删掉。\n"
+    "算出来是真 / 假 → 按动作节点的先后走（真走第 1 个、假走第 2 个）；\n"
+    "算出来是别的值 → 跟各动作节点里填的「值」比。\n"
     "\n"
     "【配对】\n"
-    "「条件 / 分支 / 条件结束」是配套的：设置只有一份，\n"
-    "点「条件结束」或某个分支标记，打开的也都是这个条件节点。"
+    "「条件 / 条件结束」是配套的：设置只有一份，点哪一端都是编辑这个条件节点。"
 )
 
 NOTE_HELP = (
@@ -349,12 +345,16 @@ class StepEditDialog(QDialog):
 
     def __init__(self, project_dir: Path, step: Optional[Step] = None,
                  parent=None, variable_names: Optional[List[str]] = None,
-                 default_url: str = "", scene: str = "web"):
+                 default_url: str = "", scene: str = "web",
+                 rule_mode: Optional[str] = None):
         super().__init__(parent)
         self.project_dir = Path(project_dir)
         self.img_dir = self.project_dir / "img"
         self._editing = step is not None
         self._step_id = step.id if step else 0
+        # 这个节点摆在「条件」里时，块里那个条件的判断方式（rule / expr）；
+        # 不是条件里的节点就是 None —— 那种情况下没有「条件判断」这一栏
+        self.rule_mode = rule_mode
         # 可插入的变量名（自定义变量 + 读取节点产出的 + loop.*）
         self._var_names_list = list(variable_names or [])
         # 元素捕获时默认打开的地址（项目里第一个「打开网页」）
@@ -398,6 +398,38 @@ class StepEditDialog(QDialog):
             "动作类型（打开网页/点击/循环…）会另外用一行小灰字标出来。"
         )
         form.addRow("名称：", self.title_edit)
+
+        # --- 这个节点摆在「条件」里时：它自带一条规则（判断方式 + 值）---
+        self.rule_op_combo = QComboBox()
+        for key, label in blocks.COND_OPS:
+            self.rule_op_combo.addItem(label, key)
+        self.rule_value_edit = QLineEdit()
+        self.rule_value_edit.setPlaceholderText("要比较的值，如 公示,公告")
+        self.rule_row = QWidget()
+        rule_layout = QHBoxLayout(self.rule_row)
+        rule_layout.setContentsMargins(0, 0, 0, 0)
+        rule_layout.addWidget(self.rule_op_combo)
+        rule_layout.addWidget(self.rule_value_edit, 1)
+        form.addRow("条件判断：", self.rule_row)
+        self.rule_hint = QLabel("")
+        self.rule_hint.setWordWrap(True)
+        self.rule_hint.setStyleSheet("color: #888;")
+        form.addRow("", self.rule_hint)
+        self._rule_widgets = [self.rule_row, self.rule_hint]
+        if self.rule_mode == "expr":
+            self.rule_value_edit.setPlaceholderText(
+                "表达式算出来不是真/假时，按这个值匹配（可留空）")
+            self.rule_hint.setText(
+                "这个节点在「条件」里。上面的表达式算出来是真/假时，"
+                "按动作节点的先后走（真走第 1 个、假走第 2 个）；"
+                "算出来是别的值，才按这里的值匹配。"
+            )
+        else:
+            self.rule_hint.setText(
+                "这个节点在「条件」里：条件节点只负责给出数据，"
+                "规则写在各自动作节点上。判断方式留空＝兜底"
+                "（上面都不成立时走这里，所以要放在最后一个）。"
+            )
 
         # --- navigate 组 ---
         self.url_edit = QLineEdit()
@@ -679,44 +711,16 @@ class StepEditDialog(QDialog):
         self.cond_hint.setStyleSheet("color: #888;")
         form.addRow("", self.cond_hint)
 
-        self.branch_table = QTableWidget(0, 3)
-        self.branch_table.setHorizontalHeaderLabels(BRANCH_HEADERS_RULE)
-        self.branch_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.ResizeToContents)
-        self.branch_table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.ResizeToContents)
-        self.branch_table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.Stretch)
-        self.branch_table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows)
-        self.branch_table.setMinimumHeight(120)
-        form.addRow("分支：", self.branch_table)
-
-        branch_btns = QWidget()
-        bb = QHBoxLayout(branch_btns)
-        bb.setContentsMargins(0, 0, 0, 0)
-        self.btn_add_branch = QPushButton("＋ 添加分支")
-        self.btn_add_branch.clicked.connect(self._on_add_branch)
-        bb.addWidget(self.btn_add_branch)
-        self.btn_del_branch = QPushButton("－ 删除选中分支")
-        self.btn_del_branch.clicked.connect(self._remove_branch_row)
-        bb.addWidget(self.btn_del_branch)
-        self.cond_count_label = QLabel("")
-        self.cond_count_label.setStyleSheet("color:#777;")
-        bb.addWidget(self.cond_count_label, 1)
-        form.addRow("", branch_btns)
-
         self.cond_branch_hint = help_row(
-            "从上往下找第一个匹配的分支，只执行那一个；都不匹配就整段跳过。",
-            "条件与分支", COND_HELP)
+            "条件体里的每个动作节点自带一条「判断方式 + 值」，"
+            "从上往下第一个成立的那个执行；都不成立就整段跳过。",
+            "条件与动作节点", COND_HELP)
         form.addRow("", self.cond_branch_hint)
 
         self._cond_widgets = [
             self.cond_mode_combo, self.cond_row, self.cond_hint,
-            self.branch_table, branch_btns, self.cond_branch_hint,
+            self.cond_branch_hint,
         ]
-        # 被删除的分支行号（原下标），保存时由调用方据此删掉分支标记
-        self._dropped_branches: list = []
 
         # --- 自由代码节点（script）：写一个真正的函数，系统自动调用它 ---
         self.script_lang_combo = QComboBox()
@@ -856,6 +860,10 @@ class StepEditDialog(QDialog):
 
         for w in self._navigate_widgets:
             self._show(w, action == "navigate")
+        # 「条件判断」只在编辑「条件里的动作节点」时出现
+        for w in self._rule_widgets:
+            self._show(w, self.rule_mode is not None)
+        self.rule_op_combo.setVisible(self.rule_mode == "rule")
         for w in self._read_widgets:
             self._show(w, is_read)
         for w in self._collect_widgets:
@@ -935,11 +943,6 @@ class StepEditDialog(QDialog):
         self.adjustSize()
 
     def _on_action_changed(self):
-        # 新建条件节点时先给两个分支：一个待填条件的，一个兜底的
-        if (not self._editing and self._current_action() == "condition_start"
-                and self.branch_table.rowCount() == 0):
-            self._add_branch_row("分支 1", op="contains")
-            self._add_branch_row("兜底", op="")
         self._on_cond_mode_changed()
         self._sync_visibility()
 
@@ -1068,7 +1071,7 @@ class StepEditDialog(QDialog):
             SCRIPT_PLACEHOLDER_JS if is_js else SCRIPT_PLACEHOLDER_PY)
 
     # ------------------------------
-    # 条件分支表
+    # 条件节点
     # ------------------------------
     def _on_cond_mode_changed(self):
         is_expr = self.cond_mode_combo.currentData() == "expr"
@@ -1078,16 +1081,12 @@ class StepEditDialog(QDialog):
         )
         self.cond_hint.setText(
             "表达式里可以直接写 {{变量}}（系统会按数字/文本自动代入）；\n"
-            "算出来是真/假 → 走第 1 / 2 个分支，算出来是别的值 → 按下面的匹配值走。"
+            "算出来是真/假 → 按动作节点的先后走（真走第 1 个、假走第 2 个），"
+            "算出来是别的值 → 按各动作节点的值匹配。"
             if is_expr else
-            "把「判断的数据」渲染出来，从上往下跟每个分支的条件比，\n"
-            "第一个成立的执行；都不成立就跳过。判断方式选「兜底」的分支无条件成立（放最后）。"
+            "条件只负责给出这份数据；判断方式写在块里的每个动作节点上，\n"
+            "从上往下第一个成立的执行，都不成立就跳过。"
         )
-        # 表达式模式不分「判断方式」，把那一列藏起来
-        self.branch_table.setHorizontalHeaderLabels(
-            BRANCH_HEADERS_EXPR if is_expr else BRANCH_HEADERS_RULE)
-        self.branch_table.setColumnHidden(1, is_expr)
-        self._update_branch_count()
 
     def _insert_cond_var(self, index: int):
         """把选中的变量插入到「判断的数据」光标处。"""
@@ -1097,76 +1096,6 @@ class StepEditDialog(QDialog):
         self.cond_expr_edit.insert(f"{{{{{name}}}}}")
         self.cond_expr_edit.setFocus()
         self.cond_var_combo.setCurrentIndex(0)
-
-    def _branch_op_at(self, row: int) -> str:
-        """某一行的判断方式（空串＝兜底）。"""
-        combo = self.branch_table.cellWidget(row, 1)
-        return (combo.currentData() if isinstance(combo, QComboBox) else "") or ""
-
-    def _on_add_branch(self):
-        """点【＋ 添加分支】：新行插在最后一个「兜底」之前。
-
-        兜底必须留在最后（它无条件成立），而分支顺序现在还不能拖动调整，
-        所以要由这里保证新增的分支不会被兜底挡住。
-        """
-        row = self.branch_table.rowCount()
-        if (self.cond_mode_combo.currentData() != "expr" and row > 0
-                and not self._branch_op_at(row - 1)):
-            row -= 1
-        self._add_branch_row(f"分支 {row + 1}", op="contains", at=row)
-
-    def _add_branch_row(self, name: str = "", op: str = "",
-                        value: str = "", origin: int = -1,
-                        at: Optional[int] = None) -> int:
-        """加一行分支；origin 是它在原清单里的下标（新建的为 -1）。"""
-        last = self.branch_table.rowCount()
-        row = last if at is None else max(0, min(int(at), last))
-        self.branch_table.insertRow(row)
-        name_item = QTableWidgetItem(name)
-        name_item.setData(Qt.ItemDataRole.UserRole, origin)
-        self.branch_table.setItem(row, 0, name_item)
-
-        op_combo = QComboBox()
-        for key, label in blocks.COND_OPS:
-            op_combo.addItem(label, key)
-        op_combo.setCurrentIndex(max(0, op_combo.findData(op)))
-        self.branch_table.setCellWidget(row, 1, op_combo)
-
-        self.branch_table.setItem(row, 2, QTableWidgetItem(value))
-        self._update_branch_count()
-        return row
-
-    def _remove_branch_row(self):
-        row = self.branch_table.currentRow()
-        if row < 0:
-            QMessageBox.information(self, "提示", "请先在表里点一下要删除的分支。")
-            return
-        name_item = self.branch_table.item(row, 0)
-        origin = name_item.data(Qt.ItemDataRole.UserRole) if name_item else -1
-        if isinstance(origin, int) and origin >= 0:
-            self._dropped_branches.append(origin)
-        self.branch_table.removeRow(row)
-        self._update_branch_count()
-
-    def _read_branches(self) -> list:
-        out = []
-        for r in range(self.branch_table.rowCount()):
-            name_item = self.branch_table.item(r, 0)
-            op_combo = self.branch_table.cellWidget(r, 1)
-            value_item = self.branch_table.item(r, 2)
-            out.append({
-                "name": (name_item.text() if name_item else "").strip(),
-                "op": (op_combo.currentData() if isinstance(op_combo, QComboBox)
-                       else "") or "",
-                "value": (value_item.text() if value_item else "").strip(),
-            })
-        return out
-
-    def _update_branch_count(self):
-        n = self.branch_table.rowCount()
-        self.cond_count_label.setText(
-            f"共 {n} 个分支" + ("（至少要 1 个）" if n < 1 else "")
-        )
 
     # ------------------------------
     # 截图选择 / 元素捕获
@@ -1409,11 +1338,11 @@ class StepEditDialog(QDialog):
         mode_idx = self.cond_mode_combo.findData(s.cond_mode or "rule")
         self.cond_mode_combo.setCurrentIndex(max(0, mode_idx))
         self.cond_expr_edit.setText(s.cond_expr or "")
-        self.branch_table.setRowCount(0)
-        for i, m in enumerate(s.cond_branches or []):
-            self._add_branch_row(m.get("name", ""), m.get("op", ""),
-                                 m.get("value", ""), origin=i)
         self._on_cond_mode_changed()
+        if self.rule_mode is not None:
+            self.rule_op_combo.setCurrentIndex(
+                max(0, self.rule_op_combo.findData(s.cond_op or "")))
+            self.rule_value_edit.setText(s.cond_value or "")
 
         self.note_edit.setText(s.note)
 
@@ -1523,24 +1452,6 @@ class StepEditDialog(QDialog):
                     "条件节点必须填写「判断的数据」"
                     "（规则模式填变量，如 {{loop.item.标题}}；表达式模式写 Python 表达式）"
                 )
-            branches = self._read_branches()
-            if not branches:
-                errors.append("条件节点至少要有一个分支（点【＋ 添加分支】）")
-            elif self.cond_mode_combo.currentData() != "expr":
-                miss = [str(i + 1) for i, b in enumerate(branches)
-                        if b["op"] and not b["value"]]
-                if miss:
-                    errors.append(
-                        "第 " + "、".join(miss)
-                        + " 个分支选了判断方式，但没填要比较的值"
-                    )
-                early = [i + 1 for i, b in enumerate(branches[:-1])
-                         if not b["op"]]
-                if early:
-                    errors.append(
-                        f"第 {early[0]} 个分支是兜底（无条件成立），"
-                        "排在它后面的分支永远轮不到——兜底要放在最后一个"
-                    )
         elif action == "script":
             code = self.script_code.toPlainText()
             if not code.strip():
@@ -1558,6 +1469,15 @@ class StepEditDialog(QDialog):
                 errors.append(
                     "调用函数节点必须选一个函数"
                     "（还没定义过？去【项目管理…】→【函数库】新建一个）"
+                )
+
+        # 这个节点在「条件」里：选了判断方式却没填值，跑起来永远不会成立
+        if self.rule_mode == "rule":
+            op = self.rule_op_combo.currentData() or ""
+            if op and not self.rule_value_edit.text().strip():
+                errors.append(
+                    f"「条件判断」选了「{blocks.COND_OP_CN.get(op, op)}」，"
+                    "但没填要比较的值"
                 )
 
         if errors:
@@ -1652,9 +1572,11 @@ class StepEditDialog(QDialog):
         elif action == "condition_start":
             step.cond_mode = self.cond_mode_combo.currentData()
             step.cond_expr = self.cond_expr_edit.text().strip()
-            step.cond_branches = self._read_branches()
-            # 界面记下的「被删掉的分支行号」，调用方据此删掉对应分支标记
-            step.cond_dropped = sorted(set(self._dropped_branches))
+
+        if self.rule_mode is not None:
+            # 这个节点摆在「条件」里：它自带的规则
+            step.cond_op = self.rule_op_combo.currentData() or ""
+            step.cond_value = self.rule_value_edit.text().strip()
 
         step.note = self.note_edit.text().strip()
         return step

@@ -1,27 +1,27 @@
 # -*- coding: utf-8 -*-
 """步骤结构解析：把线性的 steps 列表解析成「块树」，执行与界面共用同一套规则。
 
-容器（块）有四种：
+容器（块）有三种：
 - 循环   `loop_start` … `loop_end`            配置存在「循环开始」节点上
-- 条件   `condition_start` … `condition_end`  配置存在「条件」节点上（判断方式 + 分支清单）
-- 分支   `branch` 是条件块内部的段落标记：从它到下一个 `branch`（或条件结束）
-         之间的步骤属于这个分支
+- 条件   `condition_start` … `condition_end`  条件节点只提供「判断的数据」，
+         块里**直属的动作节点**各自带一条规则（判断方式 + 值）：
+         从上往下第一个成立的执行，所以节点的先后就是优先级；
+         判断方式留空＝兜底（相当于 else）。一个动作想要多步，就把它收成「组合」。
 - 组合   `group_start` … `group_end`          把连着的一串步骤收成一个、起个名字，
          画布上只显示一张卡片；名字存在「组合开始」节点的 title 上
 
-块可以互相嵌套（分支里放循环、循环里放条件……）。
+块可以互相嵌套（条件里放循环、循环里放条件、组合里放条件……）。
 
 本模块只做结构，不依赖 PyQt；执行器用 `parse()` 得到块树，界面用 `spans()` 得到
 「哪个块占了哪几行」以及每行该缩进几级。
 """
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 from smart_tool.core.project_store import Step
 
 LOOP_START, LOOP_END = "loop_start", "loop_end"
 COND_START, COND_END = "condition_start", "condition_end"
-BRANCH = "branch"
 GROUP_START, GROUP_END = "group_start", "group_end"
 
 # 容器：开始标记 → (块类型, 结束标记)
@@ -33,8 +33,7 @@ CONTAINERS = {
 # 结束标记 → 块类型
 END_KINDS = {LOOP_END: "loop", COND_END: "condition", GROUP_END: "group"}
 # 所有结构标记（不是真正的动作步骤）
-MARKERS = (LOOP_START, LOOP_END, COND_START, COND_END, BRANCH,
-           GROUP_START, GROUP_END)
+MARKERS = (LOOP_START, LOOP_END, COND_START, COND_END, GROUP_START, GROUP_END)
 # 成对标记的「结束端」：画布上不画卡片（流程编辑里能看到）
 END_MARKERS = tuple(END_KINDS)
 #: 不占「顺序编号」的结构标记：结束端（循环/条件/组合结束）只是收尾，组合开始也只是壳
@@ -44,7 +43,7 @@ REGION_KINDS = ("loop", "condition")
 
 ACTION_CN = {
     LOOP_START: "循环开始", LOOP_END: "循环结束",
-    COND_START: "条件", COND_END: "条件结束", BRANCH: "分支",
+    COND_START: "条件", COND_END: "条件结束",
     GROUP_START: "组合", GROUP_END: "组合结束",
 }
 
@@ -58,18 +57,13 @@ class StructureError(ValueError):
 
 @dataclass
 class Block:
-    """一个块（循环 / 条件 / 分支）。"""
-    kind: str                                  # loop | condition | branch
+    """一个块（循环 / 条件 / 组合）。"""
+    kind: str                                  # loop | condition | group
     start: Step                                # 起始标记
-    end: Optional[Step] = None                 # 结束标记（分支没有）
+    end: Optional[Step] = None                 # 结束标记
     nodes: List["Node"] = field(default_factory=list)
     start_idx: int = -1                        # 起始标记在 steps 里的下标
-    end_idx: int = -1                          # 结束标记下标；分支＝内部最后一个步骤下标
-
-    @property
-    def branches(self) -> List["Block"]:
-        """条件块内的分支（按顺序）。"""
-        return [n for n in self.nodes if isinstance(n, Block) and n.kind == "branch"]
+    end_idx: int = -1                          # 结束标记下标
 
     @property
     def steps(self) -> List[Step]:
@@ -121,27 +115,17 @@ def _parse_nodes(steps: List[Step], i: int,
         a = s.action
         if a in stops:
             return nodes, i
-        if a == LOOP_START:
-            inner, j = _parse_nodes(steps, i + 1, (LOOP_END,))
+        if a in CONTAINERS:
+            kind, end_marker = CONTAINERS[a]
+            inner, j = _parse_nodes(steps, i + 1, (end_marker,))
             if j >= len(steps):
                 raise StructureError(
-                    f"步骤 {s.id} 的「循环开始」缺少配对的「循环结束」"
+                    f"步骤 {s.id} 的「{ACTION_CN[a]}」缺少配对的"
+                    f"「{ACTION_CN[end_marker]}」"
                 )
-            nodes.append(Block("loop", s, steps[j], inner, i, j))
+            nodes.append(Block(kind, s, steps[j], inner, i, j))
             i = j + 1
-        elif a == GROUP_START:
-            inner, j = _parse_nodes(steps, i + 1, (GROUP_END,))
-            if j >= len(steps):
-                raise StructureError(
-                    f"步骤 {s.id} 的「组合」缺少配对的「组合结束」"
-                )
-            nodes.append(Block("group", s, steps[j], inner, i, j))
-            i = j + 1
-        elif a == COND_START:
-            block, j = _parse_condition(steps, i)
-            nodes.append(block)
-            i = j + 1
-        elif a in (LOOP_END, COND_END, BRANCH, GROUP_END):
+        elif a in END_KINDS:
             raise StructureError(
                 f"步骤 {s.id} 的「{ACTION_CN.get(a, a)}」没有对应的开始标记"
                 "（是不是被挪到外面了？）"
@@ -152,43 +136,15 @@ def _parse_nodes(steps: List[Step], i: int,
     return nodes, i
 
 
-def _parse_condition(steps: List[Step],
-                     i: int) -> Tuple[Block, int]:
-    """解析一个条件块：内部按「分支」标记切成若干分支。"""
-    start = steps[i]
-    branches: List[Block] = []
-    pending: Optional[int] = None          # 当前分支标记的下标
-    j = i + 1
-    while True:
-        inner, j = _parse_nodes(steps, j, (COND_END, BRANCH))
-        if pending is None:
-            if inner:
-                raise StructureError(
-                    f"步骤 {start.id} 的条件里，「分支」之前不能放步骤"
-                    "（请在前面先加一个分支）"
-                )
-        else:
-            branches.append(Block("branch", steps[pending], None, inner,
-                                  pending, j - 1))
-        if j >= len(steps):
-            raise StructureError(
-                f"步骤 {start.id} 的「条件」缺少配对的「条件结束」"
-            )
-        if steps[j].action == COND_END:
-            return Block("condition", start, steps[j], branches, i, j), j
-        pending = j                        # 下一个分支标记
-        j += 1
-
-
 # ------------------------------
 # 平坦视角：每个块占了哪几行
 # ------------------------------
 @dataclass
 class Span:
     """平坦 steps 列表里的一个块范围。"""
-    kind: str            # loop | condition | branch
+    kind: str            # loop | condition | group
     start: int           # 起始标记下标
-    end: int             # 结束标记下标；分支＝内部最后一个步骤下标（空分支＝起始标记下标）
+    end: int             # 结束标记下标
     depth: int           # 嵌套层级，最外层 0
     inner_lo: int = 0    # 内部范围（左闭右开）：缩进、拆分单元用
     inner_hi: int = 0
@@ -198,13 +154,9 @@ class Span:
         return self.start <= index <= self.end
 
     @property
-    def is_branch(self) -> bool:
-        return self.kind == "branch"
-
-    @property
     def insert_pos(self) -> int:
         """往这个块末尾插步骤的位置（插到结束标记之前）。"""
-        return self.end + 1 if self.is_branch else self.end
+        return self.end
 
 
 def spans(steps: List[Step]) -> List[Span]:
@@ -222,21 +174,39 @@ def _collect(nodes: List[Node], depth: int, out: List[Span]):
     for n in nodes:
         if not isinstance(n, Block):
             continue
-        if n.kind == "branch":
-            inner_lo, inner_hi = n.start_idx + 1, n.end_idx + 1
-        else:
-            inner_lo, inner_hi = n.start_idx + 1, n.end_idx
         out.append(Span(n.kind, n.start_idx, n.end_idx, depth,
-                        inner_lo, inner_hi))
+                        n.start_idx + 1, n.end_idx))
         _collect(n.nodes, depth + 1, out)
+
+
+def direct_children(all_spans: List[Span], sp: Span) -> List[int]:
+    """块 sp 的**直属**子节点行号（嵌套块整个算作一个节点）。"""
+    nested = {x.start: x for x in all_spans if x.depth == sp.depth + 1}
+    out: List[int] = []
+    i = sp.inner_lo
+    while i < sp.inner_hi:
+        inner = nested.get(i)
+        out.append(i)
+        i = (inner.end + 1) if inner is not None else i + 1
+    return out
+
+
+def rule_owner_span(steps: List[Step], index: int) -> Optional[Span]:
+    """index 作为「条件里的一个动作节点」时返回那个条件块，否则 None。
+
+    只认直属子节点：嵌在循环 / 组合 / 更里层条件里的节点不带自己的判断方式。
+    """
+    all_spans = spans(steps)
+    for sp in all_spans:
+        if sp.kind == "condition" and index in direct_children(all_spans, sp):
+            return sp
+    return None
 
 
 def span_by_marker(all_spans: List[Span], index: int) -> Optional[Span]:
     """index 正好是某个块的起始/结束标记 → 返回那个块。"""
     for sp in all_spans:
-        if index == sp.start:
-            return sp
-        if not sp.is_branch and index == sp.end:
+        if index == sp.start or index == sp.end:
             return sp
     return None
 
@@ -256,17 +226,11 @@ def enclosing_span(all_spans: List[Span], index: int,
 def marker_owner_index(steps: List[Step], index: int) -> int:
     """标记节点对应的「配置节点」下标，普通步骤返回它自己。
 
-    循环结束 → 循环开始；条件结束 / 分支 → 条件。
+    循环结束 → 循环开始；条件结束 → 条件。
     （设置只有一份，点哪一端都是编辑同一个块）
     """
-    all_spans = spans(steps)
-    sp = span_by_marker(all_spans, index)
-    if sp is None:
-        return index
-    if sp.kind == "branch":
-        cond = enclosing_span(all_spans, sp.start, ("condition",))
-        return cond.start if cond is not None else index
-    return sp.start
+    sp = span_by_marker(spans(steps), index)
+    return index if sp is None else sp.start
 
 
 def move_bounds(steps: List[Step], index: int) -> Tuple[int, int]:
@@ -280,14 +244,12 @@ def move_bounds(steps: List[Step], index: int) -> Tuple[int, int]:
 def depths(steps: List[Step]) -> List[int]:
     """每个步骤该缩进几级（界面列表用）。
 
-    容器的开始/结束标记与它所在层对齐；容器内部的步骤缩进一层；
-    条件里的「分支」标记也缩进一层（它属于条件内部）。
+    容器的开始/结束标记与它所在层对齐；容器内部的步骤缩进一层。
     """
     result = [0] * len(steps)
     for sp in spans(steps):
         result[sp.start] = sp.depth
-        if not sp.is_branch:
-            result[sp.end] = sp.depth
+        result[sp.end] = sp.depth
         for k in range(sp.inner_lo, sp.inner_hi):
             result[k] = max(result[k], sp.depth + 1)
     return result
@@ -381,10 +343,10 @@ def can_group(steps: List[Step], lo: int, hi: int) -> Optional[str]:
         inside = lo <= sp.start and sp.end <= hi      # 选中的范围把整个块包住
         nested = sp.start <= lo and hi <= sp.end      # 选中的范围整个缩在块里面
         # 两种都不算「切开」：整个包住＝块被收进去；缩在里面＝新组合嵌在这个块里
-        # （循环里、条件分支里都能再合并出一个组合）
+        # （循环里、条件里都能再合并出一个组合）
         if overlap and not (inside or nested):
             name = {"loop": "循环", "condition": "条件",
-                    "branch": "分支", "group": "组合"}.get(sp.kind, sp.kind)
+                    "group": "组合"}.get(sp.kind, sp.kind)
             return (f"选中的范围把一个「{name}」切成了两半：\n"
                     "要么把整个块一起选上，要么只选它里面的步骤。")
     return None
@@ -431,10 +393,13 @@ def ungroup(steps: List[Step], index: int) -> Optional[str]:
     return name
 
 
-#: 分支的判断方式（key, 界面上的中文名）。
-#: 空串＝兜底分支：不判断，无条件命中（相当于 else），必须放在最后。
+# ------------------------------
+# 条件里动作节点的「规则」（判断方式 + 值）
+# ------------------------------
+#: 判断方式（key, 界面上的中文名）。
+#: 空串＝兜底：不判断、无条件成立（相当于 else），必须放在最后。
 COND_OPS = [
-    ("", "兜底（上面都不匹配时走这里）"),
+    ("", "兜底（上面都不成立时走这里）"),
     ("contains", "包含"),
     ("not_contains", "不包含"),
     ("eq", "等于"),
@@ -451,144 +416,68 @@ COND_MULTI_OPS = ("contains", "not_contains", "eq", "ne")
 COND_NUMBER_OPS = ("gt", "lt", "ge", "le")
 
 
-def condition_branch_op(step: Step, index: int) -> str:
-    """条件节点第 index 个分支的判断方式（空串＝兜底）。"""
-    if index < 0 or index >= len(step.cond_branches or []):
+def rule_op(step: Step) -> str:
+    """这个动作节点的判断方式（空串＝兜底）。"""
+    return str(getattr(step, "cond_op", "") or "").strip()
+
+
+def rule_value(step: Step) -> str:
+    """这个动作节点要比较的值（原文，可含 {{变量}}）。"""
+    return str(getattr(step, "cond_value", "") or "")
+
+
+def rule_values(step: Step) -> List[str]:
+    """值清单（逗号分隔，已去空）——表达式模式下用它做「按值匹配」。"""
+    return [x.strip() for x in rule_value(step).replace("，", ",").split(",")
+            if x.strip()]
+
+
+def rule_summary(step: Step, index: int, mode: str = "rule") -> str:
+    """动作节点在流程编辑 / 画布上的规则摘要（没填规则时返回空串）。"""
+    if mode == "expr":
+        values = "、".join(rule_values(step))
+        if values:
+            return f"匹配 {values}"
+        if index == 0:
+            return "真"
+        if index == 1:
+            return "假"
         return ""
-    return str(step.cond_branches[index].get("op") or "").strip()
-
-
-def condition_branch_value(step: Step, index: int) -> str:
-    """条件节点第 index 个分支要比较的值（原文，可含 {{变量}}）。"""
-    if index < 0 or index >= len(step.cond_branches or []):
-        return ""
-    return str(step.cond_branches[index].get("value") or "")
-
-
-def condition_branch_values(step: Step, index: int) -> List[str]:
-    """第 index 个分支的值清单（逗号分隔，已去空）。"""
-    raw = condition_branch_value(step, index).replace("，", ",")
-    return [x.strip() for x in raw.split(",") if x.strip()]
-
-
-def condition_branch_name(step: Step, index: int) -> str:
-    """条件节点第 index 个分支的显示名。"""
-    if index < 0 or index >= len(step.cond_branches or []):
-        return f"分支 {index + 1}"
-    name = (step.cond_branches[index].get("name") or "").strip()
-    return name or f"分支 {index + 1}"
-
-
-def condition_branch_summary(step: Step, index: int) -> str:
-    """分支在画布 / 列表上的摘要文字（两种判断方式各有一套写法）。"""
-    name = condition_branch_name(step, index)
-    if (step.cond_mode or "rule") == "expr":
-        values = "、".join(condition_branch_values(step, index))
-        return f"{name}：{values}" if values else name
-    op = condition_branch_op(step, index)
+    op = rule_op(step)
     if not op:
-        return f"{name}（兜底）"
-    value = condition_branch_value(step, index).strip()
-    return f"{name}（{COND_OP_CN.get(op, op)} {value}）"
+        return "兜底"
+    value = rule_value(step).strip()
+    return f"{COND_OP_CN.get(op, op)} {value}".strip()
 
 
-def new_branch(name: str = "", op: str = "", value: str = "") -> Dict[str, str]:
-    """新建一条分支定义（界面用）。"""
-    return {"name": name, "op": op, "value": value}
+def rule_mode_at(steps: List[Step], pos: int) -> Optional[str]:
+    """在 pos 这个位置插入节点时，它会不会落在某个「条件」里。
 
-
-# ------------------------------
-# 条件分支清单与分支标记的同步
-# ------------------------------
-def normalize_branch_lists(steps: List[Step]) -> bool:
-    """让每个条件节点的「分支清单」条数＝它的分支标记个数（多了截断、少了补空）。
-
-    单一数据源：分支个数由结构（分支标记）决定，清单只负责存名字与匹配值。
-    返回是否改动过。
+    落在里面就返回那个条件的判断方式（rule / expr），否则 None ——
+    两个界面用它决定「新建节点」的对话框要不要显示「条件判断」那一栏。
     """
-    changed = False
     for sp in spans(steps):
-        if sp.kind != "condition":
-            continue
-        cond = steps[sp.start]
-        count = sum(1 for k in range(sp.inner_lo, sp.inner_hi)
-                    if steps[k].action == BRANCH)
-        items = [dict(m) for m in (cond.cond_branches or [])]
-        if len(items) == count:
-            continue
-        if len(items) > count:
-            items = items[:count]
-        else:
-            items += [new_branch() for _ in range(count - len(items))]
-        cond.cond_branches = items
-        changed = True
-    return changed
-
-
-def apply_condition_edit(steps: List[Step], cond_index: int,
-                         new_step: Step) -> str:
-    """把条件节点的改动落到步骤结构上（原地改 steps），返回提示信息。
-
-    - `new_step.cond_dropped`（界面记下的、被删掉的分支行号）→ 删掉对应的分支
-      标记连同分支里的步骤；
-    - 剩下的按「分支清单条数＝分支标记个数」补齐或截断。
-    """
-    dropped = sorted({i for i in (getattr(new_step, "cond_dropped", []) or [])},
-                     reverse=True)
-    notes: List[str] = []
-    for i in dropped:
-        sp = _span_at(steps, cond_index, "condition")
-        if sp is None:
-            break
-        marks = [k for k in range(sp.inner_lo, sp.inner_hi)
-                 if steps[k].action == BRANCH]
-        if i >= len(marks):
-            continue          # 行号早就变了（比如同时删了两个），跳过
-        m = marks[i]
-        end = _branch_end(steps, m)
-        notes.append(f"已删掉第 {i + 1} 个分支（含 {end - m} 个步骤）")
-        del steps[m:end + 1]
-    nxt = steps[cond_index]
-    nxt.cond_mode = new_step.cond_mode
-    nxt.cond_expr = new_step.cond_expr
-    nxt.cond_branches = [dict(m) for m in (new_step.cond_branches or [])]
-    normalize_branch_lists(steps)
-    return "；".join(notes)
-
-
-def drop_branch_entry(steps: List[Step], branch_index: int) -> None:
-    """删掉某个分支标记时，顺手去掉条件节点里对应的那条分支定义。
-
-    不做这一步的话，剩下的分支会顶着上一分支的名字与匹配值（清单条数还是对的，
-    但对应关系错了）。
-    """
-    all_spans = spans(steps)
-    sp = span_by_marker(all_spans, branch_index)
-    if sp is None or sp.kind != "branch":
-        return
-    cond = enclosing_span(all_spans, sp.start, ("condition",))
-    if cond is None:
-        return
-    order = [k for k in range(cond.inner_lo, cond.inner_hi)
-             if steps[k].action == BRANCH]
-    if branch_index not in order:
-        return
-    bi = order.index(branch_index)
-    cond_step = steps[cond.start]
-    items = [dict(m) for m in (cond_step.cond_branches or [])]
-    if 0 <= bi < len(items):
-        del items[bi]
-        cond_step.cond_branches = items
-
-
-def _span_at(steps: List[Step], index: int, kind: str) -> Optional[Span]:
-    for sp in spans(steps):
-        if sp.kind == kind and sp.start == index:
-            return sp
+        if sp.kind == "condition" and sp.inner_lo <= pos <= sp.end:
+            return steps[sp.start].cond_mode or "rule"
     return None
 
 
-def _branch_end(steps: List[Step], branch_idx: int) -> int:
-    """分支标记之后到下一个分支/条件结束之前的位置（含）。"""
-    sp = _span_at(steps, branch_idx, "branch")
-    return sp.end if sp else branch_idx
+def apply_default_rule(steps: List[Step], index: int) -> None:
+    """新插进来的节点如果正好落在「条件」里，给它补一条默认规则。
+
+    默认给「包含」（值留空＝暂时不成立），等用户去填。**不能默认成兜底**：
+    兜底无条件成立，摆在前面的兜底会把后面的动作全挡住。
+    表达式模式不用判断方式，这里不碰。
+    """
+    if not (0 <= index < len(steps)):
+        return
+    step = steps[index]
+    # 结束端标记不可能是条件里的动作节点；别的（含循环/组合/条件的开始标记，
+    # 它们整个块算一个动作节点）都该拿到默认规则
+    if step.action in END_MARKERS or step.cond_op or step.cond_value:
+        return
+    owner = rule_owner_span(steps, index)
+    if owner is None:
+        return
+    if (steps[owner.start].cond_mode or "rule") == "rule":
+        step.cond_op = "contains"
