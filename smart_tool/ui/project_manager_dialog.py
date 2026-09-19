@@ -74,6 +74,12 @@ class ProjectManagerDialog(QDialog):
         self.list_widget.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
         )
+        # 名字再长也不让它把右边挤变形：超长就省略号，鼠标停上去看完整信息
+        self.list_widget.setMaximumWidth(300)
+        self.list_widget.setWordWrap(False)
+        self.list_widget.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.list_widget.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list_widget.itemSelectionChanged.connect(self._on_selection_changed)
         self.list_widget.itemDoubleClicked.connect(self._open_selected)
         left.addWidget(self.list_widget, 1)
@@ -467,10 +473,15 @@ class ProjectManagerDialog(QDialog):
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
         for s in self._stores:
-            item = QListWidgetItem(
-                f"{s.name}    （{len(s.load_steps())} 步，{s.image_count()} 张截图）"
-            )
+            steps = s.load_steps()
+            item = QListWidgetItem(f"{s.name}（{len(steps)} 步）")
             item.setData(Qt.ItemDataRole.UserRole, s.name)
+            # 列表宽度有限，名字长会被省略号截掉——完整信息放悬停提示里
+            item.setToolTip(
+                f"{s.name}\n{len(steps)} 步 ｜ {s.image_count()} 张截图 ｜ "
+                + ("桌面应用" if s.is_desktop else "网页自动化")
+                + "\n双击打开这个项目"
+            )
             self.list_widget.addItem(item)
             if s.name == select_name:
                 item.setSelected(True)

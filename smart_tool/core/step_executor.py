@@ -162,7 +162,7 @@ def step_var_fields(step: Step) -> List[str]:
     texts = [step.url, step.value, step.wait_target,
              step.resume_url, step.resume_element, step.prompt,
              step.loop_expr, step.cond_expr,
-             step.win_title, step.keys]
+             step.win_title, step.keys, step.text]
     # 定位也可以是变量（如 {{登录框}}：元素定位存在变量清单里）
     if step.locator is not None and step.locator.type != "image":
         texts.append(step.locator.value)
@@ -838,6 +838,8 @@ class StepExecutor:
                 self._hotkey(step)
             elif step.action == "delay":
                 self._delay(step)
+            elif step.action == "note":
+                self._note(step)
             elif step.action == "click":
                 if self.desktop:
                     self._desktop_click(step)
@@ -1105,6 +1107,18 @@ class StepExecutor:
             return
         self.log(f"  等 {secs:g}s")
         time.sleep(secs)
+
+    def _note(self, step: Step):
+        """「提示 / 日志」节点：把写在卡片上的话（含 {{变量}}）打进运行日志。
+
+        不碰浏览器、不碰桌面，纯粹是给自己看的：卡在哪一步、某个变量到底取到了
+        什么，插一个这种节点就知道了。画布上它也是一张说明卡片。
+        """
+        text = self._resolve_value(step.text or "").strip()
+        if not text:
+            return
+        for line in text.splitlines():
+            self.log(f"  {line}")
 
     def _read_data(self, step: Step):
         """「读取数据」节点：读文件 / 文件夹，把结果放进 output_var。

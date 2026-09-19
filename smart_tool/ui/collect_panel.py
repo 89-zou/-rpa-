@@ -125,11 +125,11 @@ class CollectPanel(QWidget):
         root.addWidget(self.row_area)
 
         btns = QHBoxLayout()
-        self.btn_add = QPushButton("＋ 添加字段 ▾")
+        self.btn_add = QPushButton("添加字段")
         self.btn_add.setToolTip("点开选一个常用字段；或选「空字段」自己填名字和定位")
         self.btn_add.setMenu(self._build_add_menu())
         btns.addWidget(self.btn_add)
-        self.btn_del = QPushButton("－ 删除选中行")
+        self.btn_del = QPushButton("删除选中行")
         self.btn_del.clicked.connect(self.remove_selected)
         btns.addWidget(self.btn_del)
         btns.addStretch()
