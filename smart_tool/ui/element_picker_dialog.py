@@ -1,359 +1,249 @@
 # -*- coding: utf-8 -*-
-"""元素捕获窗口：点一下拿到「XPath + 元素截图」。
+"""元素捕获窗口：**自动开浏览器**，你按住 Ctrl 点元素，抓到就自动收工。
 
-界面上只有一个地址栏和状态提示，真正的操作在浏览器里：
-鼠标划过页面元素会画橙框、并显示这个选择器命中几个；点一下就捕获。
+跟以前不一样的地方（都是为了「一步接一步抓、不用反复开网页」）：
+- 网址直接用这一步（或项目里第一个「打开网页」节点）的，不用手填、不用点开始；
+- 捕获期间**主界面会收起来**，抓完自动回来；
+- 页面里平时照常能点能滚，**按住 Ctrl** 才是「我要抓」（松开 Ctrl 就还给页面）；
+- **浏览器不关** —— 下一次捕获直接接着用你当前停留的页面（见 picker_session）。
 
-浏览器跑在独立线程（Playwright 同步 API 不能和 Qt 事件循环挤在一个线程），
-捕获结果通过信号回主线程。捕获完自动重新装填选择器，可以连着抓多个。
+所以这个窗口只是一条很小的「捕获条」：告诉你现在是什么情况，并留一个取消的出口。
 """
-import queue
-import re
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QInputDialog, QLabel,
-    QLineEdit, QMessageBox, QPushButton, QVBoxLayout,
+    QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
 )
 
-from smart_tool.core.element_picker import PICKER_JS, next_shot_path
 from smart_tool.core.project_store import ProjectStore
-from smart_tool.ui.help_tip import help_row
+from smart_tool.ui import picker_session
+from smart_tool.ui.help_tip import HelpButton
 
-NAV_TIMEOUT_MS = 120_000
-POLL_MS = 200
-
-#: 【?】里的完整说明（界面上只留一句摘要）
+#: 【?】里的完整说明（用户点开看的是纯文本，别用 markdown 记号）
 PICKER_HELP = (
-    "点【开始捕获】会打开一个浏览器窗口（用的是上面的网址）：\n"
+    "【怎么抓】浏览器会自己开好（用的是这一步的网址，不用你填、也不用点开始）。\n"
+    "· 按住 Ctrl 把鼠标划过页面 → 目标元素被橙框圈住，旁边显示这个写法\n"
+    "  「命中几个」；命中好几个说明不够准，最好换个元素或者换个写法。\n"
+    "· 按住 Ctrl 点一下 → 抓下它的 XPath，同时把元素截图存进项目 img/\n"
+    "  （以后 XPath 失效时可以拿这张图兜底）。\n"
+    "· 抓完浏览器里会弹一条绿提示，主界面自动回来。\n"
     "\n"
-    "· 鼠标划过元素 → 画橙框，并在旁边显示「这个选择器命中几个」；\n"
-    "  命中好几个说明这个写法不够准，最好换一个元素或换种写法。\n"
-    "· 点一下 → 抓下它的 XPath，同时把这个元素的截图存进项目 img/；\n"
-    "  这张图后面可以当「兜底截图」用（XPath 失效时靠它找位置）。\n"
-    "· 抓到没有，看页面就知道：点中的元素会被「绿框」圈住，\n"
-    "  屏幕顶端还会弹一条绿色提示「✓ 已捕获第 N 个」。\n"
+    "【松开 Ctrl 就恢复正常】不按 Ctrl 的时候页面照常能点能滚，翻页、展开菜单\n"
+    "都不会被拦下来 —— 可以先正常操作到目标页面，再按住 Ctrl 抓。\n"
     "\n"
-    "【可以连着抓】抓完会自动重新装填，接着点下一个就行，抓到满意为止点【完成】。\n"
-    "· 按 Esc 只是收起橙框（方便你看清页面），不会退出；\n"
-    "· 抓完最后留下的只有你选中那一次的元素截图，中间试的那些会自动删掉，\n"
-    "  不会在 img/ 里堆废图。\n"
+    "【浏览器不会关】抓到之后浏览器一直开着，下一次捕获直接接着用你当前停留的\n"
+    "页面：不用重新打开、不用重新登录、也不用重新点到那一层。\n"
+    "想把页面重新加载一遍，就把那个浏览器窗口关掉再抓一次。\n"
     "\n"
-    "【抓不到的情况】如果元素在 iframe 里，XPath 能拿到但截不到图——\n"
-    "这时可以自己裁剪一张图放进项目 img/ 当兜底。"
+    "【抓到的是元素，不是坐标】抓下来的是 XPath，页面改版时换个元素重抓就行，\n"
+    "不依赖屏幕位置；这也正是网页场景比桌面场景耐用的地方。\n"
+    "\n"
+    "【不想抓了】按 Esc，或者点这条上的【取消】，主界面一样会回来。"
 )
-
-
-class PickerWorker(QThread):
-    """后台线程：开浏览器 → 注入选择器 → 等人点 → 回传结果。"""
-
-    ready = pyqtSignal(str)        # 页面已打开（当前 URL）
-    picked = pyqtSignal(dict)      # 捕获结果
-    failed = pyqtSignal(str)       # 出错 / 浏览器被关掉
-    log = pyqtSignal(str)
-
-    def __init__(self, url: str, img_dir: Path, parent=None):
-        super().__init__(parent)
-        self._url = url
-        self._img_dir = Path(img_dir)
-        self._stop = False
-        self._picks: "queue.Queue[dict]" = queue.Queue()
-        self._page = None
-        self._seq = 0
-
-    # ------------------------------
-    # 主线程调用
-    # ------------------------------
-    def stop(self):
-        """请求收工（会关掉浏览器）。"""
-        self._stop = True
-
-    # ------------------------------
-    # 线程内
-    # ------------------------------
-    def _on_pick(self, payload):
-        """页面里点中元素时由 Playwright 回调（运行在本线程）。"""
-        self._picks.put(dict(payload or {}))
-
-    def _save_shot(self, payload: dict) -> str:
-        """把刚捕获的元素截下来，返回相对项目的路径（img/xxx.png）。
-
-        用 locator.screenshot()：它裁的就是元素精确边框，不受滚动/缩放影响。
-        iframe 里的元素（page 找不到这个 XPath）跳过截图，交给上层提示。
-        """
-        xpath = (payload.get("xpath") or "").strip()
-        if not xpath or not payload.get("top"):
-            return ""
-        try:
-            loc = self._page.locator(f"xpath={xpath}")
-            if loc.count() < 1:
-                return ""
-            self._img_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = next_shot_path(self._img_dir, f"{stamp}_{self._seq}")
-            loc.first.screenshot(path=str(path))
-            return f"img/{path.name}"
-        except Exception as e:
-            self.log.emit(f"元素截图失败（XPath 仍然可用）：{str(e).splitlines()[0][:100]}")
-            return ""
-
-    def _drain(self):
-        """把这一轮捕获结果发出去，并重新装填选择器（方便连着抓）。"""
-        while True:
-            try:
-                payload = self._picks.get_nowait()
-            except queue.Empty:
-                return
-            self._seq += 1
-            payload["image"] = self._save_shot(payload)
-            self.picked.emit(payload)
-            try:
-                self._page.evaluate(PICKER_JS)      # 重新装填，继续抓下一个
-            except Exception:
-                return
-
-    def run(self):
-        from playwright.sync_api import sync_playwright
-
-        from smart_tool.core import browser_setup
-
-        browser_setup.ensure_env()        # 内核可能在「程序目录旁的浏览器文件夹」里
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=False)
-                context = browser.new_context()
-                page = context.new_page()
-                self._page = page
-                page.expose_function("__trae_pick", self._on_pick)
-                page.add_init_script(PICKER_JS)
-                try:
-                    page.goto(self._url, wait_until="domcontentloaded",
-                              timeout=NAV_TIMEOUT_MS)
-                except Exception as e:
-                    self.failed.emit(f"打开网址失败：{str(e).splitlines()[0][:150]}")
-                    browser.close()
-                    return
-                self.ready.emit(page.url or self._url)
-
-                while not self._stop:
-                    if page.is_closed():
-                        self.failed.emit("浏览器窗口被关掉了，捕获结束。")
-                        break
-                    try:
-                        page.wait_for_timeout(POLL_MS)
-                    except Exception as e:
-                        if self._stop:
-                            break
-                        self.failed.emit(
-                            f"页面已关闭，捕获结束（{str(e).splitlines()[0][:80]}）"
-                        )
-                        break
-                    self._drain()
-                try:
-                    browser.close()
-                except Exception:
-                    pass
-        except Exception as e:
-            self.failed.emit(f"启动浏览器失败：{str(e).splitlines()[0][:150]}")
 
 
 class ElementPickerDialog(QDialog):
-    """捕获窗口。accept 后用 result_data 取结果。"""
+    """捕获条（accept 后用 result_data 取结果）。"""
 
     def __init__(self, url: str, project_dir: Path, parent=None):
-        super().__init__(parent)
+        # 故意**不要父窗口**：捕获期间主界面要藏起来，有父子关系的话会把它一起带走
+        super().__init__(None)
         self.setWindowTitle("元素捕获")
-        self.setMinimumWidth(640)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         self.project_dir = Path(project_dir)
         self.img_dir = self.project_dir / "img"
-        self._worker: Optional[PickerWorker] = None
-        self._hits: list = []
-        self._shots: list = []          # 这次捕获生成的截图（收尾时清掉没用的）
+        self._url = (url or "").strip()
+        self._home = parent.window() if parent is not None else None
+        self._home_hidden = False
+        self._wired: list = []
+        self._started = False
         self.result_data: Optional[dict] = None
-        self._init_ui(url)
+        self._init_ui()
 
     # ------------------------------
     # UI
     # ------------------------------
-    def _init_ui(self, url: str):
+    def _init_ui(self):
+        self.setFixedWidth(430)
         root = QVBoxLayout(self)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(6)
 
-        root.addWidget(help_row(
-            "点【开始捕获】，在浏览器里点元素（抓到会弹绿框提示）。",
-            "元素捕获", PICKER_HELP))
+        head = QHBoxLayout()
+        title = QLabel("按住 Ctrl 点元素＝捕获")
+        title.setStyleSheet("font-weight: 600;")
+        head.addWidget(title)
+        head.addStretch(1)
+        head.addWidget(HelpButton("元素捕获", PICKER_HELP))
+        root.addLayout(head)
 
-        form = QFormLayout()
-        self.url_edit = QLineEdit(url)
-        self.url_edit.setPlaceholderText("https://example.com/login")
-        form.addRow("页面地址：", self.url_edit)
-        root.addLayout(form)
+        self.status = QLabel("正在打开浏览器…")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color: #555;")
+        root.addWidget(self.status)
 
         row = QHBoxLayout()
-        self.btn_start = QPushButton("开始捕获")
-        self.btn_start.clicked.connect(self._start)
-        row.addWidget(self.btn_start)
-        self.btn_stop = QPushButton("关闭浏览器")
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.clicked.connect(self._stop_worker)
-        row.addWidget(self.btn_stop)
-        self.status = QLabel("还没开始。")
-        self.status.setStyleSheet("color: #888;")
-        row.addWidget(self.status, 1)
+        row.addStretch(1)
+        self.btn_cancel = QPushButton("取消（Esc）")
+        self.btn_cancel.setToolTip(
+            "不抓了。已经开着的浏览器不会关，下次捕获接着用。")
+        self.btn_cancel.clicked.connect(self.reject)
+        row.addWidget(self.btn_cancel)
         root.addLayout(row)
 
-        self.result_label = QLabel("捕获结果会显示在这里。")
-        self.result_label.setWordWrap(True)
-        self.result_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.result_label.setStyleSheet("color: #0f766e;")
-        root.addWidget(self.result_label)
-
-        self.preview = QLabel("（还没抓到元素）")
-        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setFixedHeight(120)
-        self.preview.setStyleSheet(
-            "border: 1px dashed #bbb; border-radius: 4px; color: #999;"
-        )
-        root.addWidget(self.preview)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("完成")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
-
     # ------------------------------
-    # 起 / 停
+    # 开窗即开始捕获
     # ------------------------------
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._started:
+            self._started = True
+            # 等窗口真正摆好再藏主界面，免得藏完自己被顺手收起
+            QTimer.singleShot(0, self._start)
+
     def _start(self):
-        url = self.url_edit.text().strip()
-        if not url:
-            QMessageBox.warning(self, "提示", "请先填页面地址。")
+        if self._wired:
+            return          # 已经在抓了：重复进来（show 了两次）别再接一遍信号
+        self._hide_home()
+        self._move_to_corner()
+        session = picker_session.shared()
+        self._wire(session)
+        session.capture(self._url, self.img_dir)
+
+    def _wire(self, session):
+        """接上会话的信号；收尾时必须摘掉 —— 会话是跨窗口复用的，
+        不摘的话下一个捕获条开起来时，上一条也会收到消息。"""
+        self._unwire()      # 兜底：万一是重复进来的，先把旧的摘干净再接
+        self._wired = [
+            (session.opened, self._on_opened),
+            (session.reused, self._on_reused),
+            (session.picked, self._on_picked),
+            (session.canceled, self._on_canceled),
+            (session.gone, self._on_gone),
+            (session.failed, self._on_failed),
+            (session.log, self._on_log),
+        ]
+        for sig, slot in self._wired:
+            sig.connect(slot)
+
+    def _unwire(self):
+        for sig, slot in self._wired:
+            try:
+                sig.disconnect(slot)
+            except Exception:
+                pass
+        self._wired = []
+
+    def _move_to_corner(self):
+        """摆到屏幕右上角：别挡住页面内容，也别跟浏览器抢地方。"""
+        try:
+            screen = self.screen().availableGeometry()
+            self.move(screen.right() - self.width() - 24, screen.top() + 24)
+        except Exception:
+            pass
+
+    # ------------------------------
+    # 主界面的藏 / 还
+    # ------------------------------
+    def _hide_home(self):
+        if self._home is None or self._home_hidden:
             return
-        if self._worker is not None:
+        try:
+            self._home.hide()
+            self._home_hidden = True
+        except Exception:
+            pass
+
+    def _show_home(self):
+        if self._home is None or not self._home_hidden:
             return
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        self.url_edit.setEnabled(False)
-        self.status.setText("正在打开浏览器…")
-        self._hits = []
-        self.result_data = None
-        self._worker = PickerWorker(url, self.img_dir, self)
-        self._worker.ready.connect(self._on_ready)
-        self._worker.picked.connect(self._on_picked)
-        self._worker.failed.connect(self._on_failed)
-        self._worker.log.connect(self.status.setText)
-        self._worker.start()
+        try:
+            self._home.show()
+            self._home.raise_()
+            self._home.activateWindow()
+        except Exception:
+            pass
+        finally:
+            self._home_hidden = False
 
-    def _stop_worker(self):
-        """关掉浏览器（捕获结束，但已经抓到的结果留着）。"""
-        if self._worker is not None:
-            self._worker.stop()
-        self.btn_stop.setEnabled(False)
-        self.status.setText("已请求关闭浏览器，已抓到的结果可以点【完成】使用。")
-
-    def _on_ready(self, url: str):
-        self.status.setText(f"页面已打开，请在浏览器里点一下目标元素：{url}")
-
-    def _on_failed(self, message: str):
+    # ------------------------------
+    # 会话的回调
+    # ------------------------------
+    def _on_log(self, message: str):
         self.status.setText(message)
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        self.url_edit.setEnabled(True)
-        self._worker = None
+
+    def _on_opened(self, _url: str):
+        self.status.setText(
+            "页面已打开。按住 Ctrl 划过元素看橙框，按住 Ctrl 点一下＝捕获；"
+            "不按 Ctrl 时页面照常能用。")
+
+    def _on_reused(self, url: str):
+        self.status.setText(
+            f"接着用已经开着的浏览器（当前：{url or '空白页'}）。"
+            "按住 Ctrl 点一下＝捕获。")
 
     def _on_picked(self, payload: dict):
-        self._hits.append(payload)
-        xpath = payload.get("xpath") or "（生成失败）"
-        count = payload.get("count", -1)
-        lines = [
-            f"✓ 已捕获第 {len(self._hits)} 个",
-            f"元素：{payload.get('desc', '')}",
-            f"XPath：{xpath}",
-            f"命中：{count} 个" + ("" if count == 1 else "（不唯一，建议换更稳的写法）"),
-            f"来源：{payload.get('why', '')}"
-            + ("" if payload.get("top") else "（在 iframe 内，XPath 需配合框架使用）"),
-        ]
-        image = payload.get("image") or ""
-        lines.append(f"截图：{image}" if image else "截图：没抓到（可用【选择截图…】手工裁剪）")
-        self.result_label.setText("\n".join(lines))
-        if image:
-            self._shots.append(self.project_dir / image)
-            self._show_preview(self.project_dir / image)
+        self._unwire()
+        self._show_home()
+        xpath = payload.get("xpath") or ""
         self.result_data = {
-            "xpath": xpath if count >= 0 else "",
-            "image": image,
-            "count": count,
+            "xpath": xpath,
+            "image": payload.get("image") or "",
+            "count": payload.get("count", -1),
             "desc": payload.get("desc", ""),
         }
-        self.status.setText(f"已捕获 {len(self._hits)} 个元素，可以继续点，或点【完成】使用。")
+        self.accept()
 
-    def _show_preview(self, path: Path):
-        pix = QPixmap(str(path))
-        if pix.isNull():
-            self.preview.setText("（截图无法预览）")
-            return
-        self.preview.setPixmap(
-            pix.scaled(self.preview.width() or 300, 110,
-                       Qt.AspectRatioMode.KeepAspectRatio,
-                       Qt.TransformationMode.SmoothTransformation)
-        )
+    def _on_canceled(self, reason: str):
+        self._unwire()
+        self._show_home()
+        self.reject()
+
+    def _on_gone(self, reason: str):
+        """浏览器被关掉了：把话留在条上让人看见，别弹模态框。"""
+        self._say_and_hold(reason)
+
+    def _on_failed(self, message: str):
+        """起不来（没网址、内核没装…）：同样留在条上。"""
+        self._say_and_hold(message)
+
+    def _say_and_hold(self, message: str):
+        """出错时：主界面还回来，但这条**不关**，把原因写在上面让人读完再关。
+
+        以前这里弹 QMessageBox：既挡视线、又在没有可见父窗口时不稳。
+        写在条上更省事 —— 条是置顶的，一定看得见。
+        """
+        self._unwire()
+        self._show_home()
+        self.status.setText(message)
+        self.status.setStyleSheet("color: #b45309;")
+        self.btn_cancel.setText("关闭")
+        self.btn_cancel.setToolTip("关掉这条提示。")
 
     # ------------------------------
     # 收尾
     # ------------------------------
-    def _on_accept(self):
-        if self.result_data is None:
-            QMessageBox.information(
-                self, "还没抓到",
-                "还没有捕获到元素。\n先点【开始捕获】，在浏览器里点一下目标元素。",
-            )
-            return
-        self.accept()
-
     def accept(self):
-        """完成：留下的只有最后选中的那张截图。"""
-        image = (self.result_data or {}).get("image") or ""
-        self._shutdown(keep=(self.project_dir / image) if image else None)
+        self._unwire()
+        self._show_home()
         super().accept()
 
     def reject(self):
-        """取消（含点右上角 ×、按 Esc）：关掉浏览器并清掉这次的截图。"""
-        self._shutdown(keep=None)
+        """取消（含点右上角 ×、按 Esc）：主界面还回来，但**不关浏览器**。"""
+        self._unwire()
+        self._show_home()
         super().reject()
 
-    def _shutdown(self, keep: Optional[Path]):
-        if self._worker is not None:
-            self._worker.stop()
-            self._worker.wait(4000)
-            self._worker = None
-        self._drop_unused_shots(keep)
-
-    def _drop_unused_shots(self, keep: Optional[Path]):
-        """删掉这次捕获生成、但最终没用上的截图。
-
-        抓一个点一个很容易试好几次；只有最后选中的那张会被写进步骤，
-        其余的留着只会在 img/ 里堆废图。
-        """
-        for p in self._shots:
-            if keep is not None and p == keep:
-                continue
-            try:
-                p.unlink()
-            except OSError:
-                pass
-        self._shots.clear()
+    def closeEvent(self, event):
+        self._unwire()
+        self._show_home()
+        super().closeEvent(event)
 
 
 def pick_element(parent, url: str, project_dir) -> Optional[dict]:
-    """开捕获窗口让用户点一个元素，返回它的信息（取消返回 None）。
+    """开捕获条让用户抓一个元素，返回它的信息（取消返回 None）。
 
     返回值就是 ElementPickerDialog.result_data：
     `{"xpath":…, "image":"img/xxx.png", "count":命中几个, "desc":元素描述}`。
@@ -368,8 +258,8 @@ def pick_element(parent, url: str, project_dir) -> Optional[dict]:
 def drop_capture_image(project_dir, data: dict) -> None:
     """「只要 XPath、不要元素截图」的地方收尾用：把那张图删掉。
 
-    捕获器只会留下最后一张截图（其余都自己清了），但很多地方（登录态体检、
-    采集行定位）根本用不上它，留着只会在项目 img/ 里堆废图。
+    捕获时顺手截的那张元素图，很多地方（登录态体检、采集行定位、验证码的辅助
+    位置）根本用不上，留着只会在项目 img/ 里堆废图。
     """
     rel = (data or {}).get("image") or ""
     if not rel:
@@ -386,6 +276,7 @@ def guess_locator_name(data: dict, taken=None) -> str:
     desc 长这样：`<a>#menu-posts “文章”`、`<input>#user_login`、`<div.item> “书”`。
     优先用元素上的文字，其次用 id；重名就往后加 2、3…
     """
+    import re
     desc = str((data or {}).get("desc") or "")
     m = re.search(r"[“\"](.+?)[”\"]", desc)
     base = re.sub(r"\s+", "", m.group(1)) if m else ""
@@ -406,6 +297,8 @@ def save_captured_locator(parent, project_dir, data: dict) -> str:
     - 同一个 XPath 已经存过 → 不再重复问，直接复用原来那个名字
     - 名字留空或取消 → 不存（只填在当前这个字段里）
     """
+    from PyQt6.QtWidgets import QInputDialog
+
     xpath = (data or {}).get("xpath") or ""
     xpath = xpath.strip()
     if not xpath:

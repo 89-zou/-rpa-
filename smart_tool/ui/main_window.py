@@ -4,6 +4,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QMessageBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
+from smart_tool.ui import picker_session
 from smart_tool.ui.web_automation_tab import WebAutomationTab
 
 
@@ -38,4 +39,9 @@ class MainWindow(QMainWindow):
                 return
             worker.stop()
             worker.wait(5000)
+        # 捕获用的那个浏览器是自己端着不放的（见 ui/picker_session），退出时收干净
+        try:
+            picker_session.shutdown()
+        except Exception:
+            pass
         event.accept()

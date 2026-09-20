@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
 
 from smart_tool.core import blocks, free_code, project_store
 from smart_tool.core.project_store import Locator, Step
+from smart_tool.ui import picker_session
 from smart_tool.ui.captcha_panel import CaptchaPanel
 from smart_tool.ui.code_editor import CodeEditor
 from smart_tool.ui.collect_panel import CollectPanel
@@ -567,15 +568,26 @@ class StepEditDialog(QDialog):
         self.btn_match.clicked.connect(lambda: self._open_window_match("main"))
         self.btn_capture = QPushButton("捕获元素…")
         self.btn_capture.setToolTip(
-            "打开浏览器窗口，在页面上点一下目标元素：\n"
-            "自动填好 XPath，并把元素的截图存进 img/ 当兜底。"
+            "打开浏览器，**按住 Ctrl 点一下**目标元素：\n"
+            "· 自动填好 XPath，并把元素截图存进 img/ 当兜底；\n"
+            "· 捕获期间主界面会收起来，抓完自动回来；\n"
+            "· 浏览器不会关——下一步捕获直接接着用你当前停留的页面。"
         )
         self.btn_capture.clicked.connect(lambda: self._capture_element("main"))
+        self.btn_trial = QPushButton("试运行")
+        self.btn_trial.setToolTip(
+            "在当前开着的捕获浏览器里，对这个元素跑一次这个动作：\n"
+            "先把元素圈出来，然后点它 / 填内容 / 选下拉项，\n"
+            "结果直接贴在浏览器页面顶端——一眼就能看出这个定位对不对。\n"
+            "（浏览器没开着时会提示你先捕获一次。）"
+        )
+        self.btn_trial.clicked.connect(self._trial_action)
         self.btn_pick_image = QPushButton("选择截图…")
         self.btn_pick_image.clicked.connect(self._pick_image)
         loc_layout.addWidget(self.locator_value, 1)
         loc_layout.addWidget(self.btn_match)
         loc_layout.addWidget(self.btn_capture)
+        loc_layout.addWidget(self.btn_trial)
         loc_layout.addWidget(self.btn_pick_image)
         self.loc_row = loc_row
         form.addRow("定位路径：", loc_row)
@@ -1031,6 +1043,9 @@ class StepEditDialog(QDialog):
         self.btn_capture.setVisible(
             show_loc and (self.desktop or loc_kind == "xpath"))
         self.btn_match.setVisible(show_loc and self.desktop)
+        # 「试运行」只在网页场景、且是「点了/填了/选了」这类动作时才有意义
+        self.btn_trial.setVisible(
+            not self.desktop and action in ("click", "fill", "select"))
         self._show(self.capture_hint, show_loc)
         for w in (self.fallback_row, self.fallback_hint):
             self._show(w, is_xpath)
@@ -1408,8 +1423,44 @@ class StepEditDialog(QDialog):
             QMessageBox.critical(self, "捕获失败",
                                  f"{type(e).__name__}: {e}")
 
+    def _trial_action(self):
+        """试运行：在**还开着的捕获浏览器**里，把这个元素跑一次。
+
+        为什么值得单独一个按钮：捕获只是「拿到了 XPath」，这个 XPath 到底能不能
+        点中、点中的是不是你要的那个，跑一下最清楚。结果会贴在浏览器页面顶端，
+        你能直接看着页面上发生什么。
+        """
+        action = self._current_action()
+        xpath = self.locator_value.text().strip()
+        if not xpath:
+            self.capture_hint.setText(
+                "还没有定位路径：先点【捕获元素…】按住 Ctrl 抓一个，再试运行。")
+            return
+        session = picker_session.shared()
+
+        def done(ok: bool, message: str):
+            try:
+                session.tried.disconnect(done)
+            except Exception:
+                pass
+            self.capture_hint.setText(("✓ " if ok else "✗ ") + message)
+
+        # 先接好再发命令：万一会话那边回得快，别让结果跑在连接前面
+        session.tried.connect(done)
+        self.capture_hint.setText(
+            "试运行中…（浏览器会切到前面，先把元素圈出来再动手，"
+            "结果会贴在页面顶端）")
+        session.trial({
+            "action": action,
+            "xpath": xpath,
+            "value": self.value_edit.text().strip(),
+        })
+
     def _capture_web_element(self, target: str):
-        """网页场景：打开浏览器点元素 → 拿到 XPath + 元素图（截图进兜底栏）。"""
+        """网页场景：按住 Ctrl 点元素 → 拿到 XPath + 元素图（截图进兜底栏）。
+
+        浏览器由常驻会话端着（见 ui/picker_session）：抓到不关，下一步捕获接着用。
+        """
         url = self.url_edit.text().strip() or self._default_url
         data = pick_element(self, url, self.project_dir)
         if not data:
@@ -1442,7 +1493,11 @@ class StepEditDialog(QDialog):
                 saved = save_captured_locator(self, self.project_dir, data)
                 more = (f"　已存成元素定位 {{{{{saved}}}}}（定位里写它就能复用）"
                         if saved else "")
-                self.capture_hint.setText(f"已捕获：{desc} → {xpath}{warn}{more}")
+                tip = ("　可以点【试运行】在浏览器里跑一下，看是不是想要的那个元素。"
+                       if self._current_action() in ("click", "fill", "select")
+                       else "")
+                self.capture_hint.setText(
+                    f"已捕获：{desc} → {xpath}{warn}{more}{tip}")
             if image and not self.fallback_edit.text().strip():
                 self.fallback_edit.setText(image)
         else:

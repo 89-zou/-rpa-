@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
-"""元素捕获器（网页）：在页面里点一下，同时拿到「稳健 XPath」和「元素截图」。
+"""元素捕获器（网页）：**按住 Ctrl** 点一下，同时拿到「稳健 XPath」和「元素截图」。
 
-怎么用：工具用 Playwright 打开一个可见的浏览器窗口，往每个页面注入 `PICKER_JS`，
-它会在你划过元素时画出橙框、并实时显示「这个选择器命中几个」；点一下就把结果
-通过 `window.__trae_pick` 回传给 Python。
+怎么用：工具用 Playwright 打开一个可见的浏览器窗口，往每个页面注入 `PICKER_JS`。
+平时页面跟正常一样能点能滚；**按住 Ctrl** 才进入捕获待命 —— 鼠标划过画橙框、
+实时显示「这个选择器命中几个」，这时候点一下就把结果通过 `window.__trae_pick`
+回传给 Python。松开 Ctrl 就退出待命，继续正常浏览。
+
+为什么改成「按住 Ctrl 才捕获」：以前是一进页面就接管点击，想翻个页、展开个菜单
+都会被抓走，还得先关掉捕获器。现在按 Ctrl 才是「我要抓」，松手就还给页面。
 
 XPath 生成策略（从稳到糙，逐级退让）：
 1. 元素自己的 id 唯一        → //*[@id="xxx"]
@@ -38,8 +42,8 @@ PICKER_JS = r"""
     + 'box-shadow:0 2px 8px rgba(0,0,0,.35)';
 
   // 点中之后「盖章」用的两个浮层：绿色粗框 + 屏幕顶端的大提示条。
-  // 为什么要有它们：捕获器自己的窗口被浏览器盖住了，只更新那边的文字，
-  // 用户在页面里什么都看不到，新手会以为「点了没反应」。
+  // 为什么要有它们：捕获器自己的窗口很小、也不在浏览器旁边，用户在页面里
+  // 什么都看不到，会以为「点了没反应」。
   var STYLE_OK = 'position:fixed;z-index:2147483646;pointer-events:none;display:none;'
     + 'border:3px solid #16a34a;background:rgba(22,163,74,.16);'
     + 'box-sizing:border-box;border-radius:3px';
@@ -165,18 +169,23 @@ PICKER_JS = r"""
     return s;
   }
 
+  function place(node, el) {
+    var r = el.getBoundingClientRect();
+    node.style.display = 'block';
+    node.style.left = r.left + 'px';
+    node.style.top = r.top + 'px';
+    node.style.width = r.width + 'px';
+    node.style.height = r.height + 'px';
+  }
+
   function draw(el, cand) {
     var r = el.getBoundingClientRect();
-    box.style.display = 'block';
-    box.style.left = r.left + 'px';
-    box.style.top = r.top + 'px';
-    box.style.width = r.width + 'px';
-    box.style.height = r.height + 'px';
+    place(box, el);
     var hits = countOf(cand.path);
     tip.textContent = labelOf(el) + '\n' + cand.path + '\n'
       + '命中 ' + hits + ' 个（' + cand.why + '）'
       + (hits === 1 ? '' : '  ← 不唯一，注意核对')
-      + '\n左键点一下＝捕获这个元素';
+      + '\n这时候点一下＝捕获这个元素';
     tip.style.display = 'block';
     var top = r.top > 62 ? r.top - 52 : r.bottom + 8;
     tip.style.left = Math.max(4, Math.min(r.left, window.innerWidth - 120)) + 'px';
@@ -195,16 +204,11 @@ PICKER_JS = r"""
        计时器也挂在 window 上：重新装填脚本后还能取消上一轮的手，免得提前收掉。 */
     try {
       window.__traePickTotal = (window.__traePickTotal || 0) + 1;
-      var r = el.getBoundingClientRect();
-      okBox.style.left = r.left + 'px';
-      okBox.style.top = r.top + 'px';
-      okBox.style.width = r.width + 'px';
-      okBox.style.height = r.height + 'px';
-      okBox.style.display = 'block';
-      toast.textContent = '✓ 已捕获第 ' + window.__traePickTotal + ' 个：' + labelOf(el)
+      place(okBox, el);
+      toast.textContent = '✓ 已捕获：' + labelOf(el)
         + '\nXPath：' + (cand.path || '（生成失败）') + '　命中 ' + hits + ' 个'
         + (hits === 1 ? '' : '（不唯一，建议重抓一个更准的）')
-        + '\n回到「元素捕获」窗口点【完成】即可写进步骤';
+        + '\n主界面马上就回来';
       toast.style.display = 'block';
       if (window.__traeOkTimer) { clearTimeout(window.__traeOkTimer); }
       window.__traeOkTimer = setTimeout(function () {
@@ -220,12 +224,28 @@ PICKER_JS = r"""
     removeEventListener('mousemove', onMove, true);
     removeEventListener('click', onClick, true);
     removeEventListener('keydown', onKey, true);
+    removeEventListener('keyup', onKeyUp, true);
+    removeEventListener('blur', onBlur, true);
     hide();
+  }
+
+  // ------------------------------
+  // 「按住 Ctrl 才捕获」：平时页面照常能用，按住 Ctrl 才是「我要抓」
+  // ------------------------------
+  var armed = false;
+  window.__traeArmed = false;
+
+  function setArmed(on) {
+    if (armed === on) { return; }
+    armed = on;
+    window.__traeArmed = on;
+    if (!on) { hide(); }
   }
 
   var lastEl = null, lastAt = 0;
 
   function onMove(e) {
+    if (!armed) { return; }
     var el = e.target;
     if (!el || el.nodeType !== 1 || el === box || el === tip) { return; }
     var now = Date.now();
@@ -236,6 +256,8 @@ PICKER_JS = r"""
   }
 
   function onClick(e) {
+    // 没按 Ctrl 就完全不插手：让页面自己处理这次点击（翻页、展开菜单都不受影响）
+    if (!armed) { return; }
     var el = e.target;
     if (!el || el.nodeType !== 1) { return; }
     e.preventDefault();
@@ -245,6 +267,7 @@ PICKER_JS = r"""
     var r = el.getBoundingClientRect();
     var hits = countOf(cand.path);
     var payload = {
+      kind: 'pick',
       xpath: cand.path,
       why: cand.why,
       desc: labelOf(el),
@@ -259,16 +282,84 @@ PICKER_JS = r"""
   }
 
   function onKey(e) {
-    if (e.key === 'Escape') { hide(); }
+    if (e.key === 'Control' || e.key === 'Ctrl') { setArmed(true); return; }
+    if (e.key === 'Escape') {
+      // 兜底出口：用户改主意了就按 Esc，主界面一样会回来
+      hide();
+      disarm();
+      if (typeof window.__trae_pick === 'function') {
+        window.__trae_pick({ kind: 'cancel', reason: '按了 Esc' });
+      }
+    }
+  }
+
+  function onKeyUp(e) {
+    if (e.key === 'Control' || e.key === 'Ctrl') { setArmed(false); }
+  }
+
+  function onBlur() {
+    // 切走窗口时收不到 keyup，Ctrl 会「卡在按下状态」——这里兜一下
+    setArmed(false);
   }
 
   addEventListener('mousemove', onMove, true);
   addEventListener('click', onClick, true);
   addEventListener('keydown', onKey, true);
+  addEventListener('keyup', onKeyUp, true);
+  addEventListener('blur', onBlur, true);
 })();
+"""
+
+# 试运行时用来「先圈一下再动手」的小助手：把 XPath 命中的元素滚到视野里、
+# 画个绿框停 2 秒。返回 true 表示找到了（Python 那边据此报「找不到元素」）。
+HIGHLIGHT_JS = r"""
+(xpath) => {
+  try {
+    var r = document.evaluate(xpath, document, null,
+      XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+    var el = r.singleNodeValue;
+    if (!el) { return false; }
+    if (el.scrollIntoView) { el.scrollIntoView({block: 'center'}); }
+    var ok = window.__traeLayer_ok;
+    if (!ok) { return true; }
+    var b = el.getBoundingClientRect();
+    ok.style.left = b.left + 'px';
+    ok.style.top = b.top + 'px';
+    ok.style.width = b.width + 'px';
+    ok.style.height = b.height + 'px';
+    ok.style.display = 'block';
+    if (window.__traeTrialTimer) { clearTimeout(window.__traeTrialTimer); }
+    window.__traeTrialTimer = setTimeout(function () {
+      ok.style.display = 'none';
+    }, 2000);
+    return true;
+  } catch (e) { return false; }
+}
+"""
+
+
+# 试运行完之后把结果「贴在页面顶端」：动作发生在浏览器里，反馈也该出现在浏览器里，
+# 不然用户光看程序那边的小字，不知道页面上到底发生了什么。
+TOAST_JS = r"""
+(payload) => {
+  try {
+    var t = window.__traeLayer_toast;
+    if (!t) { return false; }
+    t.textContent = payload.text || '';
+    t.style.background = payload.ok ? '#15803d' : '#b45309';
+    t.style.display = 'block';
+    if (window.__traeToastTimer) { clearTimeout(window.__traeToastTimer); }
+    window.__traeToastTimer = setTimeout(function () {
+      t.style.display = 'none';
+      t.style.background = '#15803d';
+    }, 3500);
+    return true;
+  } catch (e) { return false; }
+}
 """
 
 
 def next_shot_path(img_dir: Path, stamp: str) -> Path:
     """给这次捕获起一个不重名的截图路径：img/cap_20260917_203512.png。"""
     return Path(img_dir) / f"{SHOT_PREFIX}{stamp}.png"
+
