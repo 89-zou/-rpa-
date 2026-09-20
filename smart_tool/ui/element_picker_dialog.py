@@ -1,534 +1,375 @@
 # -*- coding: utf-8 -*-
-"""元素捕获窗口：**自动开浏览器**，你按住 Ctrl 点元素，抓到就自动收工。
+"""元素捕获窗口：点一下拿到「XPath + 元素截图」。
 
-跟以前不一样的地方（都是为了「一步接一步抓、不用反复开网页」）：
-- 网址直接用这一步（或项目里第一个「打开网页」节点）的，不用手填、不用点开始；
-- 捕获期间**主界面会收起来**，抓完自动回来；
-- 页面里平时照常能点能滚，**按住 Ctrl** 才是「我要抓」（松开 Ctrl 就还给页面）；
-- **浏览器不关** —— 下一次捕获直接接着用你当前停留的页面（见 picker_session）。
+界面上只有一个地址栏和状态提示，真正的操作在浏览器里：
+鼠标划过页面元素会画橙框、并显示这个选择器命中几个；点一下就捕获。
 
-所以这个窗口只是一条很小的「捕获条」：告诉你现在是什么情况，并留一个取消的出口。
+浏览器跑在独立线程（Playwright 同步 API 不能和 Qt 事件循环挤在一个线程），
+捕获结果通过信号回主线程。捕获完自动重新装填选择器，可以连着抓多个。
 """
+import queue
+import re
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton,
-    QVBoxLayout,
+    QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QInputDialog, QLabel,
+    QLineEdit, QMessageBox, QPushButton, QVBoxLayout,
 )
 
+from smart_tool.core.element_picker import PICKER_JS, next_shot_path
 from smart_tool.core.project_store import ProjectStore
-from smart_tool.ui import picker_session
-from smart_tool.ui.help_tip import HelpButton
+from smart_tool.ui.help_tip import help_row
 
-#: 这次运行里「要不要自动重跑前面的节点」问过没有 / 用户怎么答的。
-#: 问一次就记住：问太勤很烦，不问又可能把文章重发一遍（真事）。
-_replay_consent = None
+NAV_TIMEOUT_MS = 120_000
+POLL_MS = 200
 
-#: 【?】里的完整说明（用户点开看的是纯文本，别用 markdown 记号）
+#: 【?】里的完整说明（界面上只留一句摘要）
 PICKER_HELP = (
-    "【怎么抓】浏览器会自己开好（用的是这一步的网址，不用你填、也不用点开始）。\n"
-    "· 按住 Ctrl 把鼠标划过页面 → 目标元素被橙框圈住，旁边显示这个写法\n"
-    "  「命中几个」；命中好几个说明不够准，最好换个元素或者换个写法。\n"
-    "· 按住 Ctrl 点一下 → 抓下它的 XPath，同时把元素截图存进项目 img/\n"
-    "  （以后 XPath 失效时可以拿这张图兜底）。\n"
-    "· 抓完浏览器里会弹一条绿提示，主界面自动回来。\n"
+    "点【开始捕获】会打开一个浏览器窗口（用的是上面的网址）：\n"
     "\n"
-    "【松开 Ctrl 就恢复正常】不按 Ctrl 的时候页面照常能点能滚，翻页、展开菜单\n"
-    "都不会被拦下来 —— 可以先正常操作到目标页面，再按住 Ctrl 抓。\n"
+    "· 鼠标划过元素 → 画橙框，并在旁边显示「这个选择器命中几个」；\n"
+    "  命中好几个说明这个写法不够准，最好换一个元素或换种写法。\n"
+    "· 点一下 → 抓下它的 XPath，同时把这个元素的截图存进项目 img/；\n"
+    "  这张图后面可以当「兜底截图」用（XPath 失效时靠它找位置）。\n"
+    "· 抓到没有，看页面就知道：点中的元素会被「绿框」圈住，\n"
+    "  屏幕顶端还会弹一条绿色提示「✓ 已捕获第 N 个」。\n"
     "\n"
-    "【浏览器不会关】抓到之后浏览器一直开着，下一次捕获直接接着用你当前停留的\n"
-    "页面：不用重新打开、不用重新登录、也不用重新点到那一层。\n"
-    "想把页面重新加载一遍，就把那个浏览器窗口关掉再抓一次。\n"
+    "【可以连着抓】抓完会自动重新装填，接着点下一个就行，抓到满意为止点【完成】。\n"
+    "· 按 Esc 只是收起橙框（方便你看清页面），不会退出；\n"
+    "· 抓完最后留下的只有你选中那一次的元素截图，中间试的那些会自动删掉，\n"
+    "  不会在 img/ 里堆废图。\n"
     "\n"
-    "【抓到的是元素，不是坐标】抓下来的是 XPath，页面改版时换个元素重抓就行，\n"
-    "不依赖屏幕位置；这也正是网页场景比桌面场景耐用的地方。\n"
-    "\n"
-    "【不想抓了 / 卡住了】按 Esc 或点【强制停止】＝强制退出：\n"
-    "关掉浏览器、把主界面还回来，不管当时卡在哪一步。这是最后的出口。\n"
-    "只想关掉这条小条、浏览器留着下次接着用，就点【取消】。"
+    "【抓不到的情况】如果元素在 iframe 里，XPath 能拿到但截不到图——\n"
+    "这时可以自己裁剪一张图放进项目 img/ 当兜底。"
 )
 
-#: 待命时状态栏那句话（几处都用它，免得写得不一样）
-READY_HINT = (
-    "按住 Ctrl 划过元素看橙框，按住 Ctrl 点一下＝捕获；"
-    "不按 Ctrl 时页面照常能用。Esc＝立刻退出（会关掉浏览器）。"
-)
 
-#: 不回放时状态栏怎么说 —— 必须写清「现在能抓、怎么退」，
-#: 不然用户只看到一句「正在打开浏览器…」，不知道可以动手了
-SKIP_REPLAY_HINT = (
-    "好，先不重跑 —— 你自己在浏览器里点到这一步的页面就行。\n"
-    "按住 Ctrl 划过元素看橙框、按住 Ctrl 点一下＝捕获；"
-    "想让它自己跑就点【重跑前面的节点】；"
-    "按 Esc 或点【强制停止】＝立刻退出（会关掉浏览器）。"
-)
+class PickerWorker(QThread):
+    """后台线程：开浏览器 → 注入选择器 → 等人点 → 回传结果。"""
+
+    ready = pyqtSignal(str)        # 页面已打开（当前 URL）
+    picked = pyqtSignal(dict)      # 捕获结果
+    failed = pyqtSignal(str)       # 出错 / 浏览器被关掉
+    log = pyqtSignal(str)
+
+    def __init__(self, url: str, img_dir: Path, parent=None):
+        super().__init__(parent)
+        self._url = url
+        self._img_dir = Path(img_dir)
+        self._stop = False
+        self._picks: "queue.Queue[dict]" = queue.Queue()
+        self._page = None
+        self._seq = 0
+
+    # ------------------------------
+    # 主线程调用
+    # ------------------------------
+    def stop(self):
+        """请求收工（会关掉浏览器）。"""
+        self._stop = True
+
+    # ------------------------------
+    # 线程内
+    # ------------------------------
+    def _on_pick(self, payload):
+        """页面里点中元素时由 Playwright 回调（运行在本线程）。"""
+        self._picks.put(dict(payload or {}))
+
+    def _save_shot(self, payload: dict) -> str:
+        """把刚捕获的元素截下来，返回相对项目的路径（img/xxx.png）。
+
+        用 locator.screenshot()：它裁的就是元素精确边框，不受滚动/缩放影响。
+        iframe 里的元素（page 找不到这个 XPath）跳过截图，交给上层提示。
+        """
+        xpath = (payload.get("xpath") or "").strip()
+        if not xpath or not payload.get("top"):
+            return ""
+        try:
+            loc = self._page.locator(f"xpath={xpath}")
+            if loc.count() < 1:
+                return ""
+            self._img_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = next_shot_path(self._img_dir, f"{stamp}_{self._seq}")
+            loc.first.screenshot(path=str(path))
+            return f"img/{path.name}"
+        except Exception as e:
+            self.log.emit(f"元素截图失败（XPath 仍然可用）：{str(e).splitlines()[0][:100]}")
+            return ""
+
+    def _drain(self):
+        """把这一轮捕获结果发出去，并重新装填选择器（方便连着抓）。"""
+        while True:
+            try:
+                payload = self._picks.get_nowait()
+            except queue.Empty:
+                return
+            self._seq += 1
+            payload["image"] = self._save_shot(payload)
+            self.picked.emit(payload)
+            try:
+                self._page.evaluate(PICKER_JS)      # 重新装填，继续抓下一个
+            except Exception:
+                return
+
+    def run(self):
+        from playwright.sync_api import sync_playwright
+
+        from smart_tool.core import browser_setup
+
+        browser_setup.ensure_env()        # 内核可能在「程序目录旁的浏览器文件夹」里
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=False)
+                context = browser.new_context()
+                page = context.new_page()
+                self._page = page
+                page.expose_function("__trae_pick", self._on_pick)
+                page.add_init_script(PICKER_JS)
+                try:
+                    page.goto(self._url, wait_until="domcontentloaded",
+                              timeout=NAV_TIMEOUT_MS)
+                except Exception as e:
+                    self.failed.emit(f"打开网址失败：{str(e).splitlines()[0][:150]}")
+                    browser.close()
+                    return
+                self.ready.emit(page.url or self._url)
+
+                while not self._stop:
+                    if page.is_closed():
+                        self.failed.emit("浏览器窗口被关掉了，捕获结束。")
+                        break
+                    try:
+                        page.wait_for_timeout(POLL_MS)
+                    except Exception as e:
+                        if self._stop:
+                            break
+                        self.failed.emit(
+                            f"页面已关闭，捕获结束（{str(e).splitlines()[0][:80]}）"
+                        )
+                        break
+                    self._drain()
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            self.failed.emit(f"启动浏览器失败：{str(e).splitlines()[0][:150]}")
 
 
 class ElementPickerDialog(QDialog):
-    """捕获条（accept 后用 result_data 取结果）。"""
+    """捕获窗口。accept 后用 result_data 取结果。"""
 
-    def __init__(self, url: str, project_dir: Path, parent=None,
-                 replay=None):
-        # 故意**不要父窗口**：捕获期间主界面要藏起来，有父子关系的话会把它一起带走
-        super().__init__(None)
+    def __init__(self, url: str, project_dir: Path, parent=None):
+        super().__init__(parent)
         self.setWindowTitle("元素捕获")
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.setMinimumWidth(640)
         self.project_dir = Path(project_dir)
         self.img_dir = self.project_dir / "img"
-        self._url = (url or "").strip()
-        # 「回放」用的料：{"steps": [...], "variables": {...}, "entry_url": "..."}
-        # 有它就会在开抓之前先把前面的节点跑一遍，直接停在当前这一步的页面上
-        self._replay = dict(replay or {})
-        self._replaying = False
-        self._home = parent.window() if parent is not None else None
-        self._home_hidden = False
-        self._also_hidden: list = []    # 藏主界面时一并收起来的其它窗口（步骤编辑器等）
-        self._wired: list = []
-        self._session = None
-        self._started = False
+        self._worker: Optional[PickerWorker] = None
+        self._hits: list = []
+        self._shots: list = []          # 这次捕获生成的截图（收尾时清掉没用的）
         self.result_data: Optional[dict] = None
-        self.error: str = ""            # 没抓成时的原因（给调用方拿去做提示）
-        self._init_ui()
-        # 万一这个条没走 accept / reject 就被销毁（比如程序直接退出），
-        # 也要把会话的信号摘掉 —— 不然它还会接着收下一条捕获的消息
-        self.destroyed.connect(lambda *_: self._unwire())
-        # 看门狗：会话万一在后台死了（线程挂了 / 进程没了），也要把条收掉 ——
-        # 绝不能留一个模态框在这儿干等，那会让人以为整个程序卡死了
-        self._watch = QTimer(self)
-        self._watch.setInterval(1000)
-        self._watch.timeout.connect(self._check_session)
-        self._watch.start()
+        self._init_ui(url)
 
     # ------------------------------
     # UI
     # ------------------------------
-    def _init_ui(self):
-        self.setFixedWidth(600)
+    def _init_ui(self, url: str):
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 10, 12, 10)
-        root.setSpacing(6)
 
-        head = QHBoxLayout()
-        title = QLabel("按住 Ctrl 点元素＝捕获")
-        title.setStyleSheet("font-weight: 600;")
-        head.addWidget(title)
-        head.addStretch(1)
-        head.addWidget(HelpButton("元素捕获", PICKER_HELP))
-        root.addLayout(head)
+        root.addWidget(help_row(
+            "点【开始捕获】，在浏览器里点元素（抓到会弹绿框提示）。",
+            "元素捕获", PICKER_HELP))
 
-        self.status = QLabel("正在打开浏览器…")
-        self.status.setWordWrap(True)
-        self.status.setStyleSheet("color: #555;")
-        root.addWidget(self.status)
+        form = QFormLayout()
+        self.url_edit = QLineEdit(url)
+        self.url_edit.setPlaceholderText("https://example.com/login")
+        form.addRow("页面地址：", self.url_edit)
+        root.addLayout(form)
 
         row = QHBoxLayout()
-        row.setSpacing(6)
-        self.btn_replay = QPushButton("重跑前面的节点")
-        self.btn_replay.setToolTip(
-            "把当前这一步**之前**的节点在这个浏览器里跑一遍，直接停在\n"
-            "当前这一步该在的页面上。注意那些节点会真的执行（真点、真填、真发）。")
-        self.btn_replay.clicked.connect(self._on_replay_clicked)
-        row.addWidget(self.btn_replay)
-
-        self.btn_reload = QPushButton("重新加载")
-        self.btn_reload.setToolTip("把这个页面重新加载一遍（等于按 F5）。")
-        self.btn_reload.clicked.connect(self._on_reload_clicked)
-        row.addWidget(self.btn_reload)
-
-        self.btn_entry = QPushButton("回到入口页")
-        self.btn_entry.setToolTip("打开流程里第一个【打开网页】节点的地址。")
-        self.btn_entry.clicked.connect(self._on_entry_clicked)
-        row.addWidget(self.btn_entry)
-
-        row.addStretch(1)
-        self.btn_cancel = QPushButton("取消（Esc）")
-        self.btn_cancel.setToolTip(
-            "不抓了。已经开着的浏览器不会关，下次捕获接着用。")
-        self.btn_cancel.clicked.connect(self._on_cancel_clicked)
-        row.addWidget(self.btn_cancel)
-
-        self.btn_stop = QPushButton("强制停止")
-        self.btn_stop.setToolTip(
-            "不管现在卡在哪一步，立刻停下：**关掉浏览器**、把主界面还回来。\n"
-            "按 Esc 跟点它是一回事 —— 这是最后的出口，任何状态下都管用。")
-        self.btn_stop.clicked.connect(
-            lambda: self._force_stop("你点了【强制停止】"))
+        self.btn_start = QPushButton("开始捕获")
+        self.btn_start.clicked.connect(self._start)
+        row.addWidget(self.btn_start)
+        self.btn_stop = QPushButton("关闭浏览器")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self._stop_worker)
         row.addWidget(self.btn_stop)
+        self.status = QLabel("还没开始。")
+        self.status.setStyleSheet("color: #888;")
+        row.addWidget(self.status, 1)
         root.addLayout(row)
-        self._sync_buttons()
+
+        self.result_label = QLabel("捕获结果会显示在这里。")
+        self.result_label.setWordWrap(True)
+        self.result_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.result_label.setStyleSheet("color: #0f766e;")
+        root.addWidget(self.result_label)
+
+        self.preview = QLabel("（还没抓到元素）")
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setFixedHeight(120)
+        self.preview.setStyleSheet(
+            "border: 1px dashed #bbb; border-radius: 4px; color: #999;"
+        )
+        root.addWidget(self.preview)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("完成")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
 
     # ------------------------------
-    # 那排按钮
+    # 起 / 停
     # ------------------------------
-    def _sync_buttons(self):
-        """按「有没有得回放 / 是不是正在回放」调整按钮。
-
-        回放期间【取消】变成【跳过回放】：这时候想退出，多半是想让流程停下来
-        （而不是把捕获条关掉），所以复用同一个按钮，省一个位置。
-        """
-        busy = self._replaying
-        self.btn_replay.setEnabled(
-            bool(self._replay.get("steps")) and not busy)
-        self.btn_reload.setEnabled(not busy)
-        self.btn_entry.setEnabled(bool(self._replay.get("entry_url")) and not busy)
-        if busy:
-            self.btn_cancel.setText("跳过回放")
-            self.btn_cancel.setToolTip("让回放停下来，直接进入捕获状态。")
-        else:
-            self.btn_cancel.setText("取消（Esc）")
-            self.btn_cancel.setToolTip(
-                "不抓了。已经开着的浏览器不会关，下次捕获接着用。")
-        # 强制停止永远能点：它就是给「已经卡住了」这种情况准备的
-        self.btn_stop.setEnabled(True)
-
-    def _on_cancel_clicked(self):
-        if self._replaying:
-            if self._session is not None:
-                self._session.skip_replay()
-            self.status.setText("已请求跳过回放，这一步跑完就停…")
-            return
-        self.reject()
-
-    def _force_stop(self, reason: str):
-        """**强制打断一切**：关掉浏览器、丢掉排队的命令、把主界面还回来。
-
-        顺序很重要：**先让界面恢复**，再去收拾浏览器。会话那边可能正卡在
-        `goto` / `reload` 里，等它腾出手来才关得掉浏览器 —— 界面绝不能陪它一起等。
-        """
-        self._watch.stop()
-        self._unwire()
-        self.error = f"已强制停止（{reason}）。浏览器关掉了，再点【捕获元素…】重新来。"
-        if self._session is not None:
-            try:
-                self._session.force_abort()
-            except Exception:
-                pass
-        self._replaying = False
-        self._show_home()
-        self.reject()
-
-    def _on_replay_clicked(self):
-        if not self._replaying and self._session is not None:
-            self._ask_then_replay(manual=True)
-
-    def _on_reload_clicked(self):
-        if self._session is not None and not self._replaying:
-            self._session.reload_page()
-
-    def _on_entry_clicked(self):
-        if self._session is not None and not self._replaying:
-            self._session.open_entry(self._replay.get("entry_url") or "")
-
-    def _ask_then_replay(self, manual: bool, why: str = ""):
-        """回放前先问一句（每次运行只问一次）。
-
-        为什么要问：回放就是把前面那些节点**真跑一遍**。你前面要是有点「发布」
-        「提交」之类的节点，这就是真的会再发一次 —— 不打招呼就干这种事不行。
-        """
-        global _replay_consent
-        steps = self._replay.get("steps") or []
-        if not steps:
-            self.status.setText("当前这一步前面没有节点，不用回放。")
-            return
-        if not manual:
-            if _replay_consent is None:
-                reply = QMessageBox.warning(
-                    self, "要先把前面的节点跑一遍吗",
-                    f"{why}\n"
-                    f"要不要先把当前这一步「前面」的 {len(steps)} 个节点跑一遍，"
-                    "让它自己走到当前这一步该在的页面上？\n\n"
-                    "注意：那些节点会真的执行 —— 真点、真填、真提交。\n"
-                    "如果里面有「发布 / 提交」这类节点，会再发一次。\n\n"
-                    "（选「不要」就自己点过去；条上有【重跑前面的节点】随时可跑。）",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.Yes,
-                )
-                _replay_consent = (reply == QMessageBox.StandardButton.Yes)
-            if not _replay_consent:
-                # 注意：这里**不管答过没答过**都要写状态 ——
-                # 只默默跳过的话，状态栏会停在「正在打开浏览器…」，
-                # 用户根本不知道已经可以动手抓了（上一版就是这么坑人的）
-                self.status.setText(SKIP_REPLAY_HINT)
-                return
-        self._replaying = True
-        self._sync_buttons()
-        self._session.replay({
-            "steps": steps,
-            "variables": self._replay.get("variables") or {},
-            "project_dir": self.project_dir,
-        })
-
-    def _on_replayed(self, ok: bool, message: str):
-        self._replaying = False
-        self._sync_buttons()
-        self.status.setText(("✓ " if ok else "✗ ") + message
-                            + "　现在按住 Ctrl 点元素＝捕获。")
-
-    # ------------------------------
-    # 开窗即开始捕获
-    # ------------------------------
-    def showEvent(self, event):
-        super().showEvent(event)
-        if not self._started:
-            self._started = True
-            # 等窗口真正摆好再藏主界面，免得藏完自己被顺手收起
-            QTimer.singleShot(0, self._start)
-
     def _start(self):
-        if self._wired:
-            return          # 已经在抓了：重复进来（show 了两次）别再接一遍信号
-        self._hide_home()
-        self._move_to_corner()
-        session = picker_session.shared()
-        self._session = session
-        self._wire(session)
-        # 一进来就把捕获脚本装上（不再等回放）：这样按住 Ctrl 能抓、按 Esc 能退。
-        # 回放期间装着它也没关系 —— 它只有按住 Ctrl 才管事，自动化的点击照常通过。
-        session.capture(self._url, self.img_dir)
-
-    def _check_session(self):
-        """会话在后台死了就把条收掉 —— 宁可不抓，也不留一个模态框把主界面卡住。"""
-        if not self._wired or self._session is None:
+        url = self.url_edit.text().strip()
+        if not url:
+            QMessageBox.warning(self, "提示", "请先填页面地址。")
             return
-        try:
-            alive = self._session.isRunning()
-        except Exception:
-            alive = False
-        if not alive:
-            self._finish_with_error(
-                "捕获用的后台会话意外结束了，这次没抓成。\n"
-                "再点一次【捕获元素…】就行（浏览器会重新开一个）。")
-
-    def _wire(self, session):
-        """接上会话的信号；收尾时必须摘掉 —— 会话是跨窗口复用的，
-        不摘的话下一个捕获条开起来时，上一条也会收到消息。"""
-        self._unwire()      # 兜底：万一是重复进来的，先把旧的摘干净再接
-        self._wired = [
-            (session.opened, self._on_opened),
-            (session.reused, self._on_reused),
-            (session.picked, self._on_picked),
-            (session.canceled, self._on_canceled),
-            (session.gone, self._on_gone),
-            (session.failed, self._on_failed),
-            (session.log, self._on_log),
-            (session.replayed, self._on_replayed),
-            (session.aborted, self._on_aborted),
-        ]
-        for sig, slot in self._wired:
-            sig.connect(slot)
-
-    def _unwire(self):
-        for sig, slot in self._wired:
-            try:
-                sig.disconnect(slot)
-            except Exception:
-                pass
-        self._wired = []
-
-    def _move_to_corner(self):
-        """摆到屏幕右上角：别挡住页面内容，也别跟浏览器抢地方。"""
-        try:
-            screen = self.screen().availableGeometry()
-            self.move(screen.right() - self.width() - 24, screen.top() + 24)
-        except Exception:
-            pass
-
-    # ------------------------------
-    # 主界面的藏 / 还
-    # ------------------------------
-    def _hide_home(self):
-        """捕获期间把本程序所有露着的窗口都收起来，只留这条捕获条。
-
-        为什么不挑「哪个是主界面」：从步骤编辑器里点捕获时，parent.window() 拿到的
-        是**编辑器自己**（它本身就是顶层窗口）——只藏它的话主界面还在后面露着。
-        而且编辑器是模态的：藏起来之后主界面虽然看得见，却点哪儿都没反应，
-        看起来就是卡死了。所以索性全收走，收工时再逐个放回来。
-        """
-        if self._home_hidden or self._home is None:
+        if self._worker is not None:
             return
-        # **先把标记挂上再去藏**：万一中途哪一步炸了，收工的时候也一定会走
-        # 「把窗口放回来」那段（否则就是收走了再也还不回来 = 假死）
-        self._home_hidden = True
-        try:
-            self._also_hidden = [
-                w for w in QApplication.topLevelWidgets()
-                if w is not self and w.isVisible()
-                and w.windowType() in (Qt.WindowType.Window,
-                                       Qt.WindowType.Dialog)
-            ]
-        except Exception:
-            self._also_hidden = []
-        for w in self._also_hidden:
-            try:
-                w.hide()
-            except Exception:
-                pass
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.url_edit.setEnabled(False)
+        self.status.setText("正在打开浏览器…")
+        self._hits = []
+        self.result_data = None
+        self._worker = PickerWorker(url, self.img_dir, self)
+        self._worker.ready.connect(self._on_ready)
+        self._worker.picked.connect(self._on_picked)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.log.connect(self.status.setText)
+        self._worker.start()
 
-    def _show_home(self):
-        """收工：把刚才收起来的窗口都放回来（漏放一个就可能让人以为卡死了）。"""
-        if not self._home_hidden:
-            return
-        shown, self._also_hidden = self._also_hidden, []
-        self._home_hidden = False
-        for w in shown:
-            try:
-                w.show()
-                w.raise_()
-            except Exception:
-                pass
-        # 兜一层：万一还有个模态窗口没被记上（比如藏的时候还没建出来），
-        # 主界面会被它挡着却看不见 —— 那就是「看得见、点哪儿都没反应」。
-        try:
-            modal = QApplication.activeModalWidget()
-            if modal is not None and modal is not self and not modal.isVisible():
-                modal.show()
-                modal.raise_()
-        except Exception:
-            pass
-        # 焦点还给「刚才在用的那个」：模态的（步骤编辑器）优先，否则给主界面。
-        # 不然回来之后还得自己点一下窗口才接着能操作。
-        target = next((w for w in shown if w.isModal()), None) or self._home
-        if target is not None:
-            try:
-                target.activateWindow()
-            except Exception:
-                pass
+    def _stop_worker(self):
+        """关掉浏览器（捕获结束，但已经抓到的结果留着）。"""
+        if self._worker is not None:
+            self._worker.stop()
+        self.btn_stop.setEnabled(False)
+        self.status.setText("已请求关闭浏览器，已抓到的结果可以点【完成】使用。")
 
-    # ------------------------------
-    # 会话的回调
-    # ------------------------------
-    def _on_log(self, message: str):
-        self.status.setText(message)
-
-    def _on_opened(self, _url: str):
-        if self._auto_replay("这次的浏览器是刚开的，页面还停在入口页。"):
-            return
-        self.status.setText(READY_HINT)
-
-    def _on_reused(self, url: str):
-        if self._auto_replay(f"浏览器里现在停在：{url or '空白页'}。"):
-            return
-        self.status.setText(
-            f"接着用已经开着的浏览器（当前：{url or '空白页'}）。\n"
-            + READY_HINT)
-
-    def _auto_replay(self, why: str) -> bool:
-        """问一句要不要先把前面的节点跑一遍（不自动跑：那可能真的又发一篇文章）。"""
-        if not self._replay.get("steps"):
-            return False
-        self._ask_then_replay(manual=False, why=why)
-        return True
-
-    def _on_picked(self, payload: dict):
-        self._unwire()
-        self._show_home()
-        xpath = payload.get("xpath") or ""
-        self.result_data = {
-            "xpath": xpath,
-            "image": payload.get("image") or "",
-            "count": payload.get("count", -1),
-            "desc": payload.get("desc", ""),
-        }
-        self.accept()
-
-    def _on_aborted(self, reason: str):
-        """页面里按了 Esc：走强制停止那条路。"""
-        self._force_stop(reason)
-
-    def _on_canceled(self, _reason: str):
-        """用户在页面里取消了（目前只有老脚本会发这个）：当取消处理。"""
-        self._unwire()
-        self._show_home()
-        self.reject()
-
-    def _on_gone(self, reason: str):
-        self._finish_with_error(reason or "浏览器窗口被关掉了。")
+    def _on_ready(self, url: str):
+        self.status.setText(f"页面已打开，请在浏览器里点一下目标元素：{url}")
 
     def _on_failed(self, message: str):
-        self._finish_with_error(message)
+        self.status.setText(message)
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.url_edit.setEnabled(True)
+        self._worker = None
 
-    def _finish_with_error(self, message: str):
-        """出错 / 浏览器没了：**一定要把这条收掉**，并把原因交给调用方去显示。
+    def _on_picked(self, payload: dict):
+        self._hits.append(payload)
+        xpath = payload.get("xpath") or "（生成失败）"
+        count = payload.get("count", -1)
+        lines = [
+            f"✓ 已捕获第 {len(self._hits)} 个",
+            f"元素：{payload.get('desc', '')}",
+            f"XPath：{xpath}",
+            f"命中：{count} 个" + ("" if count == 1 else "（不唯一，建议换更稳的写法）"),
+            f"来源：{payload.get('why', '')}"
+            + ("" if payload.get("top") else "（在 iframe 内，XPath 需配合框架使用）"),
+        ]
+        image = payload.get("image") or ""
+        lines.append(f"截图：{image}" if image else "截图：没抓到（可用【选择截图…】手工裁剪）")
+        self.result_label.setText("\n".join(lines))
+        if image:
+            self._shots.append(self.project_dir / image)
+            self._show_preview(self.project_dir / image)
+        self.result_data = {
+            "xpath": xpath if count >= 0 else "",
+            "image": image,
+            "count": count,
+            "desc": payload.get("desc", ""),
+        }
+        self.status.setText(f"已捕获 {len(self._hits)} 个元素，可以继续点，或点【完成】使用。")
 
-        为什么不留着让人读：这条是模态窗口，留着的话主界面虽然显示回来了、
-        却点哪儿都没反应 —— 看起来就是整个程序卡死了（这个坑踩过一次）。
-        原因会写到步骤编辑器那行提示上，就在刚才那个按钮旁边，一样看得见。
-        """
-        self._watch.stop()
-        self._unwire()
-        self.error = message or "这次没抓成。"
-        self._show_home()
-        self.reject()
+    def _show_preview(self, path: Path):
+        pix = QPixmap(str(path))
+        if pix.isNull():
+            self.preview.setText("（截图无法预览）")
+            return
+        self.preview.setPixmap(
+            pix.scaled(self.preview.width() or 300, 110,
+                       Qt.AspectRatioMode.KeepAspectRatio,
+                       Qt.TransformationMode.SmoothTransformation)
+        )
 
     # ------------------------------
     # 收尾
     # ------------------------------
-    def keyPressEvent(self, event):
-        """按 Esc 直接**强制退出**捕获状态。
-
-        页面里也接了 Esc（浏览器有焦点时走那条），这里管的是「焦点在这条上」的
-        情况 —— 两条路都通。而且是硬中止：关浏览器、回主界面，不管现在卡在哪。
-        """
-        if event.key() == Qt.Key.Key_Escape:
-            self._force_stop("按了 Esc")
+    def _on_accept(self):
+        if self.result_data is None:
+            QMessageBox.information(
+                self, "还没抓到",
+                "还没有捕获到元素。\n先点【开始捕获】，在浏览器里点一下目标元素。",
+            )
             return
-        super().keyPressEvent(event)
+        self.accept()
 
     def accept(self):
-        self._watch.stop()
-        self._unwire()
-        self._show_home()
+        """完成：留下的只有最后选中的那张截图。"""
+        image = (self.result_data or {}).get("image") or ""
+        self._shutdown(keep=(self.project_dir / image) if image else None)
         super().accept()
 
     def reject(self):
-        """取消（含点右上角 ×、按 Esc）：主界面还回来，但**不关浏览器**。"""
-        self._watch.stop()
-        self._unwire()
-        self._show_home()
+        """取消（含点右上角 ×、按 Esc）：关掉浏览器并清掉这次的截图。"""
+        self._shutdown(keep=None)
         super().reject()
 
-    def closeEvent(self, event):
-        self._watch.stop()
-        self._unwire()
-        self._show_home()
-        super().closeEvent(event)
+    def _shutdown(self, keep: Optional[Path]):
+        if self._worker is not None:
+            self._worker.stop()
+            self._worker.wait(4000)
+            self._worker = None
+        self._drop_unused_shots(keep)
+
+    def _drop_unused_shots(self, keep: Optional[Path]):
+        """删掉这次捕获生成、但最终没用上的截图。
+
+        抓一个点一个很容易试好几次；只有最后选中的那张会被写进步骤，
+        其余的留着只会在 img/ 里堆废图。
+        """
+        for p in self._shots:
+            if keep is not None and p == keep:
+                continue
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        self._shots.clear()
 
 
-def pick_element_result(parent, url: str, project_dir, replay=None):
-    """跑一次捕获 → (结果, 出错原因)。用户取消时是 (None, "")。
-
-    出错原因要交回去显示：捕获那条一定会自己关掉（模态窗口留着会把主界面卡住），
-    所以原因得由调用方写在自己的界面上。
-
-    replay 给了就让浏览器先「回放前面的节点」走到当前这一步的页面，见
-    ElementPickerDialog 的同名参数。
-    """
-    dlg = ElementPickerDialog(url, Path(project_dir), parent, replay=replay)
-    dlg.exec()
-    if dlg.result_data:
-        return dlg.result_data, ""
-    return None, dlg.error
-
-
-def pick_element(parent, url: str, project_dir, replay=None) -> Optional[dict]:
-    """开捕获条让用户抓一个元素，返回它的信息（取消返回 None）。
+def pick_element(parent, url: str, project_dir) -> Optional[dict]:
+    """开捕获窗口让用户点一个元素，返回它的信息（取消返回 None）。
 
     返回值就是 ElementPickerDialog.result_data：
     `{"xpath":…, "image":"img/xxx.png", "count":命中几个, "desc":元素描述}`。
     给「不想要元素截图、只要一个 XPath」的地方用（比如登录态体检、采集行定位）。
-    需要知道「为什么没抓成」的，用 pick_element_result()。
     """
-    data, _err = pick_element_result(parent, url, project_dir, replay=replay)
-    return data
+    dlg = ElementPickerDialog(url, Path(project_dir), parent)
+    if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+        return None
+    return dlg.result_data
 
 
 def drop_capture_image(project_dir, data: dict) -> None:
     """「只要 XPath、不要元素截图」的地方收尾用：把那张图删掉。
 
-    捕获时顺手截的那张元素图，很多地方（登录态体检、采集行定位、验证码的辅助
-    位置）根本用不上，留着只会在项目 img/ 里堆废图。
+    捕获器只会留下最后一张截图（其余都自己清了），但很多地方（登录态体检、
+    采集行定位）根本用不上它，留着只会在项目 img/ 里堆废图。
     """
     rel = (data or {}).get("image") or ""
     if not rel:
@@ -545,7 +386,6 @@ def guess_locator_name(data: dict, taken=None) -> str:
     desc 长这样：`<a>#menu-posts “文章”`、`<input>#user_login`、`<div.item> “书”`。
     优先用元素上的文字，其次用 id；重名就往后加 2、3…
     """
-    import re
     desc = str((data or {}).get("desc") or "")
     m = re.search(r"[“\"](.+?)[”\"]", desc)
     base = re.sub(r"\s+", "", m.group(1)) if m else ""
@@ -566,8 +406,6 @@ def save_captured_locator(parent, project_dir, data: dict) -> str:
     - 同一个 XPath 已经存过 → 不再重复问，直接复用原来那个名字
     - 名字留空或取消 → 不存（只填在当前这个字段里）
     """
-    from PyQt6.QtWidgets import QInputDialog
-
     xpath = (data or {}).get("xpath") or ""
     xpath = xpath.strip()
     if not xpath:

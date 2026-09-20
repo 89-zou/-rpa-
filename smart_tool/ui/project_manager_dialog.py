@@ -1078,7 +1078,6 @@ class ProjectManagerDialog(QDialog):
             variable_names=step_executor.available_variables(
                 steps, self._store.load_all_variables(),
                 step_executor.library_written_vars(self._store.dir)),
-            all_steps=steps,            # 捕获时「回放前面的节点」要用
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return

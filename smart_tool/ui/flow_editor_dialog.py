@@ -577,17 +577,16 @@ class FlowEditorDialog(QDialog):
         rule_mode = None
         if sp is not None and sp.kind == "condition":
             rule_mode = self._steps[sp.start].cond_mode or "rule"
-        pos = sp.insert_pos if sp else len(self._steps)
-        step = self._new_step_via_dialog(rule_mode, insert_at=pos)
+        step = self._new_step_via_dialog(rule_mode)
         if step is None:
             return
+        pos = sp.insert_pos if sp else len(self._steps)
         self._insert_at(pos, step)
 
     # ------------------------------
     # 增删改移
     # ------------------------------
-    def _new_step_via_dialog(self, rule_mode: Optional[str] = None,
-                             insert_at: Optional[int] = None
+    def _new_step_via_dialog(self, rule_mode: Optional[str] = None
                              ) -> Optional[Step]:
         dlg = StepEditDialog(
             self.project_dir, None, self,
@@ -597,8 +596,6 @@ class FlowEditorDialog(QDialog):
             default_url=self._default_url(),
             scene=self.scene,
             rule_mode=rule_mode,
-            all_steps=self._steps,      # 捕获时「回放前面的节点」要用
-            insert_at=insert_at,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             return dlg.get_step()
@@ -613,8 +610,7 @@ class FlowEditorDialog(QDialog):
         """新增：插到选中行之后（在循环里就留在循环里）；没选中则追加到末尾。"""
         idx = self._selected_row()
         pos = idx + 1 if idx >= 0 else len(self._steps)
-        step = self._new_step_via_dialog(blocks.rule_mode_at(self._steps, pos),
-                                         insert_at=pos)
+        step = self._new_step_via_dialog(blocks.rule_mode_at(self._steps, pos))
         if step is None:
             return
         self._insert_at(pos, step)
@@ -624,8 +620,7 @@ class FlowEditorDialog(QDialog):
         idx = self._selected_row()
         if idx < 0:
             return
-        step = self._new_step_via_dialog(blocks.rule_mode_at(self._steps, idx),
-                                         insert_at=idx)
+        step = self._new_step_via_dialog(blocks.rule_mode_at(self._steps, idx))
         if step is None:
             return
         self._insert_at(idx, step)
@@ -662,7 +657,6 @@ class FlowEditorDialog(QDialog):
             scene=self.scene,
             rule_mode=(self._steps[owner.start].cond_mode or "rule"
                        if owner is not None else None),
-            all_steps=self._steps,      # 捕获时「回放前面的节点」要用
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
