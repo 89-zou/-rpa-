@@ -8,3 +8,13 @@ pyautogui>=0.9.54
 Pillow>=10.0
 # 桌面「元素捕获」用（UI Automation 拿控件名字和精确位置）；没装就退回手动框选
 uiautomation>=2.0
+
+# ---- 下面是可选的：验证码节点里「文字点选 / 计算题」要认字才用得上 ----
+# 滑块验证码不需要它们（用 OpenCV 找缺口）。要用就手动装：
+#     .venv\Scripts\python -m pip install ddddocr "onnxruntime==1.20.1"
+# 为什么锁 onnxruntime 1.20.x：更新版本要求新版 VC++ 运行时，老机器上
+# （VC++ 14.23）会「DLL 初始化例程失败」，更早的版本甚至直接让进程访问违例崩掉。
+# 体积提醒：ddddocr 自带模型（common.onnx 等）约 85 MB，加上 onnxruntime，
+# .venv 会胖 100 MB 上下 —— 打包成单文件 exe 也会跟着涨这么多。
+# ddddocr>=1.5
+# onnxruntime==1.20.1

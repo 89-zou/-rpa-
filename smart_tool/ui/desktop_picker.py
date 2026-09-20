@@ -308,7 +308,8 @@ class DesktopPickerDialog(QDialog):
             QMessageBox.information(
                 self, "没法做元素捕获",
                 "这台机器上用不了 UI Automation（uiautomation 没装）。\n"
-                "可以改用【截屏取模板…】手工框选。\n\n" + desktop_uia.missing_hint(),
+                "可以改用【定位匹配…】：选窗口 → 在窗口截图上框控件。\n\n"
+                + desktop_uia.missing_hint(),
             )
             return False
 
@@ -441,8 +442,8 @@ class DesktopPickerDialog(QDialog):
                     self._finish_control(self._ctrl)
                 else:
                     self.overlay.hint = (
-                        "这里没识别到控件（自绘界面？）——"
-                        "按住左键拖一个框，或用【截屏取模板…】")
+                        "这里没识别到控件（自绘界面？）——按住左键拖一个框，"
+                        "手工框选")
                     self.overlay.update()
                 return
 

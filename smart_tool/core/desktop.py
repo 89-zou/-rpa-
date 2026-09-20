@@ -86,6 +86,9 @@ MOVE_MIN_FRAMES = 12
 MOVE_MAX_FRAMES = 240
 #: 急停区域：光标进到这个角落里就中断（跟 pyautogui.FAILSAFE 一个意思）
 FAILSAFE_BOX = 2
+#: 按下 / 松开左键要发的系统事件（pyautogui 在 Windows 上发的也是这两个）
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
 
 
 class _POINT(ctypes.Structure):
@@ -128,6 +131,16 @@ def _set_cursor(x: float, y: float) -> None:
         if cx <= FAILSAFE_BOX and cy <= FAILSAFE_BOX:
             raise DesktopError("检测到光标被甩到屏幕左上角，已急停。")
     _user32().SetCursorPos(int(round(x)), int(round(y)))
+
+
+def _mouse_button(down: bool) -> None:
+    """按下 / 松开鼠标左键。
+
+    直接发系统事件，不走 pyautogui.mouseDown/mouseUp —— 那两个同样会各 sleep 一个
+    PAUSE（默认 0.1 秒），拖动前按下时多停 0.1 秒，轨迹的起手节奏就不对了。
+    """
+    flag = MOUSEEVENTF_LEFTDOWN if down else MOUSEEVENTF_LEFTUP
+    _user32().mouse_event(flag, 0, 0, 0, 0)
 
 
 def available() -> bool:
@@ -222,7 +235,7 @@ def locate(template_path: Path, threshold: Optional[float] = None,
     path = Path(template_path)
     if not path.exists():
         raise DesktopError(f"模板图不存在：{path}\n"
-                           "（在步骤编辑器里点【截屏取模板…】重新截一张）")
+                           "（在步骤编辑器里点【定位匹配…】重新框一张）")
     note(f"桌面：找图 {path.name}")
     template = image_locator.imread_unicode(path)
     th, tw = template.shape[:2]
@@ -262,6 +275,27 @@ def _grab_bgr():
     import numpy as np
     img = grab_screen().convert("RGB")
     return np.array(img)[:, :, ::-1].copy()
+
+
+def grab_rect_png(left: float, top: float, width: float, height: float) -> bytes:
+    """按屏幕坐标截一小块，返回 PNG 字节。
+
+    给验证码识别用：只要「验证码那一块」的当前像素，不要整屏 ——
+    识别本来就只吃那一小块图，给整屏又慢又容易认到别的地方去。
+    """
+    import io
+    from PIL import ImageGrab
+    box = (int(round(left)), int(round(top)),
+           int(round(left + width)), int(round(top + height)))
+    buf = io.BytesIO()
+    ImageGrab.grab(bbox=box).save(buf, "PNG")
+    return buf.getvalue()
+
+
+def grab_match_png(m: "DesktopMatch") -> bytes:
+    """把匹配到的那块区域截下来 → PNG 字节。"""
+    return grab_rect_png(m.x - m.width / 2, m.y - m.height / 2,
+                         m.width, m.height)
 
 
 # ------------------------------
@@ -758,6 +792,76 @@ def move(x: float, y: float):
         _set_cursor(x, y)
 
 
+def human_trace(sx: float, sy: float, x: float, y: float,
+                duration: float) -> List[Tuple[float, float]]:
+    """生成一条像人的移动轨迹（缓入缓出 + 轻微弧度 + 低频手抖）。
+
+    抽成独立函数是为了让「按住拖动」也能用同一套轨迹 —— 滑块验证码比点击更怕
+    被看出是机器：站点会检查按住期间的采样点，直线匀速、或者一步跳到位都很容易
+    被判掉。
+
+    返回中间帧的坐标（**不含**收尾那个精确的终点点，调用方自己补）。
+    """
+    sx, sy, x, y = float(sx), float(sy), float(x), float(y)
+    dist = math.hypot(x - sx, y - sy)
+    if dist < 1:
+        return [(x, y)]
+    frames = max(MOVE_MIN_FRAMES,
+                 int(duration / MOVE_FRAME_S),
+                 int(dist / MOVE_MAX_PX))
+    frames = min(frames, MOVE_MAX_FRAMES)
+    # 垂直方向上的单位向量：弧度和手抖都加在这个方向上（不影响前进的进度）
+    ux, uy = -(y - sy) / dist, (x - sx) / dist
+    bend = random.uniform(-1.0, 1.0) * min(MOVE_BEND_PX, dist * 0.06)
+    amp = MOVE_TREMOR_PX if dist > 40 else 0.0
+    phase = random.uniform(0.0, math.tau)
+    pts: List[Tuple[float, float]] = []
+    for i in range(1, frames + 1):
+        t = i / frames
+        e = t * t * (3 - 2 * t)             # 缓入缓出：起步慢、中间快、收尾慢
+        # sin(πt) 让弧度两头归零、中间最大，收尾自然收敛到目标点
+        off = (math.sin(math.pi * t) * bend
+               + math.sin(phase + math.tau * 1.5 * t) * amp * math.sin(math.pi * t))
+        pts.append((sx + (x - sx) * e + ux * off,
+                    sy + (y - sy) * e + uy * off))
+    return pts
+
+
+def _step_through(points: List[Tuple[float, float]], duration: float):
+    """按 points 一点点挪光标，整体耗时约 duration 秒。
+
+    时间对齐到「开始时刻 + 这一帧应到的时间」：sleep 的误差不会被累加，
+    不然帧多了会明显拖长（或越走越快）。
+    """
+    frames = len(points)
+    t0 = time.perf_counter()
+    for i, (px, py) in enumerate(points, 1):
+        _set_cursor(px, py)
+        gap = t0 + duration * (i / frames) - time.perf_counter()
+        if gap > 0.0005:
+            time.sleep(gap)
+
+
+def drag(x0: float, y0: float, x1: float, y1: float,
+         duration: float = 0.6, log: Callable[[str], None] = print):
+    """按住左键，从 (x0,y0) 拖到 (x1,y1) 再松开（滑块验证码用）。
+
+    按下之前先把光标**精确移到起点**：mouseDown 是按在「光标当前所在的地方」，
+    光标不在起点的话，等于从别处开始拖 —— 拖动距离就全错了。
+    """
+    _ensure_dpi_aware()
+    _set_cursor(x0, y0)
+    time.sleep(0.05)
+    log(f"  按住 ({x0:.0f},{y0:.0f}) 拖到 ({x1:.0f},{y1:.0f})，约 {duration:g} 秒")
+    _mouse_button(True)
+    try:
+        _step_through(human_trace(x0, y0, x1, y1, duration), duration)
+        _set_cursor(x1, y1)
+        time.sleep(0.08)                  # 落点停一下再松手，真人就是这样
+    finally:
+        _mouse_button(False)
+
+
 def click(x: float, y: float, times: int = 1):
     """在屏幕坐标点一下（times=2 就是双击）。
 
@@ -793,44 +897,20 @@ def mouse_setting() -> Tuple[bool, float]:
 
 
 def _human_move(x: float, y: float, duration: float):
-    """分步把光标挪过去：缓入缓出 + 轻微弧线 + 低频手抖，最后精确落到目标点。
+    """分步把光标挪过去（缓入缓出 + 轻微弧线 + 低频手抖），最后精确落到目标点。
 
-    三个要点（头两个就是「一卡一卡」的病根）：
+    轨迹本身在 `human_trace` 里（拖动也用它）；这里只负责按节奏把它放出来。
+    两个要点，都是「一卡一卡」的病根：
     · 中间帧不走 pyautogui.moveTo——它每调一次会自己 sleep 0.1 秒，
       几十帧下来就变成一格一格跳（细节见 `_set_cursor`）；
     · 帧数取「按时间」和「按距离」里更密的那个，长距离不会被时间卡成
-      一步跨上百像素的台阶；
-    · 手抖改成低频正弦，另外给轨迹加一条轻微弧线（手腕甩出去本来就是弧的）。
-      每帧塞随机数看着是「毛刺」，不像手。
+      一步跨上百像素的台阶。
     """
-    sx, sy = _cursor_pos()
-    x, y = float(x), float(y)
-    dist = math.hypot(x - sx, y - sy)
-    if dist < 1 or duration <= 0:
+    if duration <= 0:
         _set_cursor(x, y)
         return
-    frames = max(MOVE_MIN_FRAMES,
-                 int(duration / MOVE_FRAME_S),
-                 int(dist / MOVE_MAX_PX))
-    frames = min(frames, MOVE_MAX_FRAMES)
-    # 垂直方向上的单位向量：弧度和手抖都加在这个方向上（不会影响前进的进度）
-    ux, uy = -(y - sy) / dist, (x - sx) / dist
-    bend = random.uniform(-1.0, 1.0) * min(MOVE_BEND_PX, dist * 0.06)
-    amp = MOVE_TREMOR_PX if dist > 40 else 0.0
-    phase = random.uniform(0.0, math.tau)
-    t0 = time.perf_counter()
-    for i in range(1, frames + 1):
-        t = i / frames
-        e = t * t * (3 - 2 * t)             # 缓入缓出：起步慢、中间快、收尾慢
-        # sin(πt) 让弧度两头归零、中间最大，收尾自然收敛到目标点
-        off = (math.sin(math.pi * t) * bend
-               + math.sin(phase + math.tau * 1.5 * t) * amp * math.sin(math.pi * t))
-        _set_cursor(sx + (x - sx) * e + ux * off,
-                    sy + (y - sy) * e + uy * off)
-        # 对齐到「开始时刻 + 这一帧应到的时间」：sleep 的误差不会被累加
-        gap = t0 + duration * t - time.perf_counter()
-        if gap > 0.0005:
-            time.sleep(gap)
+    sx, sy = _cursor_pos()
+    _step_through(human_trace(sx, sy, x, y, duration), duration)
     _set_cursor(x, y)
 
 

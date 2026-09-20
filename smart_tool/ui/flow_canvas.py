@@ -98,6 +98,7 @@ ACTION_META = {
     "group_end": ("组合结束", "#0d7a6a"),
     "script": ("自由代码", "#475569"),
     "call": ("调用函数", "#6d28d9"),
+    "captcha": ("验证码", "#b45309"),
     # 桌面场景
     "win_activate": ("激活窗口", "#7c3aed"),
     "hotkey": ("按键", "#0d9488"),
@@ -202,6 +203,16 @@ def _step_summary_body(s: Step) -> List[str]:
         lines = [f"值：{s.value or '（空）'}"]
         if s.locator:
             lines.append(f"定位：{s.locator.value[:50]}")
+        return lines[:3]
+    if s.action == "captcha":
+        from smart_tool.core import captcha as captcha_mod
+        kind = dict((k, n) for k, n in captcha_mod.KINDS).get(
+            s.captcha_kind, s.captcha_kind)
+        lines = [f"{kind}（最多试 {int(s.captcha_retry or 1)} 次）"]
+        if s.locator and s.locator.value:
+            lines.append(f"验证码图：{s.locator.value[:50]}")
+        else:
+            lines.append("（未指定验证码图的位置）")
         return lines[:3]
     if s.action == "win_activate":
         return [f"窗口：{s.win_title[:50]}" if s.win_title

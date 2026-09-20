@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
 
 from smart_tool.core import blocks, free_code, project_store
 from smart_tool.core.project_store import Locator, Step
+from smart_tool.ui.captcha_panel import CaptchaPanel
 from smart_tool.ui.code_editor import CodeEditor
 from smart_tool.ui.collect_panel import CollectPanel
 from smart_tool.ui.desktop_picker import DesktopPickerDialog
@@ -41,13 +42,13 @@ from smart_tool.ui.window_match_dialog import WindowMatchDialog
 
 # 网页场景能用的动作
 WEB_ACTIONS = [
-    "navigate", "read_data", "collect", "click", "fill", "select",
+    "navigate", "read_data", "collect", "captcha", "click", "fill", "select",
     "note", "pause_for_human", "loop_start", "loop_end", "condition_start",
     "condition_end", "script", "call",
 ]
 # 桌面场景能用的动作（没有浏览器，也就没有 XPath / 下拉选择）
 DESKTOP_ACTIONS = [
-    "win_activate", "click", "fill", "hotkey", "delay", "read_data",
+    "win_activate", "captcha", "click", "fill", "hotkey", "delay", "read_data",
     "note", "pause_for_human", "loop_start", "loop_end", "condition_start",
     "condition_end", "script", "call",
 ]
@@ -57,6 +58,7 @@ ACTION_LABELS = {
     "navigate": "打开网页 navigate",
     "read_data": "读取数据 read_data（读文件夹/文件 → 产出一个列表变量）",
     "collect": "采集数据 collect（把页面上的文字/链接/图片/截图取下来 → 存 data/ 并进变量）",
+    "captcha": "验证码 captcha（滑块拼图 / 文字点选 / 计算题，自动识别并操作）",
     "note": "提示 / 日志 note（画布上写一句说明；运行时把内容打进日志，可含 {{变量}}）",
     "click": "点击 click",
     "fill": "填入 fill",
@@ -493,6 +495,12 @@ class StepEditDialog(QDialog):
         self.collect_panel.capture_requested.connect(self._capture_collect_row)
         form.addRow("采集什么：", self.collect_panel)
 
+        # --- captcha 组：滑块 / 文字点选 / 计算题（验证码图用上面的定位那一行）---
+        self.captcha_panel = CaptchaPanel(self.desktop)
+        self.captcha_panel.capture_requested.connect(self._capture_element)
+        self.captcha_panel.changed.connect(self._sync_visibility)
+        form.addRow("验证码怎么配：", self.captcha_panel)
+
         # --- note 组：画布上的提示 / 运行日志（不碰浏览器，纯说明 + 打日志）---
         self.note_box = QWidget()
         nb = QVBoxLayout(self.note_box)
@@ -927,6 +935,7 @@ class StepEditDialog(QDialog):
         self._navigate_widgets = [self.url_edit, self.nav_timeout]
         self._read_widgets = [self.read_panel]
         self._collect_widgets = [self.collect_panel]
+        self._captcha_widgets = [self.captcha_panel]
         self._note_widgets = [self.note_box]
         self._locator_widgets = [self.locator_type, loc_row, self.locator_hint]
         self._image_widgets = [self.image_hint, self.preview]
@@ -972,12 +981,18 @@ class StepEditDialog(QDialog):
         is_cond = action == "condition_start"
         is_read = action == "read_data"
         is_collect = action == "collect"
+        is_captcha = action == "captcha"
         is_locate = action in ("click", "fill", "select")
+        # 主定位那一行（「定位路径」/「图片模板」）对验证码节点也是必填的 ——
+        # 对验证码来说它填的是「验证码图在哪」，所以用 show_loc 统一控制
+        show_loc = is_locate or is_captcha
         is_fill = action in ("fill", "select")
         # 桌面场景只有「图片模板」一种定位方式：定位方式那个下拉在这儿没有意义
         # （选了也不作数，保存时一律按截图存），下面会把它整行收起来
         loc_kind = "image" if self.desktop else self.locator_type.currentData()
-        is_image = is_locate and loc_kind == "image"
+        is_image = show_loc and loc_kind == "image"
+        # 「兜底截图」只给点击 / 填入 / 下拉用（验证码那边没接这条兜底）
+        is_xpath = is_locate and loc_kind == "xpath"
         is_pause = action == "pause_for_human"
         is_script = action == "script"
         is_call = action == "call"
@@ -985,8 +1000,6 @@ class StepEditDialog(QDialog):
         is_keys = action == "hotkey"
         is_delay = action == "delay"
         cond = self.resume_combo.currentData()
-        # 桌面场景：定位一律是「图片模板」，没有 XPath / 兜底截图这些概念
-        is_xpath = is_locate and loc_kind == "xpath"
         need_target = self.wait_combo.currentData() in WAIT_NEEDS_TARGET
 
         for w in self._navigate_widgets:
@@ -1003,35 +1016,41 @@ class StepEditDialog(QDialog):
             self._show(w, action == "note")
         # 产出变量名：读取 / 采集都要填
         self._show(self.output_var_edit, is_read or is_collect)
+        for w in self._captcha_widgets:
+            self._show(w, is_captcha)
         for w in self._locator_widgets:
-            self._show(w, is_locate)
-        self._show(self.locator_type, is_locate and not self.desktop)
+            self._show(w, show_loc)
+        self._show(self.locator_type, show_loc and not self.desktop)
+        # 桌面场景的窗口名统一走「定位匹配」记的 _window_title（跟点击/填入一样），
+        # 那行输入框只给「激活窗口」用，所以这里不再给验证码多开一个
         self._show(self.win_title_edit, is_win)
         self._show(self.keys_edit, is_keys)
         self._show(self.click_times_combo,
                    self.desktop and action == "click")
-        self.btn_pick_image.setVisible(is_image or (is_locate and self.desktop))
-        self.btn_capture.setVisible(is_xpath or (is_locate and self.desktop))
-        self.btn_match.setVisible(is_locate and self.desktop)
-        self._show(self.capture_hint, is_locate)
+        self.btn_pick_image.setVisible(is_image)
+        self.btn_capture.setVisible(
+            show_loc and (self.desktop or loc_kind == "xpath"))
+        self.btn_match.setVisible(show_loc and self.desktop)
+        self._show(self.capture_hint, show_loc)
         for w in (self.fallback_row, self.fallback_hint):
             self._show(w, is_xpath)
         for w in self._image_widgets:
             self._show(w, is_image)
         # 「相似度」只在**这一步真的会用图片匹配**时才出现：
-        # 定位是图片，或者桌面的「步骤后等待」等的是图片。
-        # 不是一进桌面场景就人人一行 —— 那样等于每个节点都多一个没用的输入框。
-        uses_image = is_image or (
-            self.desktop
-            and self.wait_combo.currentData() in ("element_present", "image_gone"))
+        # 定位是图片、验证码节点（桌面靠图片匹配找那块图）、或者桌面的
+        # 「步骤后等待」等的是图片。不是一进桌面场景就人人一行 ——
+        # 那样等于每个节点都多一个没用的输入框。
+        uses_image = is_image or (self.desktop and (
+            is_captcha
+            or self.wait_combo.currentData() in ("element_present", "image_gone")))
         for w in (self.threshold_spin, self.threshold_hint):
             self._show(w, uses_image)
         for w in self._value_widgets:
             self._show(w, is_fill)
         for w in self._wait_widgets:
-            self._show(w, is_locate)
-        self._show(self.wait_target_row, is_locate and need_target)
-        self.btn_wait_shot.setVisible(self.desktop and is_locate)
+            self._show(w, show_loc)
+        self._show(self.wait_target_row, show_loc and need_target)
+        self.btn_wait_shot.setVisible(self.desktop and show_loc)
         for w in self._pause_widgets:
             self._show(w, is_pause)
         self._show(self.resume_url,
@@ -1054,10 +1073,10 @@ class StepEditDialog(QDialog):
         # 定位那一行的说法随场景变：网页填 XPath，桌面填图片模板
         if self.desktop:
             self.locator_value.setPlaceholderText(
-                "img/xxx.png（点【截屏取模板…】框一个控件）"
+                "img/xxx.png（点【定位匹配…】框一个控件）"
             )
             self.wait_target.setPlaceholderText(
-                "img/xxx.png（点【截屏取模板…】框一个图）"
+                "img/xxx.png（点【定位匹配…】框一个图）"
             )
             self.btn_pick_image.setText("选择图片…")
             self.btn_pick_image.setToolTip("从项目 img/ 里选一张已有图片")
@@ -1068,17 +1087,24 @@ class StepEditDialog(QDialog):
                 "右键＝选上一层（框住容器），按住左键拖＝手动框选，Esc＝取消。"
             )
         else:
-            self.locator_value.setPlaceholderText(
-                "选择截图后自动填入 img/xxx.png" if is_image
-                else "//input[@id='username']"
-            )
+            if is_captcha:
+                self.locator_value.setPlaceholderText(
+                    "//img[@class='captcha-img']（那一整张验证码图）")
+            else:
+                self.locator_value.setPlaceholderText(
+                    "选择截图后自动填入 img/xxx.png" if is_image
+                    else "//input[@id='username']"
+                )
             self.wait_target.setPlaceholderText(
                 "只填 XPath，如 //*[@id='wpadminbar']（说明文字请写到【备注】里）"
             )
             self.btn_pick_image.setText("选择截图…")
         label = self._form.labelForField(self.loc_row)
         if label is not None:
-            label.setText("图片模板：" if self.desktop else "定位路径：")
+            if is_captcha:
+                label.setText("验证码图：")
+            else:
+                label.setText("图片模板：" if self.desktop else "定位路径：")
         sec_label = self._form.labelForField(self.wait_seconds)
         if sec_label is not None:
             sec_label.setText("等待秒数：" if is_delay else "额外等待：")
@@ -1392,6 +1418,21 @@ class StepEditDialog(QDialog):
         image = data.get("image") or ""
         count = data.get("count", 1)
         desc = data.get("desc", "")
+        if target.startswith("captcha_"):
+            # 验证码节点的辅助位置（滑块手柄 / 题干 / 换一张 / 答案输入框）：
+            # 只要 XPath 就够了，不用那张截图（这几个元素都是活的）
+            if not xpath:
+                self.capture_hint.setText(
+                    "没抓到 XPath，换个元素再点一下试试。\n"
+                    "要是这个位置确实不好抓，文字点选的题干可以直接手写在"
+                    "「题干文字」里。")
+                return
+            self.captcha_panel.set_captured(target, xpath, "xpath")
+            warn = "" if count == 1 else f"（命中 {count} 个，建议核对）"
+            self.capture_hint.setText(f"已捕获：{desc} → {xpath}{warn}")
+            drop_capture_image(self.project_dir, data)
+            self._sync_visibility()
+            return
         if target == "main":
             if xpath:
                 self.locator_value.setText(xpath)
@@ -1452,6 +1493,17 @@ class StepEditDialog(QDialog):
             if not dlg.run() or not dlg.result_path:
                 return
             text = dlg.result_text or dlg.result_path
+            if target.startswith("captcha_"):
+                # 验证码的辅助位置（滑块手柄 / 题干 / 换一张 / 答案输入框）：
+                # 只记那张图，窗口信息统一用主定位那一份（都是同一个窗口）
+                self.captcha_panel.set_captured(target, dlg.result_path, "image")
+                if not self._window_title and dlg.window_title:
+                    self._window_title = dlg.window_title
+                self.capture_hint.setText(
+                    f"已捕获：{text}　→　{dlg.result_path}（验证码的辅助位置）")
+                self._show_preview(self.project_dir / dlg.result_path)
+                self._sync_visibility()
+                return
             if target == "wait":
                 self.wait_target.setText(dlg.result_path)
                 self.capture_hint.setText(f"已捕获等待模板：{text}")
@@ -1489,6 +1541,17 @@ class StepEditDialog(QDialog):
             dlg = WindowMatchDialog(self.project_dir, self,
                                     initial_title=self._window_title)
             if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_path:
+                return
+            if target.startswith("captcha_"):
+                # 辅助位置只取那张控件图；窗口名 / 窗口图统一留在主定位那一份上
+                self.captcha_panel.set_captured(target, dlg.result_path, "image")
+                if dlg.window_title and not self._window_title:
+                    self._window_title = dlg.window_title
+                self.capture_hint.setText(
+                    f"已捕获：{dlg.result_path}（验证码的辅助位置，"
+                    f"窗口「{dlg.window_title}」）")
+                self._show_preview(self.project_dir / dlg.result_path)
+                self._sync_visibility()
                 return
             if target == "wait":
                 self.wait_target.setText(dlg.result_path)
@@ -1551,7 +1614,7 @@ class StepEditDialog(QDialog):
                 img_path = self.project_dir / s.locator.value
                 if img_path.exists():
                     self._show_preview(img_path)
-        if self.desktop and s.action in ("click", "fill", "select"):
+        if self.desktop and s.action in ("click", "fill", "select", "captcha"):
             self._window_title = str(getattr(s, "win_title", "") or "")
             if self._window_path:
                 self.capture_hint.setText(
@@ -1593,6 +1656,7 @@ class StepEditDialog(QDialog):
         self.output_var_edit.setText(s.output_var or "")
         self.read_panel.load(s.data_cfg or {})
         self.collect_panel.load(s)
+        self.captcha_panel.load(s)
         self.note_text.setPlainText(s.text or "")
         self.loop_expr_edit.setText(s.loop_expr or "")
         self.loop_mode_combo.setCurrentIndex(max(
@@ -1637,11 +1701,11 @@ class StepEditDialog(QDialog):
                 if action == "click" and not value:
                     errors.append(
                         "桌面场景的「点击」要选一张图片模板"
-                        "（点【截屏取模板…】框住那个控件）"
+                        "（点【定位匹配…】框住那个控件）"
                     )
                 elif value and not _is_project_image(value):
                     errors.append(
-                        "图片模板要用【截屏取模板…】或【选择图片…】来选，"
+                        "图片模板要用【定位匹配…】或【选择图片…】来选，"
                         "路径需位于项目 img/ 目录"
                     )
             else:
@@ -1658,7 +1722,7 @@ class StepEditDialog(QDialog):
                 errors.append("设置了步骤后等待，就必须填写等待目标")
             elif self.desktop and target and not _is_project_image(target):
                 errors.append(
-                    "桌面场景的「等待目标」要选一张图片模板（点【截屏取模板…】）"
+                    "桌面场景的「等待目标」要选一张图片模板（点【定位匹配…】）"
                 )
             elif (not self.desktop and wait_mode == "element_present"
                     and not _looks_like_xpath(target)):
@@ -1717,6 +1781,23 @@ class StepEditDialog(QDialog):
             problem = self.collect_panel.validate()
             if problem:
                 errors.append("「采集数据」：" + problem)
+        elif action == "captcha":
+            cap = self.locator_value.text().strip()
+            if not cap:
+                errors.append(
+                    "「验证码」要指认「验证码图」在哪：在「验证码图」那一行点"
+                    "【捕获元素…】（桌面场景【定位匹配…】）把那一整张图框出来"
+                )
+            elif not self.desktop \
+                    and self.locator_type.currentData() == "xpath" \
+                    and not _looks_like_xpath(cap):
+                errors.append(
+                    "「验证码图」只能填 XPath（例如 //img[@class='captcha-img']），"
+                    "说明文字请写到【备注】里"
+                )
+            problem = self.captcha_panel.validate()
+            if problem:
+                errors.append("「验证码」：" + problem)
         elif action == "loop_start":
             if self.loop_mode_combo.currentData() == "cond":
                 kind = self.loop_cond_kind_combo.currentData()
@@ -1819,6 +1900,24 @@ class StepEditDialog(QDialog):
             step.collect_mode = mode
             step.collect_row = row
             step.collect_fields = fields
+        elif action == "captcha":
+            # 主定位＝「验证码图在哪」；几个辅助位置（滑块手柄 / 题干 / 换一张 /
+            # 答案输入框）由面板自己收
+            step.locator = Locator(
+                type="image" if self.desktop else self.locator_type.currentData(),
+                value=self.locator_value.text().strip(),
+                window=self._window_path,
+                window_size=list(self._window_size),
+                offset=list(self._window_offset),
+                feature=self._feature_path,
+            )
+            step.image_threshold = float(self.threshold_spin.value() or 0)
+            if self.desktop:
+                step.win_title = self._window_title
+            self.captcha_panel.save(step)
+            step.wait_after = self.wait_combo.currentData()
+            step.wait_target = self.wait_target.text().strip()
+            step.wait_seconds = float(self.wait_seconds.value())
         elif action == "note":
             step.text = self.note_text.toPlainText().strip()
         elif action in ("click", "fill", "select"):

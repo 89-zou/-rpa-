@@ -20,8 +20,8 @@ from playwright.sync_api import (
 )
 
 from smart_tool.core import (
-    auth_store, blocks, browser_setup, data_sources, datastore, desktop, free_code,
-    image_locator, project_store,
+    auth_store, blocks, browser_setup, captcha, data_sources, datastore, desktop,
+    free_code, image_locator, project_store,
 )
 from smart_tool.core import real_mouse as real_mouse_mod
 from smart_tool.core.blocks import Block
@@ -1244,6 +1244,8 @@ class StepExecutor:
                 self._win_activate(step)
             elif step.action == "hotkey":
                 self._hotkey(step)
+            elif step.action == "captcha":
+                self._run_captcha(step)
             elif step.action == "delay":
                 self._delay(step)
             elif step.action == "note":
@@ -1711,7 +1713,7 @@ class StepExecutor:
         if not image:
             raise ValueError(
                 "桌面场景的「点击」必须选一张模板图。\n"
-                "   双击这一步，在「图片模板」那一行点【截屏取模板…】框一个控件。"
+                "   双击这一步，在「图片模板」那一行点【定位匹配…】框一个控件。"
             )
         m = self._desktop_locate(image, step)
         times = 2 if int(step.click_times or 1) >= 2 else 1
@@ -2071,6 +2073,361 @@ class StepExecutor:
                 f"   当前页面：{self._current_url() or '（正在跳转中）'}\n"
                 "   多半是上一步之后没跳到你以为的页面，或这个 XPath 属于另一个页面。"
             ) from e
+
+    # ------------------------------
+    # 验证码（滑块 / 文字点选 / 计算题）
+    # ------------------------------
+    def _run_captcha(self, step: Step):
+        """验证码节点：取图 → 识别 → 操作 → 看还在不在；没过就换一张重来。
+
+        三种验证码的差别全在「识别」那一步，操作只有三类：滑块是按住拖过去，
+        点选是依次点几个点，计算题是往输入框里敲答案。所以网页 / 桌面各写一遍
+        取图和落点，识别逻辑共用 core/captcha.py。
+        """
+        kind = (step.captcha_kind or "slider").strip()
+        if kind not in dict(captcha.KINDS):
+            raise ValueError(
+                f"不认识的验证码类型 {kind!r}，只能是 "
+                + " / ".join(f"{k}（{n}）" for k, n in captcha.KINDS))
+        tries = max(1, int(step.captcha_retry or 1))
+        # 配置缺东西属于「填错了」，直接报错 —— 别拿它去重试 3 遍、最后报个
+        # 「试了 3 次都没过」，那样根本看不出是自己没填
+        self._require_captcha_image(step)
+        if kind == "slider":
+            self._captcha_slider_loc(step)
+        elif kind == "click_text":
+            self._captcha_prompt_source(step)
+        err: Optional[Exception] = None
+        for i in range(1, tries + 1):
+            if i > 1:
+                self._captcha_next(step)
+            try:
+                if self.desktop:
+                    self._captcha_desktop(step, kind)
+                else:
+                    self._captcha_web(step, kind)
+            except Exception as e:
+                err = e
+                self.log(f"  第 {i}/{tries} 次没成：{_first_line(e)}")
+                continue
+            if self._captcha_still_there(step) is not True:
+                self.log(f"  第 {i}/{tries} 次处理完了（验证码图不在了，应该是过了）")
+                return
+            err = ValueError("处理完了，但验证码还在界面上")
+            self.log(f"  第 {i}/{tries} 次处理完了，可验证码还在 → 换一张再来")
+        raise ValueError(
+            f"验证码试了 {tries} 次都没过"
+            f"（最后一次：{_first_line(err) if err else '原因不明'}）。\n"
+            "   可以调大「最多试几次」，或者把「换一张」按钮配上。"
+            "嫌麻烦也可以把这一步换成「暂停等人工」，自己拖一次。")
+
+    def _require_captcha_image(self, step: Step) -> Locator:
+        """验证码图的位置是必填的（没它连图都拿不到）。"""
+        loc = step.locator
+        if not loc or not (loc.value or loc.image):
+            raise ValueError(
+                "验证码节点还没指定「验证码图片」在哪。\n"
+                "   双击这一步，在「验证码图」那一行点【捕获元素…】"
+                "（桌面场景点【定位匹配…】）把那张图框出来。")
+        return loc
+
+    def _captcha_slider_loc(self, step: Step) -> Locator:
+        """滑块手柄（拖动的起点）是必填的 —— 少了它会拖到莫名其妙的地方。"""
+        loc = step.captcha_slider
+        if not loc or not (loc.value or loc.image):
+            raise ValueError(
+                "滑块验证码要知道「滑块手柄在哪」（拖动的起点）。\n"
+                "   在「滑块手柄」那一行点【捕获元素…】"
+                "（桌面场景点【定位匹配…】）把那个拼图块框出来。")
+        return loc
+
+    def _captcha_prompt_source(self, step: Step) -> Tuple[str, Optional[Locator]]:
+        """点选的题干从哪来 → (手写的文字, 元素定位)。手写的优先，两个都空就报错。"""
+        manual = (step.captcha_prompt or "").strip()
+        if manual:
+            return manual, None
+        loc = step.captcha_tip
+        if not loc or not (loc.value or loc.image):
+            raise ValueError(
+                "文字点选要知道「点哪些字」，但题干是空的。两种填法：\n"
+                "   ①把题干那句话直接写进「题干文字」（如：圈、流、伟）；\n"
+                "   ②把题干所在的位置填进「题干」那一行 ——"
+                "页面上是段文字就取文字，是张图片就再认一次字。")
+        return "", loc
+
+    # ---- 网页 ----
+    def _captcha_web(self, step: Step, kind: str):
+        """网页场景：在页面上取图 → 识别 → 用页面上算出来的坐标操作。"""
+        loc = self._require_captcha_image(step)
+        data, box, (iw, ih) = self._web_element_bytes(loc)
+        if iw < 4 or ih < 4:
+            raise ValueError("验证码图取回来是空的，没法识别。")
+        # 原图像素 → 页面 CSS 像素的比例。图被 CSS 放大/缩小时少了这一步必然点歪。
+        kx, ky = box["width"] / iw, box["height"] / ih
+        self.log(f"  验证码图原图 {iw:.0f}×{ih:.0f}，页面上 "
+                 f"{box['width']:.0f}×{box['height']:.0f}（缩放 {kx:.2f}×）")
+
+        if kind == "slider":
+            handle = self._captcha_slider_loc(step)
+            target, _hbox, _hs = self._web_element_bytes(handle)
+            offset, conf, how = captcha.slide_offset(target, data)
+            self.log(f"  缺口在原图上的 x = {offset:.0f}"
+                     f"（把握 {conf:.2f}，{how}）")
+            hx = _hbox["x"] + _hbox["width"] / 2
+            hy = _hbox["y"] + _hbox["height"] / 2
+            self._mouse_drag(hx, hy, box["x"] + offset * kx, hy)
+        elif kind == "click_text":
+            self._captcha_click_text(
+                step, data,
+                lambda cx, cy: self._mouse_click(box["x"] + cx * kx,
+                                                 box["y"] + cy * ky))
+        else:
+            text, expr, answer = captcha.solve_math_image(data)
+            self.log(f"  认出 {text!r} → {expr} = {answer}")
+            self._captcha_fill(step, answer)
+
+    def _web_element_bytes(self, loc: Locator
+                           ) -> Tuple[bytes, Dict[str, Any], Tuple[float, float]]:
+        """把网页上一个元素的内容取成图片字节，返回 (字节, 页面上的框, 原图长宽)。
+
+        **优先要原始像素**（img 的 src / canvas 的 toDataURL），拿不到才退回元素
+        截图。为什么绕这一下：元素截图拿到的是「显示尺寸」的像素，而识别出来的框
+        和偏移是「图上」的像素 —— 图被 CSS 缩放显示时（很常见）两者差一个比例，
+        不换算就会点歪。读 src 拿到的是原图，配 naturalWidth 才把比例算得准。
+        """
+        if loc.type == "image":
+            m = self._locate_by_image(loc)
+            w, h = float(m.width), float(m.height)
+            box = {"x": m.x - w / 2, "y": m.y - h / 2, "width": w, "height": h}
+            return self._resolve_image_path(loc).read_bytes(), box, (w, h)
+
+        el = self._resolve_xpath(loc)
+        box = el.bounding_box()
+        if not box or box["width"] < 4 or box["height"] < 4:
+            raise ValueError(
+                "验证码图在页面上量不到尺寸（可能还没显示出来，或者被隐藏了）。\n"
+                "   在它前面加一步「等待」等它出现，或者配一下「步骤后等待」。")
+        info = el.evaluate("""e => {
+          const img = e.tagName.toLowerCase() === 'img' ? e : e.querySelector('img');
+          return {
+            src: (img && (img.currentSrc || img.src)) || '',
+            nw: (img && img.naturalWidth) || 0,
+            nh: (img && img.naturalHeight) || 0,
+            canvas: e.tagName.toLowerCase() === 'canvas'
+                    || !!e.querySelector('canvas'),
+          };
+        }""")
+        data = None
+        src = (info.get("src") or "").strip()
+        if src.startswith("data:"):
+            data = base64.b64decode(src.split(",", 1)[1])
+        elif src:
+            data = self._fetch_bytes(src)
+        if data is None and info.get("canvas"):
+            try:
+                url = el.evaluate(
+                    "e => (e.tagName.toLowerCase() === 'canvas' ? e"
+                    " : e.querySelector('canvas')).toDataURL('image/png')")
+                data = base64.b64decode(url.split(",", 1)[1])
+            except Exception:
+                data = None
+        if data is None:
+            self.log("  拿不到验证码的原图（可能跨域或画出来的），改用元素截图")
+            data = el.screenshot(timeout=COLLECT_TIMEOUT_MS)
+        size = (float(info.get("nw") or 0), float(info.get("nh") or 0))
+        if size[0] < 4 or size[1] < 4:
+            size = self._image_size(data)
+        return data, box, size
+
+    def _fetch_bytes(self, url: str) -> Optional[bytes]:
+        """用浏览器自己的会话去下载（带着 cookie，也不吃跨域那套）。"""
+        try:
+            resp = self._page.request.get(url, timeout=DOWNLOAD_TIMEOUT_MS)
+            if resp.ok:
+                return resp.body()
+        except Exception as e:
+            self.log(f"  下载验证码原图失败：{_first_line(e)}")
+        return None
+
+    @staticmethod
+    def _image_size(data: bytes) -> Tuple[float, float]:
+        """图片字节的长宽（拿不到就 (0, 0)）。"""
+        try:
+            import io
+            from PIL import Image
+            with Image.open(io.BytesIO(data)) as im:
+                return float(im.width), float(im.height)
+        except Exception:
+            return 0.0, 0.0
+
+    # ---- 桌面 ----
+    def _captcha_desktop(self, step: Step, kind: str):
+        """桌面场景：按窗口名找到窗口 → 只截验证码那一块 → 识别 → 操作。
+
+        注意只截「验证码那一块」，不是整屏也不是整个窗口：识别只吃那一小块图。
+        """
+        loc = self._require_captcha_image(step)
+        m = self._desktop_locate(loc.value or loc.image, step)
+        data = desktop.grab_match_png(m)
+        left, top = m.x - m.width / 2, m.y - m.height / 2
+        self.log(f"  截下验证码那块 {m.width:.0f}×{m.height:.0f}"
+                 f"（置信度 {m.confidence:.2f}）")
+
+        if kind == "slider":
+            handle = self._captcha_slider_loc(step)
+            hm = self._desktop_locate(handle.value or handle.image, step)
+            offset, conf, how = captcha.slide_offset(
+                desktop.grab_match_png(hm), data)
+            self.log(f"  缺口在原图上的 x = {offset:.0f}"
+                     f"（把握 {conf:.2f}，{how}）")
+            desktop.drag(hm.x, hm.y, left + offset, hm.y,
+                         duration=0.7, log=self.log)
+        elif kind == "click_text":
+            self._captcha_click_text(
+                step, data,
+                lambda cx, cy: desktop.click(left + cx, top + cy))
+        else:
+            text, expr, answer = captcha.solve_math_image(data)
+            self.log(f"  认出 {text!r} → {expr} = {answer}")
+            self._captcha_fill(step, answer)
+
+    # ---- 两种场景共用 ----
+    def _captcha_click_text(self, step: Step, data: bytes,
+                            to_screen: Callable[[float, float], None]):
+        """点选：认字 → 按题干里的先后排 → 依次点过去。
+
+        to_screen 负责把「图上的坐标」换成「屏幕/页面坐标」并点下去 ——
+        网页要乘缩放比例，桌面直接平移，所以让调用方决定。
+        """
+        prompt = self._captcha_prompt(step)
+        boxes = captcha.read_boxes(data)
+        if not boxes:
+            raise ValueError("图上一格都没认出来（验证码可能太糊或有干扰线）。")
+        texts = [b[4] for b in boxes]
+        self.log("  图上认到的字：" + "、".join(t or "?" for t in texts))
+        order = captcha.order_targets(prompt, texts)
+        if not order:
+            raise ValueError(
+                f"题干 {prompt!r} 里没有一个是图上认出来的字。\n"
+                f"   图上认到的是：{'、'.join(t or '?' for t in texts)}\n"
+                "   题干填错了？或者换个「最多试几次」再试。")
+        self.log("  题干要依次点：" + "、".join(texts[i] for i in order))
+        for n, idx in enumerate(order, 1):
+            x1, y1, x2, y2, _t = boxes[idx]
+            to_screen((x1 + x2) / 2, (y1 + y2) / 2)
+            self.log(f"  第 {n} 个点了「{texts[idx]}」")
+            time.sleep(0.25 + 0.08 * n)      # 真人点选有节奏，别连成一串
+
+    def _captcha_prompt(self, step: Step) -> str:
+        """点选的题干：手写的优先，否则去「题干」那个定位取（文字或图）。"""
+        manual, loc = self._captcha_prompt_source(step)
+        if manual:
+            return manual
+        if self.desktop:
+            m = self._desktop_locate(loc.value or loc.image, step)
+            prompt = captcha.read_text(desktop.grab_match_png(m))
+        elif loc.type == "image":
+            data, _box, _size = self._web_element_bytes(loc)
+            prompt = captcha.read_text(data)
+        else:
+            prompt = (self._resolve_xpath(loc).inner_text(
+                timeout=CLICK_TIMEOUT_MS) or "")
+        prompt = (prompt or "").strip()
+        if not prompt:
+            raise ValueError(
+                "「题干」那个位置上是空的，没读到要点的字。\n"
+                "   要么把题干换成一张图（用图片定位），要么直接手写进「题干文字」。")
+        return prompt
+
+    def _captcha_fill(self, step: Step, text: str):
+        """把答案填进去：配了输入框就先点它一下，没配就直接往当前焦点敲。"""
+        loc = step.captcha_input
+        if loc and (loc.value or loc.image):
+            self._captcha_click_target(step, loc, "答案输入框")
+            time.sleep(0.15)
+        if self.desktop:
+            desktop.clear_field(log=self.log)
+            desktop.type_text(text, log=self.log)
+        else:
+            self._page.keyboard.press("Control+A")
+            self._page.keyboard.type(text, delay=90)
+        self.log(f"  已填入答案 {text!r}")
+
+    def _captcha_click_target(self, step: Step, loc: Locator, what: str):
+        """按一个定位点一下（换一张 / 答案输入框都走它）。"""
+        if self.desktop:
+            m = self._desktop_locate(loc.value or loc.image, step)
+            desktop.click(m.x, m.y)
+            return
+        if loc.type == "image":
+            m = self._locate_by_image(loc)
+            self._mouse_click(m.x, m.y)
+            return
+        self._resolve_xpath(loc).click(timeout=CLICK_TIMEOUT_MS)
+
+    def _captcha_next(self, step: Step):
+        """换一张验证码（没配「换一张」按钮就原地再来一次）。"""
+        loc = step.captcha_refresh
+        if not loc or not (loc.value or loc.image):
+            self.log("  没配「换一张」按钮 → 原地再试一次")
+            return
+        self.log("  点「换一张」")
+        try:
+            self._captcha_click_target(step, loc, "换一张")
+        except Exception as e:
+            self.log(f"  换一张没点上（{_first_line(e)}），原地再试")
+        time.sleep(0.6)                  # 等新图刷出来
+
+    def _captcha_still_there(self, step: Step) -> Optional[bool]:
+        """验证码图还在不在？True＝还在（多半没过）/ False＝不在了 / None＝判不了。
+
+        这只是旁证 —— 站点真正怎么判是它自己的事。所以**判不了就返回 None**
+        当成过了，交给后面的步骤去发现问题，总比乱猜一通强。信号取「验证码图还在不在」。
+        """
+        loc = step.locator
+        if not loc or not (loc.value or loc.image):
+            return None
+        time.sleep(0.8)                  # 给它一点时间把界面换掉
+        try:
+            if self.desktop:
+                path = self._resolve_image_path(
+                    Locator(type="image", value=loc.value or loc.image))
+                if not path.exists():
+                    return None
+                return bool(desktop.exists(
+                    path, threshold=float(step.image_threshold or 0) or None))
+            if loc.type == "image":
+                return None              # 图片定位不好判「还在不在」，不猜
+            el = self._resolve_xpath(loc)
+            return bool(el.count() and el.first.is_visible())
+        except Exception:
+            return None
+
+    def _mouse_drag(self, x0: float, y0: float, x1: float, y1: float,
+                    duration: float = 0.7):
+        """按住从 (x0,y0) 拖到 (x1,y1)（滑块用）。
+
+        中间发一整条像人的轨迹，不是一步到位 —— 滑块验证码会检查按住期间的
+        采样点，直线匀速（或者干脆跳过去）很容易被判成机器。轨迹算法跟桌面
+        那边共用（desktop.human_trace），两边手感一致。
+        """
+        mouse = self._page.mouse
+        mouse.move(x0, y0)
+        time.sleep(0.05)
+        mouse.down()
+        try:
+            pts = desktop.human_trace(x0, y0, x1, y1, duration)
+            frames = len(pts)
+            t0 = time.perf_counter()
+            for i, (px, py) in enumerate(pts, 1):
+                mouse.move(px, py)
+                gap = t0 + duration * (i / frames) - time.perf_counter()
+                if gap > 0.0005:
+                    time.sleep(gap)
+            mouse.move(x1, y1)
+            time.sleep(0.1)              # 落点停一下再松手
+        finally:
+            mouse.up()
 
     # ------------------------------
     # 鼠标：普通（CDP 合成）/ 真实（OS 级）

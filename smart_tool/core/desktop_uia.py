@@ -101,7 +101,7 @@ def available() -> bool:
 
 def missing_hint() -> str:
     return ("桌面元素捕获需要 uiautomation（拿到控件名字和精确位置），"
-            "没装也能用【截屏取模板…】手工框选。\n"
+            "没装也可以改用【定位匹配…】（选窗口后在窗口截图上框控件）。\n"
             "    装法：.venv\\Scripts\\python -m pip install uiautomation")
 
 
