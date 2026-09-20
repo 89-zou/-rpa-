@@ -14,6 +14,8 @@
 没有 XPath，也没有 DOM：所以定位精度天然不如网页，模板要裁得干净
 （只框控件本身，别带上大片背景）。
 """
+import ctypes
+import math
 import random
 import re
 import sys
@@ -69,6 +71,63 @@ MOUSE_SPEED_PRESETS = (("fast", "快（0.15 秒）", 0.15),
                        ("mid", "中（0.3 秒）", 0.3),
                        ("slow", "慢（0.6 秒）", 0.6))
 DEFAULT_MOUSE_SPEED = 0.3
+
+#: 拟人化移动的帧间隔（秒）。位置更新的节奏要跟得上系统消化鼠标消息的速度，
+#: 这里约 120Hz——每帧只挪一点点，看上去才是「滑过去」而不是「跳过去」。
+MOVE_FRAME_S = 0.008
+#: 一帧最多跨多少像素。距离远的时候靠它补帧，免得帧数被时间卡死、一步跨一大截。
+MOVE_MAX_PX = 22.0
+#: 轨迹的弧度和手抖幅度（像素）。弧度＝手腕甩出去的那种感觉；
+#: 手抖用低频正弦，不用每帧塞随机数（那看着是「毛刺」，不像手）。
+MOVE_BEND_PX = 18.0
+MOVE_TREMOR_PX = 1.2
+#: 帧数上下限：太少能看出台阶，太多白耗时间
+MOVE_MIN_FRAMES = 12
+MOVE_MAX_FRAMES = 240
+#: 急停区域：光标进到这个角落里就中断（跟 pyautogui.FAILSAFE 一个意思）
+FAILSAFE_BOX = 2
+
+
+class _POINT(ctypes.Structure):
+    """GetCursorPos 用的结构体。"""
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def _user32():
+    if sys.platform != "win32":
+        raise DesktopError("桌面自动化目前只支持 Windows。")
+    return ctypes.windll.user32
+
+
+def _cursor_pos() -> Tuple[float, float]:
+    """光标现在在哪（物理像素）。"""
+    pt = _POINT()
+    _user32().GetCursorPos(ctypes.byref(pt))
+    return float(pt.x), float(pt.y)
+
+
+def _set_cursor(x: float, y: float) -> None:
+    """把光标直接放到 (x, y)（物理像素），顺手做一次左上角急停检查。
+
+    为什么不直接调 pyautogui.moveTo：它每次调用完会自己 sleep 一个
+    `pyautogui.PAUSE`（默认 0.1 秒）。拟人化轨迹要连着发几十帧，于是变成
+    「跳一格 → 冻 0.1 秒 → 再跳一格」，这就是一卡一卡的根因
+    （实测：15 步的移动，光 PAUSE 就多花 1.5 秒）。这里直接调系统 API
+    （pyautogui 内部调的也是它），把节奏完全握在自己手里。
+
+    自己发事件就绕开了 pyautogui 的 FAILSAFE，所以在这里补回来——
+    跑的时候把鼠标猛地甩到屏幕左上角＝急停，这个救命功能不能丢。
+    """
+    try:
+        import pyautogui
+        failsafe = bool(pyautogui.FAILSAFE)
+    except Exception:
+        failsafe = False
+    if failsafe:
+        cx, cy = _cursor_pos()
+        if cx <= FAILSAFE_BOX and cy <= FAILSAFE_BOX:
+            raise DesktopError("检测到光标被甩到屏幕左上角，已急停。")
+    _user32().SetCursorPos(int(round(x)), int(round(y)))
 
 
 def available() -> bool:
@@ -692,12 +751,11 @@ def exists(template_path, threshold: Optional[float] = None) -> bool:
 
 def move(x: float, y: float):
     """把光标移到 (x, y)。开了拟人化就分步挪过去，否则一步到位。"""
-    gui = _gui()
     human, speed = _MOUSE["human"], _MOUSE["speed"]
     if human and speed > 0:
-        _human_move(gui, x, y, speed)
+        _human_move(x, y, speed)
     else:
-        gui.moveTo(int(round(x)), int(round(y)))
+        _set_cursor(x, y)
 
 
 def click(x: float, y: float, times: int = 1):
@@ -734,27 +792,46 @@ def mouse_setting() -> Tuple[bool, float]:
     return bool(_MOUSE["human"]), float(_MOUSE["speed"])
 
 
-def _human_move(gui, x: float, y: float, duration: float):
-    """分步把光标挪过去：缓入缓出 + 轻微抖动，最后精确落到目标点。
+def _human_move(x: float, y: float, duration: float):
+    """分步把光标挪过去：缓入缓出 + 轻微弧线 + 低频手抖，最后精确落到目标点。
 
-    为什么不用 pyautogui 自带的 moveTo(duration=...)：它是一步插值到底、
-    走的是直线匀速，跟人手差得远；而且它不发中间位置，某些程序看不到
-    「鼠标一路移过来」的过程。这里自己发每一步，中途带点抖动，收尾拉直。
+    三个要点（头两个就是「一卡一卡」的病根）：
+    · 中间帧不走 pyautogui.moveTo——它每调一次会自己 sleep 0.1 秒，
+      几十帧下来就变成一格一格跳（细节见 `_set_cursor`）；
+    · 帧数取「按时间」和「按距离」里更密的那个，长距离不会被时间卡成
+      一步跨上百像素的台阶；
+    · 手抖改成低频正弦，另外给轨迹加一条轻微弧线（手腕甩出去本来就是弧的）。
+      每帧塞随机数看着是「毛刺」，不像手。
     """
-    try:
-        sx, sy = gui.position()
-    except Exception:
-        sx, sy = x, y
-    steps = max(6, min(40, int(duration / 0.02)))
-    for i in range(1, steps + 1):
-        t = i / steps
-        t = t * t * (3 - 2 * t)              # ease-in-out：起步慢、中间快、收尾慢
-        jitter = 1.5 if i < steps else 0.0   # 最后一步不抖，保证落到点上
-        nx = sx + (x - sx) * t + random.uniform(-jitter, jitter)
-        ny = sy + (y - sy) * t + random.uniform(-jitter, jitter)
-        gui.moveTo(int(round(nx)), int(round(ny)))
-        time.sleep(duration / steps)
-    gui.moveTo(int(round(x)), int(round(y)))
+    sx, sy = _cursor_pos()
+    x, y = float(x), float(y)
+    dist = math.hypot(x - sx, y - sy)
+    if dist < 1 or duration <= 0:
+        _set_cursor(x, y)
+        return
+    frames = max(MOVE_MIN_FRAMES,
+                 int(duration / MOVE_FRAME_S),
+                 int(dist / MOVE_MAX_PX))
+    frames = min(frames, MOVE_MAX_FRAMES)
+    # 垂直方向上的单位向量：弧度和手抖都加在这个方向上（不会影响前进的进度）
+    ux, uy = -(y - sy) / dist, (x - sx) / dist
+    bend = random.uniform(-1.0, 1.0) * min(MOVE_BEND_PX, dist * 0.06)
+    amp = MOVE_TREMOR_PX if dist > 40 else 0.0
+    phase = random.uniform(0.0, math.tau)
+    t0 = time.perf_counter()
+    for i in range(1, frames + 1):
+        t = i / frames
+        e = t * t * (3 - 2 * t)             # 缓入缓出：起步慢、中间快、收尾慢
+        # sin(πt) 让弧度两头归零、中间最大，收尾自然收敛到目标点
+        off = (math.sin(math.pi * t) * bend
+               + math.sin(phase + math.tau * 1.5 * t) * amp * math.sin(math.pi * t))
+        _set_cursor(sx + (x - sx) * e + ux * off,
+                    sy + (y - sy) * e + uy * off)
+        # 对齐到「开始时刻 + 这一帧应到的时间」：sleep 的误差不会被累加
+        gap = t0 + duration * t - time.perf_counter()
+        if gap > 0.0005:
+            time.sleep(gap)
+    _set_cursor(x, y)
 
 
 def clear_field(log: Callable[[str], None] = print):
