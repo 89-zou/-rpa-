@@ -493,3 +493,41 @@ def apply_default_rule(steps: List[Step], index: int) -> None:
         return
     if (steps[owner.start].cond_mode or "rule") == "rule":
         step.cond_op = "contains"
+
+
+# ------------------------------
+# 循环：次数 / 列表 还是 条件（while）
+# ------------------------------
+#: 循环方式（key, 界面上的中文名）
+LOOP_MODES = [
+    ("each", "次数 / 列表（先算好一份清单，挨个跑完就结束）"),
+    ("cond", "条件（每轮先判断，判断不出次数——while）"),
+]
+#: 条件模式里「判断什么」（key, 界面上的中文名）
+LOOP_COND_KINDS = [
+    ("element", "网页上有这个元素（填 XPath）"),
+    ("image", "屏幕上找到这张图（选项目里的图片）"),
+    ("var", "变量满足条件（变量 + 判断方式 + 值）"),
+    ("expr", "自定义表达式（Python，能用 元素存在(...) / 图片存在(...)）"),
+]
+LOOP_COND_CN = dict(LOOP_COND_KINDS)
+
+
+def loop_summary(step: Step) -> str:
+    """循环节点在流程列表 / 画布上的一句话摘要。"""
+    if (step.loop_mode or "each") != "cond":
+        expr = (step.loop_expr or "").strip()
+        return f"遍历 {expr}" if expr else "（还没填循环内容）"
+
+    kind = step.loop_cond_kind or "element"
+    arg = (step.loop_cond_arg or "").strip()
+    if kind == "var":
+        op = COND_OP_CN.get((step.loop_cond_op or "").strip(), "")
+        what = f"{arg} {op} {step.loop_cond_value or ''}".strip()
+    elif kind == "image":
+        what = arg.replace("\\", "/").rsplit("/", 1)[-1] or "（还没选图片）"
+    else:
+        what = arg or "（还没填）"
+    if len(what) > 40:
+        what = what[:39] + "…"
+    return f"一直等到：{what}" if step.loop_cond_stop else f"只要「{what}」就一直跑"

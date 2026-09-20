@@ -91,12 +91,25 @@ class Step:
     # encoding/sheet/has_header/field_map/vars_picked）
     output_var: str = ""                   # 产出变量名，如「文章列表」
     data_cfg: Dict[str, Any] = field(default_factory=dict)
-    # ---- loop_start 专用：循环什么，只填一个表达式 ----
-    # 纯数字 10        跑 10 次（loop.item = 索引 0~9）
-    # {{变量}}         按变量的「长度」跑：列表 / JSON 数组 / 多行文本按项数，
-    #                  取值为整数则按该数；每一项注入 {{loop.item}}
-    # 其他文本         按行/逗号切分成多项；只有一项就只跑一次
+    # ---- loop_start 专用：循环什么 ----
+    # 【次数/列表】按 loop_expr 先算出一份固定清单，再逐项跑（for 语义）：
+    #   纯数字 10        跑 10 次（loop.item = 索引 0~9）
+    #   {{变量}}         按变量的「长度」跑：列表 / JSON 数组 / 多行文本按项数，
+    #                   取值为整数则按该数；每一项注入 {{loop.item}}
+    #   其他文本         按行/逗号切分成多项；只有一项就只跑一次
     loop_expr: str = ""
+    # 【条件】每轮**先判断**再决定跑不跑（while / until 语义），判断不出次数
+    loop_mode: str = "each"                # each＝次数/列表；cond＝条件
+    # 判断什么：element＝网页上有这个元素；image＝屏幕上找到这张图；
+    #          var＝变量满足条件（配 loop_cond_op / loop_cond_value）；
+    #          expr＝自定义表达式
+    loop_cond_kind: str = "element"
+    loop_cond_arg: str = ""                # XPath / 图片名 / 变量名 / 表达式
+    loop_cond_op: str = ""                 # var 用：判断方式，见 blocks.COND_OPS
+    loop_cond_value: str = ""              # var 用：要比较的值
+    loop_cond_stop: bool = False           # 成立时：False＝继续下一轮；True＝结束循环
+    loop_interval: float = 1.0             # 每轮之间等几秒（0＝不等，监控类必填）
+    loop_max: int = 10000                  # 最多跑几轮，0＝不限（死循环刹车）
     # ---- condition_start 专用：条件判断 ----
     # cond_mode: rule  条件节点只提供「判断的数据」（cond_expr 写 {{变量}}）；
     #                  块里**直属的动作节点**各自带一条规则（cond_op + cond_value），
@@ -185,7 +198,17 @@ class Step:
                 d["collect_fields"] = [dict(f) for f in self.collect_fields
                                        if isinstance(f, dict)]
         if self.action == "loop_start":
-            d["loop_expr"] = self.loop_expr
+            d["loop_mode"] = self.loop_mode or "each"
+            if self.loop_mode == "cond":
+                d["loop_cond_kind"] = self.loop_cond_kind or "element"
+                d["loop_cond_arg"] = self.loop_cond_arg
+                d["loop_cond_op"] = self.loop_cond_op
+                d["loop_cond_value"] = self.loop_cond_value
+                d["loop_cond_stop"] = bool(self.loop_cond_stop)
+                d["loop_interval"] = float(self.loop_interval or 0)
+                d["loop_max"] = int(self.loop_max or 0)
+            else:
+                d["loop_expr"] = self.loop_expr
         if self.action == "condition_start":
             d["cond_mode"] = self.cond_mode
             if self.cond_expr:
@@ -247,6 +270,14 @@ class Step:
             collect_fields=[dict(f) for f in d.get("collect_fields", [])
                             if isinstance(f, dict)],
             loop_expr=d.get("loop_expr", ""),
+            loop_mode=d.get("loop_mode") or "each",
+            loop_cond_kind=d.get("loop_cond_kind") or "element",
+            loop_cond_arg=d.get("loop_cond_arg", ""),
+            loop_cond_op=d.get("loop_cond_op", ""),
+            loop_cond_value=d.get("loop_cond_value", ""),
+            loop_cond_stop=bool(d.get("loop_cond_stop")),
+            loop_interval=float(d.get("loop_interval", 1.0) or 0),
+            loop_max=int(d.get("loop_max", 10000) or 0),
             cond_mode=d.get("cond_mode") or "rule",
             cond_expr=d.get("cond_expr", ""),
             cond_op=d.get("cond_op", ""),

@@ -204,6 +204,27 @@ def wait_gone(template_path: Path, wait_s: float = DEFAULT_WAIT_S,
 # ------------------------------
 # 鼠标 / 键盘
 # ------------------------------
+def exists(template_path, threshold: Optional[float] = None) -> bool:
+    """屏幕上现在有没有这张图（即时看一眼，不等、不抛异常）。
+
+    给「循环」的条件判断用：监控某个图标 / 提示是不是出现了。
+    想让它出现就等一会儿的（比如等按钮变亮）用 `locate()`。
+    """
+    try:
+        path = Path(template_path)
+        if not path.is_file():
+            return False
+        template = image_locator.imread_unicode(path)
+        if template is None or min(template.shape[:2]) < 4:
+            return False
+        limit = (threshold if threshold is not None
+                 else image_locator.DEFAULT_THRESHOLD)
+        return image_locator.best_match(_grab_bgr(), template,
+                                        threshold=limit) is not None
+    except Exception:
+        return False
+
+
 def move(x: float, y: float):
     _gui().moveTo(int(round(x)), int(round(y)))
 

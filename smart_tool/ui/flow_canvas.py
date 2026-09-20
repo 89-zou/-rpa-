@@ -217,6 +217,10 @@ def _step_summary_body(s: Step) -> List[str]:
         }.get(s.resume_condition, s.resume_condition)
         return [s.prompt[:50] or "（无提示）", f"恢复：{cond}（{s.resume_timeout}s）"]
     if s.action == "loop_start":
+        if (s.loop_mode or "each") == "cond":
+            return [blocks.loop_summary(s),
+                    f"每轮间隔 {float(s.loop_interval or 0):g} 秒 · "
+                    f"最多 {int(s.loop_max or 0) or '不限'} 轮"]
         expr = (s.loop_expr or "").strip()
         if not expr:
             return ["循环内容（未填写）"]
@@ -1474,6 +1478,8 @@ class FlowCanvas(QWidget):
             count = len(blocks.direct_children(self._spans, sp))
             return f"↳ 条件（{mode}：{step.cond_expr or '未填'}，{count} 个动作节点）"
         step = self._steps[sp.start]
+        if (step.loop_mode or "each") == "cond":
+            return f"↳ 循环体（{blocks.loop_summary(step)}）"
         expr = (step.loop_expr or "").strip()
         if not expr:
             return "↳ 循环体（还没填循环内容）"
