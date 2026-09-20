@@ -193,10 +193,32 @@ ACTION_SPECS: Dict[str, Dict[str, Any]] = {
     },
     "loop_start": {
         "label": "循环", "scenes": [SCENE_WEB, SCENE_DESKTOP],
-        "desc": "循环的开头（系统会自动补上配对的「循环结束」）。"
-                "loop_expr 写数字＝跑几次；写 {{变量}}＝按它的长度跑。"
+        "desc": "循环的开头（系统会自动补上配对的「循环结束」）。两种方式：\n"
+                "· loop_mode='each'（默认）：先算好一份清单跑完 —— "
+                "loop_expr 写数字＝跑几次，写 {{变量}}＝按它的长度跑；\n"
+                "· loop_mode='cond'：每轮开头先判断，判断不出次数（while）—— "
+                "loop_cond_kind 选 element（网页元素，loop_cond_arg 填 XPath）/ "
+                "image（屏幕图片，loop_cond_arg 填图片名，放进项目 img/）/ "
+                "var（变量，配 loop_cond_op + loop_cond_value）/ expr（Python，"
+                "能用 元素存在(...) / 图片存在(...)）；loop_cond_stop=True 表示"
+                "「一直等到条件成立」（监控某样东西出现），False 表示「条件成立就继续」。"
+                "配 loop_interval（每轮间隔秒）和 loop_max（最多轮数，0＝不限）防死循环。\n"
                 "循环体里用 {{loop.item}} / {{loop.index}}。",
-        "fields": [f("loop_expr", "str", "循环什么：10 或 {{列表变量}}", True)],
+        "fields": [
+            f("loop_mode", "str", "循环方式", default="each",
+              choices=["each", "cond"]),
+            f("loop_expr", "str", "each 模式：循环什么，如 10 或 {{列表变量}}"),
+            f("loop_cond_kind", "str", "cond 模式：判断什么", default="element",
+              choices=["element", "image", "var", "expr"]),
+            f("loop_cond_arg", "str", "cond 模式：XPath / 图片名 / {{变量}} / 表达式"),
+            f("loop_cond_op", "str", "cond 模式的 var：判断方式"
+              "（contains / not_contains / eq / ne / gt / lt / ge / le）"),
+            f("loop_cond_value", "str", "cond 模式的 var：要比较的值"),
+            f("loop_cond_stop", "bool", "cond 模式：成立时结束循环吗"
+              "（true＝一直等到条件成立；false＝条件成立就继续）", default=False),
+            f("loop_interval", "float", "cond 模式：每轮间隔几秒", default=1.0),
+            f("loop_max", "int", "cond 模式：最多跑几轮，0＝不限", default=10000),
+        ],
     },
     "condition_start": {
         "label": "条件 if/else", "scenes": [SCENE_WEB, SCENE_DESKTOP],
@@ -561,7 +583,7 @@ def _summary(step: Step) -> str:
     if a == "note":
         return "提示：" + (step.text or "").replace("\n", " ")[:40]
     if a == "loop_start":
-        return f"循环 {step.loop_expr}"
+        return blocks.loop_summary(step)
     if a == "loop_end":
         return "循环结束"
     if a == "condition_start":
@@ -774,24 +796,40 @@ def move_step(project: str, index: int, to: int) -> Dict[str, Any]:
     return {"moved": _summary(step), "from": i, "to": j}
 
 
-def add_loop(project: str, loop_expr: str, body: Optional[List[Dict]] = None,
-             at: Optional[int] = None, title: str = "", note: str = "") -> Dict[str, Any]:
+def add_loop(project: str, loop_expr: str = "",
+             body: Optional[List[Dict]] = None,
+             at: Optional[int] = None, title: str = "", note: str = "",
+             loop_mode: str = "each", cond_kind: str = "element",
+             cond_arg: str = "", cond_op: str = "", cond_value: str = "",
+             cond_stop: bool = False, interval: float = 1.0,
+             max_rounds: int = 10000) -> Dict[str, Any]:
     """加一个循环（自动补「循环结束」）。
 
-    loop_expr：数字＝跑几次；{{变量}}＝按它的长度跑。
+    · loop_mode="each"（默认）：loop_expr 写数字＝跑几次；{{变量}}＝按它的长度跑。
+    · loop_mode="cond"：每轮开头先判断（while）—— cond_kind 选 element（XPath）/
+      image（图片名）/ var（变量，配 cond_op + cond_value）/ expr（Python 表达式）；
+      cond_stop=True 表示「一直等到条件成立」，False 表示「条件成立就继续」。
     body：循环体里的步骤（可选，之后也能用 add_steps 往 body_end 里插）。
     """
     store = _store(project)
     steps = store.load_steps()
     pos = len(steps) if at is None else int(at)
     inner = [_step_from_dict(x) for x in (body or [])]
-    new = [Step(id=0, action="loop_start", loop_expr=str(loop_expr),
-                title=title, note=note)] + inner + [Step(id=0, action="loop_end")]
+    head = Step(id=0, action="loop_start", loop_mode=loop_mode,
+                loop_expr=str(loop_expr),
+                loop_cond_kind=cond_kind or "element",
+                loop_cond_arg=str(cond_arg), loop_cond_op=str(cond_op),
+                loop_cond_value=str(cond_value),
+                loop_cond_stop=bool(cond_stop),
+                loop_interval=float(interval), loop_max=int(max_rounds),
+                title=title, note=note)
+    new = [head] + inner + [Step(id=0, action="loop_end")]
     result = steps[:pos] + new + steps[pos:]
     _save_checked(store, result)
     return {"range": [pos, pos + len(new) - 1],
             "body_range": [pos + 1, pos + len(inner)],
-            "summary": f"循环 {loop_expr}（{len(inner)} 个步骤在体内）"}
+            "summary": f"{blocks.loop_summary(head)}"
+                       f"（{len(inner)} 个步骤在体内）"}
 
 
 def add_condition(project: str, cond_expr: str,
@@ -942,8 +980,15 @@ def _connect_roundtrip(steps: List[Step]) -> List[str]:
             cfg = s.data_cfg or {}
             if not cfg.get("type") or not cfg.get("path"):
                 out.append(f"第 {i} 步（读取数据）没配好 type / path")
-        if a == "loop_start" and not (s.loop_expr or "").strip():
-            out.append(f"第 {i} 步（循环）没填循环内容")
+        if a == "loop_start":
+            if (s.loop_mode or "each") == "cond":
+                if not (s.loop_cond_arg or "").strip():
+                    out.append(f"第 {i} 步（循环）选了条件方式，但没填条件内容")
+                elif ((s.loop_cond_kind or "element") == "var"
+                      and not (s.loop_cond_op or "").strip()):
+                    out.append(f"第 {i} 步（循环）的变量条件没选判断方式")
+            elif not (s.loop_expr or "").strip():
+                out.append(f"第 {i} 步（循环）没填循环内容")
         if a == "condition_start" and not (s.cond_expr or "").strip():
             out.append(f"第 {i} 步（条件）没填判断的数据")
         if a == "pause_for_human":

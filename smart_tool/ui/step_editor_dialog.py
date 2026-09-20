@@ -193,11 +193,20 @@ LOOP_HELP = (
     "夹在中间的那些步骤（列表里缩进显示）会重复执行。\n"
     "设置只有这一份——点「循环结束」打开的也是这里。\n"
     "\n"
-    "【循环内容怎么写】\n"
+    "【方式一：次数 / 列表】（跑固定次数，或挨个处理拿到的数据）\n"
     "· 跑固定次数 → 填数字，如 10（{{loop.item}} 是当前序号，0 起）；\n"
-    "· 挨个处理「读取数据」/「采集数据」拿到的东西 → 填 {{变量名}}\n"
-    "  （如 {{文章列表}}）；\n"
+    "· 挨个处理「读取数据」/「采集数据」拿到的东西 → 填 {{变量名}}；\n"
     "· 别的写法也行：值是列表 / 多行文本就逐项遍历，是数字就跑那么多次。\n"
+    "\n"
+    "【方式二：条件】（判断不出次数，每轮开头先判断一次）\n"
+    "· 判断什么：网页元素（填 XPath）/ 屏幕图片（选项目里的图）/ 变量满足 / 自定义表达式；\n"
+    "· 成立时：\n"
+    "    「继续下一轮」＝ 只要条件成立就一直转（while）；\n"
+    "    「结束循环」  ＝ 一直等到条件成立才往下走（until），\n"
+    "                     等一个东西出现、等加载转圈消失，都用这个。\n"
+    "· 每轮间隔：监控类场景一定要填（比如 1 秒），不然会空转把 CPU 吃满；\n"
+    "· 最多轮数：死循环刹车，转这么多轮还没等到就停下（0＝不限）。\n"
+    "  运行时随时可以点【停止】。\n"
     "\n"
     "【循环体里能用什么】\n"
     "· {{loop.item}}         —— 当前这一项（列表项是对象时，用它下面的字段，\n"
@@ -665,7 +674,15 @@ class StepEditDialog(QDialog):
         self.resume_timeout.setSuffix(" 秒")
         form.addRow("等待超时：", self.resume_timeout)
 
-        # --- 循环组：只填一个「循环内容」 ---
+        # --- 循环组 ---
+        self.loop_mode_combo = QComboBox()
+        for key, label in blocks.LOOP_MODES:
+            self.loop_mode_combo.addItem(label, key)
+        self.loop_mode_combo.currentIndexChanged.connect(
+            self._on_loop_mode_changed)
+        form.addRow("循环方式：", self.loop_mode_combo)
+
+        # 方式一：次数 / 列表（先算好一份清单，挨个跑完）
         self.loop_expr_edit = QLineEdit()
         self.loop_expr_edit.setPlaceholderText(
             "10 = 跑 10 次；{{文章列表}} = 按这个变量的长度跑"
@@ -680,6 +697,70 @@ class StepEditDialog(QDialog):
         loop_layout.addWidget(self.loop_expr_edit, 1)
         loop_layout.addWidget(self.loop_expr_var_combo)
         form.addRow("循环内容：", self.loop_expr_row)
+
+        # 方式二：条件（每轮先判断，判断不出次数）
+        self.loop_cond_kind_combo = QComboBox()
+        for key, label in blocks.LOOP_COND_KINDS:
+            self.loop_cond_kind_combo.addItem(label, key)
+        self.loop_cond_kind_combo.currentIndexChanged.connect(
+            self._on_loop_cond_kind_changed)
+        form.addRow("判断什么：", self.loop_cond_kind_combo)
+
+        self.loop_cond_arg_edit = QLineEdit()
+        self.loop_cond_arg_edit.setPlaceholderText('//*[@id="ok"]')
+        self.loop_cond_arg_combo = QComboBox()      # 变量 / 图片，随「判断什么」变
+        self.loop_cond_arg_combo.setMinimumWidth(190)
+        self.loop_cond_arg_combo.activated.connect(self._on_loop_arg_picked)
+        self.btn_loop_image = QPushButton("选择图片…")
+        self.btn_loop_image.clicked.connect(self._pick_loop_image)
+        self.loop_cond_arg_row = QWidget()
+        arg_layout = QHBoxLayout(self.loop_cond_arg_row)
+        arg_layout.setContentsMargins(0, 0, 0, 0)
+        arg_layout.addWidget(self.loop_cond_arg_edit, 1)
+        arg_layout.addWidget(self.loop_cond_arg_combo)
+        arg_layout.addWidget(self.btn_loop_image)
+        form.addRow("条件内容：", self.loop_cond_arg_row)
+
+        self.loop_cond_op_combo = QComboBox()
+        for key, label in blocks.COND_OPS:
+            self.loop_cond_op_combo.addItem(label, key)
+        self.loop_cond_value_edit = QLineEdit()
+        self.loop_cond_value_edit.setPlaceholderText("要比较的值，如 是")
+        self.loop_cond_rule_row = QWidget()
+        loop_rule_layout = QHBoxLayout(self.loop_cond_rule_row)
+        loop_rule_layout.setContentsMargins(0, 0, 0, 0)
+        loop_rule_layout.addWidget(self.loop_cond_op_combo)
+        loop_rule_layout.addWidget(self.loop_cond_value_edit, 1)
+        form.addRow("变量判断：", self.loop_cond_rule_row)
+
+        self.loop_cond_stop_combo = QComboBox()
+        self.loop_cond_stop_combo.addItem("继续下一轮（条件成立就一直转）", False)
+        self.loop_cond_stop_combo.addItem("结束循环（一直等到条件成立）", True)
+        self.loop_cond_stop_combo.setToolTip(
+            "「监控某样东西出现」通常选「结束循环」：\n"
+            "只要条件还没成立就一直转，成立了就往下走。")
+        form.addRow("成立时：", self.loop_cond_stop_combo)
+
+        self.loop_interval_spin = QDoubleSpinBox()
+        self.loop_interval_spin.setRange(0.0, 3600.0)
+        self.loop_interval_spin.setDecimals(1)
+        self.loop_interval_spin.setSingleStep(0.5)
+        self.loop_interval_spin.setSuffix(" 秒")
+        form.addRow("每轮间隔：", self.loop_interval_spin)
+
+        self.loop_max_spin = QSpinBox()
+        self.loop_max_spin.setRange(0, 1000000)
+        self.loop_max_spin.setSpecialValueText("不限")
+        self.loop_max_spin.setSuffix(" 轮")
+        self.loop_max_spin.setToolTip(
+            "死循环刹车：转这么多轮还没等到就停下来（0＝不限）")
+        form.addRow("最多轮数：", self.loop_max_spin)
+
+        self.loop_cond_hint = help_row(
+            "每轮开头先判断一次：成立就按「成立时」那一项决定继续还是跳出。"
+            "「最多轮数」是死循环刹车，填 0 表示不限。",
+            "条件循环（while）", LOOP_HELP)
+        form.addRow("", self.loop_cond_hint)
 
         self.loop_hint = help_row(
             "夹在「循环开始 / 循环结束」中间的步骤会重复执行。",
@@ -811,7 +892,13 @@ class StepEditDialog(QDialog):
         self._wait_widgets = [self.wait_combo, self.wait_seconds]
         self._pause_widgets = [self.prompt_edit, self.resume_combo,
                                self.resume_timeout]
-        self._loop_widgets = [self.loop_expr_row, self.loop_hint]
+        self._loop_widgets = [
+            self.loop_mode_combo, self.loop_expr_row,
+            self.loop_cond_kind_combo, self.loop_cond_arg_row,
+            self.loop_cond_rule_row, self.loop_cond_stop_combo,
+            self.loop_interval_spin, self.loop_max_spin,
+            self.loop_cond_hint, self.loop_hint,
+        ]
         self._script_widgets = [
             self.script_lang_combo, self.script_code, self.script_hint,
         ]
@@ -906,6 +993,8 @@ class StepEditDialog(QDialog):
             self._show(w, is_call)
         for w in self._loop_widgets:
             self._show(w, is_loop)
+        if is_loop:
+            self._sync_loop_visibility()      # 循环里再按「方式」细分
         for w in self._cond_widgets:
             self._show(w, is_cond)
 
@@ -979,6 +1068,7 @@ class StepEditDialog(QDialog):
 
         # 名字不写全也能看懂：自定义变量 + 节点产出的，不算「运行时」的那些
         user_names = [n for n in names if not n.startswith("loop.")]
+        self._fill_loop_arg_combo()
         if user_names:
             self.value_hint.setText(
                 f"可用变量 {len(names)} 个，从右侧下拉选择即可插入。\n"
@@ -1017,6 +1107,83 @@ class StepEditDialog(QDialog):
         self.loop_expr_edit.insert(f"{{{{{name}}}}}")
         self.loop_expr_edit.setFocus()
         self.loop_expr_var_combo.setCurrentIndex(0)
+
+    # ------------------------------
+    # 循环：方式与条件
+    # ------------------------------
+    def _on_loop_mode_changed(self):
+        self._sync_loop_visibility()
+
+    def _on_loop_cond_kind_changed(self):
+        self._sync_loop_visibility()
+
+    def _sync_loop_visibility(self):
+        """循环方式＝次数/列表 还是 条件；条件里再按「判断什么」细分。"""
+        is_cond = self.loop_mode_combo.currentData() == "cond"
+        self._show(self.loop_expr_row, not is_cond)
+        self._show(self.loop_hint, not is_cond)
+        for w in (self.loop_cond_kind_combo, self.loop_cond_arg_row,
+                  self.loop_cond_stop_combo, self.loop_interval_spin,
+                  self.loop_max_spin, self.loop_cond_hint):
+            self._show(w, is_cond)
+        if not is_cond:
+            return
+
+        kind = self.loop_cond_kind_combo.currentData() or "element"
+        self._show(self.loop_cond_rule_row, kind == "var")
+        self.btn_loop_image.setVisible(kind == "image")
+        self.loop_cond_arg_combo.setVisible(kind in ("image", "var", "expr"))
+        self.loop_cond_arg_combo.setToolTip(
+            "从项目图片库里选一张" if kind == "image" else "选择后把变量插进来")
+        self.loop_cond_arg_edit.setPlaceholderText({
+            "element": '网页上的定位，如 //*[@id="ok"]',
+            "image": "在屏幕上找的那张图（点右边「选择图片…」）",
+            "var": "{{变量}}（要拿来判断的变量）",
+            "expr": '如 元素存在("//*[@id=\'ok\']") == False',
+        }.get(kind, ""))
+        self._fill_loop_arg_combo()
+
+    def _fill_loop_arg_combo(self):
+        """「条件内容」右边那个下拉：按「判断什么」列变量或图片。"""
+        kind = self.loop_cond_kind_combo.currentData() or "element"
+        combo = self.loop_cond_arg_combo
+        combo.blockSignals(True)
+        combo.clear()
+        if kind == "image":
+            combo.addItem("项目图片 ▾", "")
+            for name in self._image_names():
+                combo.addItem(name, name)
+        else:
+            combo.addItem("插入变量 ▾", "")
+            for n in self._var_names_list:
+                combo.addItem(f"{{{{{n}}}}}", n)
+        combo.blockSignals(False)
+
+    def _on_loop_arg_picked(self, index: int):
+        """从下拉里选了一项：图片直接填名字，变量插成 {{变量}}。"""
+        value = self.loop_cond_arg_combo.itemData(index)
+        if not value:
+            return
+        if self.loop_cond_kind_combo.currentData() == "image":
+            self.loop_cond_arg_edit.setText(str(value))
+        else:
+            self.loop_cond_arg_edit.insert(f"{{{{{value}}}}}")
+        self.loop_cond_arg_edit.setFocus()
+        self.loop_cond_arg_combo.setCurrentIndex(0)
+
+    def _pick_loop_image(self):
+        """给循环条件选一张图片（拷进项目 img/）。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择要监控的图片",
+            str(self.project_dir),
+            "图片 (*.png *.jpg *.jpeg *.bmp *.webp)",
+        )
+        if not path:
+            return
+        rel = self._copy_into_img(Path(path))
+        if rel:
+            self.loop_cond_arg_edit.setText(rel)
+            self._fill_loop_arg_combo()
 
     def _insert_call_var(self, index: int):
         """把选中的变量插到「参数」的光标处（写成 {{变量}}）。"""
@@ -1330,6 +1497,18 @@ class StepEditDialog(QDialog):
         self.collect_panel.load(s)
         self.note_text.setPlainText(s.text or "")
         self.loop_expr_edit.setText(s.loop_expr or "")
+        self.loop_mode_combo.setCurrentIndex(max(
+            0, self.loop_mode_combo.findData(s.loop_mode or "each")))
+        self.loop_cond_kind_combo.setCurrentIndex(max(
+            0, self.loop_cond_kind_combo.findData(s.loop_cond_kind or "element")))
+        self.loop_cond_arg_edit.setText(s.loop_cond_arg or "")
+        self.loop_cond_op_combo.setCurrentIndex(max(
+            0, self.loop_cond_op_combo.findData(s.loop_cond_op or "")))
+        self.loop_cond_value_edit.setText(s.loop_cond_value or "")
+        self.loop_cond_stop_combo.setCurrentIndex(1 if s.loop_cond_stop else 0)
+        self.loop_interval_spin.setValue(float(s.loop_interval or 0))
+        self.loop_max_spin.setValue(int(s.loop_max or 0))
+        self._sync_loop_visibility()
         self.win_title_edit.setText(s.win_title or "")
         self.keys_edit.setText(s.keys or "")
         self.click_times_combo.setCurrentIndex(max(
@@ -1441,7 +1620,18 @@ class StepEditDialog(QDialog):
             if problem:
                 errors.append("「采集数据」：" + problem)
         elif action == "loop_start":
-            if not self.loop_expr_edit.text().strip():
+            if self.loop_mode_combo.currentData() == "cond":
+                kind = self.loop_cond_kind_combo.currentData()
+                if not self.loop_cond_arg_edit.text().strip():
+                    errors.append(
+                        "「循环」选了条件方式，但「条件内容」还没填：\n"
+                        "    网页元素填 XPath；屏幕图片点【选择图片…】；"
+                        "变量写 {{变量}}；自定义表达式写 Python")
+                elif (kind == "var"
+                      and not self.loop_cond_op_combo.currentData()):
+                    errors.append(
+                        "「循环」的变量条件还没选判断方式（等于 / 包含 / 大于 …）")
+            elif not self.loop_expr_edit.text().strip():
                 errors.append(
                     "「循环」必须填循环内容："
                     "写数字＝跑几次（如 10），或写变量＝按它的长度跑（如 {{文章列表}}）"
@@ -1568,7 +1758,15 @@ class StepEditDialog(QDialog):
             step.func_args = self.call_args.text().strip()
             step.script_timeout = self.script_timeout.value()
         elif action == "loop_start":
+            step.loop_mode = self.loop_mode_combo.currentData() or "each"
             step.loop_expr = self.loop_expr_edit.text().strip()
+            step.loop_cond_kind = self.loop_cond_kind_combo.currentData() or "element"
+            step.loop_cond_arg = self.loop_cond_arg_edit.text().strip()
+            step.loop_cond_op = self.loop_cond_op_combo.currentData() or ""
+            step.loop_cond_value = self.loop_cond_value_edit.text().strip()
+            step.loop_cond_stop = bool(self.loop_cond_stop_combo.currentData())
+            step.loop_interval = float(self.loop_interval_spin.value())
+            step.loop_max = int(self.loop_max_spin.value())
         elif action == "condition_start":
             step.cond_mode = self.cond_mode_combo.currentData()
             step.cond_expr = self.cond_expr_edit.text().strip()

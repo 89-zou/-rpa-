@@ -265,6 +265,8 @@ def step_var_fields(step: Step) -> List[str]:
     texts = [step.url, step.value, step.wait_target,
              step.resume_url, step.resume_element, step.prompt,
              step.loop_expr, step.cond_expr,
+             step.loop_cond_arg,       # 循环条件：变量名 / 图片名 / 表达式
+             step.loop_cond_value,
              step.win_title, step.keys, step.text,
              step.func_args,           # 调用函数：实参里可写 {{变量}}
              step.script_code]         # 自由代码：#文件的路径里可写 {{变量}}
@@ -516,9 +518,18 @@ def check_variables(steps: List[Step],
             if (s.collect_mode or "page") == "list" and not (s.collect_row or "").strip():
                 add(s.id, "「采集数据」是列表模式，但没填「每行的定位」"
                           "（比如 //div[@class='item']）")
-        if s.action == "loop_start" and not (s.loop_expr or "").strip():
-            add(s.id, "「循环」节点还没填循环内容（双击节点填写：数字＝跑几次，"
-                      "或 {{变量}}＝按它的长度跑）")
+        if s.action == "loop_start":
+            if (s.loop_mode or "each") == "cond":
+                kind = (s.loop_cond_kind or "element").strip()
+                if not (s.loop_cond_arg or "").strip():
+                    add(s.id, "「循环」选了条件方式，但还没填条件内容"
+                              "（双击循环节点填写：XPath / 图片 / 变量 / 表达式）")
+                elif kind == "var" and not (s.loop_cond_op or "").strip():
+                    add(s.id, "「循环」的变量条件还没选判断方式"
+                              "（等于 / 包含 / 大于 …）")
+            elif not (s.loop_expr or "").strip():
+                add(s.id, "「循环」节点还没填循环内容（双击节点填写：数字＝跑几次，"
+                          "或 {{变量}}＝按它的长度跑）")
         rule = cond_children.get(idx)
         if rule and rule[3] != "expr":
             _cond, order, total, _mode = rule
@@ -911,21 +922,27 @@ class StepExecutor:
         """这个动作节点成立吗？成立返回一句原因（写日志用），不成立返回空串。
 
         · 判断方式留空＝兜底，无条件成立；
-        · 包含 / 不包含 / 等于 / 不等于：值支持逗号分隔多个，命中任意一个就算；
-        · 大于 / 小于 / 大于等于 / 小于等于：两边都要能当数字。
         """
         op = blocks.rule_op(step)
         if not op:
             return "兜底"
-        raw = self._resolve_value(blocks.rule_value(step)).strip()
+        return self._compare(op, blocks.rule_value(step), data,
+                             _node_label(step))
+
+    def _compare(self, op: str, raw_value: str, data: str, label: str) -> str:
+        """按「判断方式 + 值」比一比：成立返回一句原因，不成立返回空串。
+
+        · 包含 / 不包含 / 等于 / 不等于：值支持逗号分隔多个，命中任意一个就算；
+        · 大于 / 小于 / 大于等于 / 小于等于：两边都要能当数字。
+        """
+        raw = self._resolve_value(raw_value).strip()
         if not raw:
             return ""                       # 值没填 → 不成立（保存时会提示补上）
         if op in blocks.COND_NUMBER_OPS:
             left, right = _as_number(data), _as_number(raw)
             if left is None or right is None:
                 raise ValueError(
-                    f"「{_node_label(step)}」要按数字比，"
-                    f"但「{data}」和「{raw}」不都是数字")
+                    f"「{label}」要按数字比，但「{data}」和「{raw}」不都是数字")
             hit = {"gt": left > right, "lt": left < right,
                    "ge": left >= right, "le": left <= right}[op]
             return f"{blocks.COND_OP_CN[op]} {raw}" if hit else ""
@@ -957,7 +974,8 @@ class StepExecutor:
         code = VAR_PATTERN.sub(
             lambda m: _literal(self.variables.get(m.group(1), "")), raw
         )
-        scope = {"vars": self.variables, "log": self.log}
+        scope = {"vars": self.variables, "log": self.log,
+                 **self._expr_helpers()}
         try:
             value = eval(compile(code, "<条件>", "eval"), scope)   # noqa: S307
         except Exception as e:
@@ -975,8 +993,13 @@ class StepExecutor:
         - 其他文本       → 按行 / 逗号拆成多项
         每一轮注入 {{loop.item}}（当前项，对象会展开成 {{loop.item.字段}}）
         与 {{loop.index}}（第几轮，从 1 开始）。
+
+        循环方式选「条件」时不走这里，见 _run_while_loop。
         """
         start_step = block.start
+        if (start_step.loop_mode or "each") == "cond":
+            self._run_while_loop(block)
+            return
         records, source_label = self._loop_records(start_step)
         if records is None:
             return
@@ -1060,6 +1083,131 @@ class StepExecutor:
             )
         items = _as_list(text) or []
         return items, f"循环内容：{raw[:30]}（{len(items)} 项）"
+
+    # ------------------------------
+    # 条件循环（while）
+    # ------------------------------
+    def _run_while_loop(self, block: Block):
+        """条件循环：每轮**先判断**，再决定跑不跑这一轮。
+
+        · 成立时＝继续下一轮 → while(条件) { 循环体 }
+        · 成立时＝结束循环   → until(条件) { 循环体 }（一直等到条件成立）
+
+        每轮之间等 `loop_interval` 秒，最多跑 `loop_max` 轮（0＝不限）。
+        这两道刹车是给"监控某个东西出现"这类场景兜底的：条件写错了也不至于永远空转。
+        """
+        start = block.start
+        stop_when = bool(start.loop_cond_stop)
+        interval = max(0.0, float(start.loop_interval or 0))
+        limit = max(0, int(start.loop_max or 0))
+        self.log(f"[循环开始] {blocks.loop_summary(start)}"
+                 f"（{'成立就结束' if stop_when else '成立就继续'}；"
+                 f"每轮间隔 {interval:g} 秒，最多 {limit or '不限'} 轮）")
+
+        base_vars = dict(self.variables)
+        rounds = 0
+        while True:
+            if self._stop:
+                self.log("已停止。")
+                break
+            if limit and rounds >= limit:
+                self.log(f"[循环结束] 到设定的最多轮数 {limit} 了，先停下"
+                         "（想跑更久就把循环的「最多轮数」调大，填 0 表示不限）")
+                break
+            ok_cond, why = self._loop_cond_ok(start)
+            if (ok_cond if stop_when else not ok_cond):
+                self.log(f"[循环结束] {'按设定结束循环' if ok_cond else '条件不成立'}"
+                         f"（{why}），共跑了 {rounds} 轮")
+                break
+            rounds += 1
+            carried_script = {
+                k: v for k, v in self.variables.items()
+                if k in self._script_written and not k.startswith(LOOP_PREFIX)
+            }
+            self.variables = {**base_vars, **carried_script,
+                              "loop.index": str(rounds)}
+            self.log(f"──── 循环 {rounds}"
+                     f"{'/' + str(limit) if limit else ''} ────")
+            self._run_nodes(block.nodes)
+            if interval > 0 and not self._stop:
+                time.sleep(interval)
+
+        # 恢复循环外的变量；但脚本产出的（新造的 / 改过值的）保留最后一次的值
+        carried = {
+            k: v for k, v in self.variables.items()
+            if not k.startswith(LOOP_PREFIX)
+            and (k not in base_vars or k in self._script_written)
+        }
+        self.variables = {**base_vars, **carried}
+
+    def _loop_cond_ok(self, start: Step):
+        """循环的条件成立吗？返回 (是否成立, 一句说明)。"""
+        kind = (start.loop_cond_kind or "element").strip()
+        arg = (start.loop_cond_arg or "").strip()
+
+        if kind == "element":
+            if not arg:
+                raise ValueError("「循环」的条件还没填 XPath，请双击循环节点填写。")
+            ok = self._element_present(self._resolve_value(arg).strip())
+            return ok, f"网页元素{'在' if ok else '不在'}：{arg[:40]}"
+
+        if kind == "image":
+            if not arg:
+                raise ValueError(
+                    "「循环」的条件还没选图片，请双击循环节点用【选择图片…】挑一张。")
+            path = self._image_map().get(arg)
+            if not path:
+                raise ValueError(
+                    f"「循环」要看的图片「{arg}」不在项目图片库里。\n"
+                    "   双击循环节点，用【选择图片…】重新挑一张（会存进项目 img/）。")
+            ok = desktop.exists(path)
+            return ok, f"屏幕上{'找到' if ok else '没找到'} {Path(path).name}"
+
+        if kind == "var":
+            if not arg:
+                raise ValueError(
+                    "「循环」的变量条件还没填变量名，请双击循环节点填写。")
+            op = (start.loop_cond_op or "").strip()
+            if not op:
+                raise ValueError(
+                    "「循环」的变量条件还没选判断方式（等于 / 包含 / 大于 …），"
+                    "请双击循环节点填写。")
+            data = self._resolve_value(arg).strip()
+            why = self._compare(op, start.loop_cond_value, data, "循环条件")
+            return bool(why), f"{arg} = 「{data}」→ {why or '不成立'}"
+
+        if not arg:
+            raise ValueError("「循环」的表达式条件还没填，请双击循环节点填写。")
+        code = VAR_PATTERN.sub(
+            lambda m: _literal(self.variables.get(m.group(1), "")), arg)
+        scope = {"vars": self.variables, "log": self.log, **self._expr_helpers()}
+        try:
+            value = eval(compile(code, "<循环条件>", "eval"), scope)   # noqa: S307
+        except Exception as e:
+            raise ValueError(f"循环条件「{arg}」算不出来：{e}")
+        return bool(value), f"表达式 {arg[:40]} → {value}"
+
+    def _expr_helpers(self) -> Dict[str, Any]:
+        """表达式里能直接用的函数（条件的表达式模式、循环的条件都能用）。
+
+        · 元素存在("//*[@id='ok']")  网页上有没有这个元素（不等、不抛异常）
+        · 图片存在("完成.png")        项目 img/ 里那张图现在在不在屏幕上
+        """
+        return {
+            "元素存在": self._element_exists,
+            "图片存在": self._image_exists,
+        }
+
+    def _element_exists(self, xpath: str) -> bool:
+        """网页上这个 XPath 存在且可见吗（即时看一眼，不等、不抛异常）。"""
+        return self._element_present(str(xpath or "").strip())
+
+    def _image_exists(self, name: str, threshold: float = 0.0) -> bool:
+        """项目图片库里这张图，现在在屏幕上吗（即时看一眼）。"""
+        path = self._image_map().get(str(name or "").strip())
+        if not path:
+            return False
+        return desktop.exists(path, threshold or None)
 
     # ------------------------------
     # 步骤分发
