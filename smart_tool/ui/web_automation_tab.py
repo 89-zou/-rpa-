@@ -7,12 +7,12 @@ from typing import List, Optional, Tuple
 from PyQt6.QtCore import QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
-    QCheckBox, QDialog, QHBoxLayout, QLabel, QMenu, QMessageBox,
+    QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel, QMenu, QMessageBox,
     QPushButton, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from smart_tool import paths
-from smart_tool.core import blocks, datastore, real_mouse
+from smart_tool.core import blocks, datastore, desktop, real_mouse
 from smart_tool.core.project_store import (
     ProjectStore, Step, list_projects, rename_field_refs,
 )
@@ -52,6 +52,8 @@ class ExecutorWorker(QThread):
         project_dir=None,
         headless: bool = False,
         real_mouse: bool = False,
+        human_mouse: bool = False,
+        mouse_speed: float = 0.3,
         scene: str = "web",
         auth: Optional[dict] = None,
     ):
@@ -68,6 +70,8 @@ class ExecutorWorker(QThread):
             on_step=self.step_signal.emit,
             on_state=self.state_signal.emit,
             real_mouse=real_mouse,
+            human_mouse=human_mouse,
+            mouse_speed=mouse_speed,
             scene=scene,
             auth=auth,
         )
@@ -234,6 +238,27 @@ class WebAutomationTab(QWidget):
         )
         self.chk_real_mouse.stateChanged.connect(self._on_real_mouse_toggled)
         run_layout.addWidget(self.chk_real_mouse)
+        # 桌面场景的「拟人化鼠标」：光标分步移动过去（缓入缓出 + 轻微抖动），
+        # 落点稍停再点，更像人手 —— 对瞬移敏感的软件更稳。默认关（瞬移最快）。
+        self.chk_human_mouse = QCheckBox("拟人化鼠标")
+        self.chk_human_mouse.setToolTip(
+            "桌面场景的鼠标行为：勾上以后光标**分步移动**过去（缓入缓出 + 轻微抖动）、\n"
+            "落点稍停再按下，更像人手；不勾就是「瞬移到位 + 立刻点」（最快）。\n\n"
+            "什么时候勾：\n"
+            "· 目标程序对「鼠标瞬间跳到控件上」不买账（游戏、有轨迹校验的软件）；\n"
+            "· 需要让人看得出鼠标是一路移过去的。\n\n"
+            "代价：每次点击多花零点几秒（速度在右边选）；跑的时候会占用你的鼠标，\n"
+            "鼠标猛地甩到屏幕左上角可以急停。"
+        )
+        self.chk_human_mouse.stateChanged.connect(self._on_human_mouse_toggled)
+        run_layout.addWidget(self.chk_human_mouse)
+        self.combo_mouse_speed = QComboBox()
+        for key, label, _sec in desktop.MOUSE_SPEED_PRESETS:
+            self.combo_mouse_speed.addItem(label, key)
+        self.combo_mouse_speed.setToolTip("拟人化移动大概花多久挪过去")
+        self.combo_mouse_speed.currentIndexChanged.connect(
+            self._on_mouse_speed_changed)
+        run_layout.addWidget(self.combo_mouse_speed)
         run_layout.addStretch()
         # 日志折叠开关（︿ 收起 / ﹀ 展开）：默认收起，不占画布地方
         self._log_collapsed = True
@@ -274,6 +299,41 @@ class WebAutomationTab(QWidget):
                 "真实鼠标已开启：运行时用系统级鼠标点击。"
                 "浏览器窗口要保持可见、在最前面，全程别动鼠标键盘。"
             )
+
+    def _on_human_mouse_toggled(self, _state):
+        """「拟人化鼠标」开关（桌面场景）：立即写进项目。"""
+        on = self.chk_human_mouse.isChecked()
+        self.combo_mouse_speed.setEnabled(on and self._worker is None)
+        if self._current_store:
+            self._current_store.save_human_mouse(on, self._mouse_speed())
+        if on:
+            self._append_log(
+                f"拟人化鼠标已开启：光标分步移动过去（约 {self._mouse_speed():g} 秒）、"
+                "落点稍停再点。跑的时候别抢鼠标（甩到屏幕左上角可急停）。")
+        else:
+            self._append_log("拟人化鼠标已关闭：光标瞬移到位、立刻点击（最快）。")
+
+    def _on_mouse_speed_changed(self, _index):
+        """移动速度（快/中/慢）：立即写进项目。"""
+        if self._current_store:
+            self._current_store.save_human_mouse(
+                self.chk_human_mouse.isChecked(), self._mouse_speed())
+
+    def _mouse_speed(self) -> float:
+        """当前选的速度 → 秒。"""
+        key = self.combo_mouse_speed.currentData()
+        for k, _label, sec in desktop.MOUSE_SPEED_PRESETS:
+            if k == key:
+                return sec
+        return desktop.DEFAULT_MOUSE_SPEED
+
+    def _set_mouse_speed(self, seconds: float):
+        """按秒数选中对应的速度项（项目里存的是秒）。"""
+        for i, (k, _label, sec) in enumerate(desktop.MOUSE_SPEED_PRESETS):
+            if abs(sec - float(seconds)) < 1e-6:
+                self.combo_mouse_speed.setCurrentIndex(i)
+                return
+        self.combo_mouse_speed.setCurrentIndex(1)      # 认不出来就「中」
 
     def _toggle_log(self):
         """收起/展开日志面板，按钮符号在 ︿ 与 ﹀ 之间切换。"""
@@ -326,12 +386,23 @@ class WebAutomationTab(QWidget):
         self._current_store = store
         self._steps = store.load_steps()
         self._scene = store.load_scene()
-        desktop = self._scene == "desktop"
-        # 桌面场景本身就是系统级鼠标键盘，「真实鼠标」那个开关没意义
-        self.chk_real_mouse.setVisible(not desktop)
+        is_desktop = self._scene == "desktop"
+        # 桌面场景本身就是系统级鼠标键盘，「真实鼠标」那个开关没意义；
+        # 反过来桌面才有「拟人化鼠标」（分步移动 vs 瞬移），网页项目不显示。
+        self.chk_real_mouse.setVisible(not is_desktop)
         self.chk_real_mouse.blockSignals(True)
         self.chk_real_mouse.setChecked(store.load_real_mouse())
         self.chk_real_mouse.blockSignals(False)
+        for w in (self.chk_human_mouse, self.combo_mouse_speed):
+            w.setVisible(is_desktop)
+        mouse_cfg = store.load_human_mouse()
+        self.combo_mouse_speed.blockSignals(True)
+        self._set_mouse_speed(mouse_cfg["speed"])
+        self.combo_mouse_speed.blockSignals(False)
+        self.chk_human_mouse.blockSignals(True)
+        self.chk_human_mouse.setChecked(mouse_cfg["human"])
+        self.chk_human_mouse.blockSignals(False)
+        self.combo_mouse_speed.setEnabled(mouse_cfg["human"])
         # 旧版纵向排版、或新项目还没排过版 → 请求横向蛇形排版。
         # 画布尚未显示时它会挂起，等拿到真实宽度再排（避免列数过窄）。
         need_layout = (
@@ -349,10 +420,10 @@ class WebAutomationTab(QWidget):
         self.canvas.set_placeholder_text(DEFAULT_PLACEHOLDER)
         self.project_label.setText(
             f"当前项目：{store.name}"
-            + ("　【桌面应用】" if desktop else "　【网页】")
+            + ("　【桌面应用】" if is_desktop else "　【网页】")
         )
         self._append_log(f"已载入项目【{store.name}】（{len(self._steps)} 步"
-                         + ("，桌面应用场景）" if desktop else "，网页场景）"))
+                         + ("，桌面应用场景）" if is_desktop else "，网页场景）"))
         self._update_edit_buttons()
         return True
 
@@ -383,6 +454,11 @@ class WebAutomationTab(QWidget):
         self.chk_real_mouse.blockSignals(True)
         self.chk_real_mouse.setChecked(False)
         self.chk_real_mouse.blockSignals(False)
+        for w in (self.chk_human_mouse, self.combo_mouse_speed):
+            w.setVisible(False)             # 没载入项目时不显示鼠标开关
+        self.chk_human_mouse.blockSignals(True)
+        self.chk_human_mouse.setChecked(False)
+        self.chk_human_mouse.blockSignals(False)
         self.canvas.set_manual_edges([])
         self.canvas.set_placeholder_text(NO_PROJECT_PLACEHOLDER)
         self.canvas.load_steps([])
@@ -435,6 +511,9 @@ class WebAutomationTab(QWidget):
         self.btn_load.setEnabled(self._worker is None)
         self.btn_run.setEnabled(self._worker is None and editable)
         self.chk_real_mouse.setEnabled(self._worker is None)
+        self.chk_human_mouse.setEnabled(self._worker is None)
+        self.combo_mouse_speed.setEnabled(
+            self._worker is None and self.chk_human_mouse.isChecked())
 
     def _require_project(self) -> bool:
         if not self._current_store:
@@ -816,6 +895,9 @@ class WebAutomationTab(QWidget):
             project_dir=self._current_store.dir,
             headless=False,
             real_mouse=self.chk_real_mouse.isChecked(),
+            human_mouse=(self._scene == "desktop"
+                         and self.chk_human_mouse.isChecked()),
+            mouse_speed=self._mouse_speed(),
             scene=self._scene,
             auth=self._current_store.load_auth(),
         )

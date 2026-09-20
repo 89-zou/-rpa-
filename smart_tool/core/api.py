@@ -446,7 +446,7 @@ def rename_project(project: str, new_name: str) -> Dict[str, Any]:
 
 
 def get_project(project: str) -> Dict[str, Any]:
-    """项目概况：场景、变量、元素定位、登录态、函数库、步骤数。"""
+    """项目概况：场景、变量、元素定位、登录态、函数库、鼠标行为、步骤数。"""
     store = _store(project)
     steps = store.load_steps()
     return {
@@ -454,6 +454,7 @@ def get_project(project: str) -> Dict[str, Any]:
         "dir": str(store.dir),
         "scene": store.load_scene(),
         "real_mouse": store.load_real_mouse(),
+        "human_mouse": store.load_human_mouse(),
         "step_count": len(steps),
         "variables": store.load_variables(),
         "locators": store.load_locators(),
@@ -470,6 +471,18 @@ def set_scene(project: str, scene: str) -> Dict[str, Any]:
     store = _store(project)
     store.save(store.load_steps(), scene=scene)
     return {"scene": store.load_scene()}
+
+
+def set_human_mouse(project: str, human: bool = True,
+                    speed: float = 0.3) -> Dict[str, Any]:
+    """桌面项目：拟人化鼠标（光标分步移动过去 + 落点稍停，像人手）。
+
+    :param human: 开/关；关＝光标瞬移到位、立刻点击（最快）
+    :param speed: 移过去大概用几秒（0.15 快 / 0.3 中 / 0.6 慢）
+    """
+    store = _store(project)
+    store.save_human_mouse(bool(human), float(speed or 0.3))
+    return store.load_human_mouse()
 
 
 # ============================================================
@@ -1210,7 +1223,7 @@ def _register(*funcs: Callable):
 
 _register(
     list_projects_info, create_project, delete_project, rename_project, get_project,
-    set_scene,
+    set_scene, set_human_mouse,
     get_variables, set_variables, delete_variable,
     get_locators, set_locators, get_auth, set_auth, clear_auth,
     list_functions, set_function, delete_function,

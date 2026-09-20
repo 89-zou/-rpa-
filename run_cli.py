@@ -31,13 +31,17 @@ def main():
     steps = store.load_steps()
     variables = store.load_all_variables()
     real = store.load_real_mouse()
+    mouse = store.load_human_mouse()
     scene = store.load_scene()
+    human = scene == "desktop" and mouse["human"]
     print(f"加载项目 [{name}]，共 {len(steps)} 步。"
           + ("（桌面应用场景）" if scene == "desktop" else "（网页场景）")
-          + ("（真实鼠标：开）" if real else ""))
+          + ("（真实鼠标：开）" if real else "")
+          + (f"（拟人化鼠标：开，{mouse['speed']:g} 秒）" if human else ""))
     executor = StepExecutor(
         steps, variables, headless=False, project_dir=store.dir,
-        real_mouse=real, scene=scene, auth=store.load_auth(),
+        real_mouse=real, human_mouse=human, mouse_speed=mouse["speed"],
+        scene=scene, auth=store.load_auth(),
     )
     try:
         executor.run()

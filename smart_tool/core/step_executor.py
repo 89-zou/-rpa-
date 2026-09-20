@@ -597,6 +597,8 @@ class StepExecutor:
         on_step: Optional[Callable[[int], None]] = None,
         on_state: Optional[Callable[[str], None]] = None,
         real_mouse: bool = False,
+        human_mouse: bool = False,
+        mouse_speed: float = 0.3,
         scene: str = "web",
         auth: Optional[Dict[str, str]] = None,
     ):
@@ -628,6 +630,10 @@ class StepExecutor:
         self.on_step = on_step
         self.on_state = on_state
         self.real_mouse = bool(real_mouse) and not headless
+        # 桌面场景的鼠标行为：拟人化（分步移动 + 落点停顿）还是瞬移直点
+        self.human_mouse = bool(human_mouse)
+        self.mouse_speed = float(mouse_speed or desktop.DEFAULT_MOUSE_SPEED)
+        desktop.configure_mouse(self.human_mouse, self.mouse_speed)
         self.desktop = scene == "desktop"
         self._real_mouse = None
         self._stop = False
@@ -723,6 +729,12 @@ class StepExecutor:
         self._script_written.clear()        # 每一轮执行重新统计脚本产出的变量
         nodes = blocks.parse(self.steps)
         if self.desktop:
+            if self.human_mouse:
+                self.log(
+                    f"拟人化鼠标已开启：光标会分步移动过去（约 {self.mouse_speed:g} 秒）、"
+                    "落点稍停再点。\n"
+                    "   跑的时候别抢鼠标；鼠标猛地甩到屏幕左上角可以急停。"
+                )
             self._run_desktop(nodes)
             return
         if self.real_mouse:

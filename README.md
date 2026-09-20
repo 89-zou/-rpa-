@@ -17,7 +17,7 @@
 | 场景 | 怎么干活 |
 |---|---|
 | **网页自动化** | Playwright 驱动 Chromium：XPath 定位元素、等页面加载、拦住整页跳转；元素点不到时可以**用截图兜底**（OpenCV 模板匹配再找一次） |
-| **桌面应用** | 截图定位 + 系统级鼠标键盘（pyautogui），可选 UI Automation 抓控件名字和坐标；捕获时顺手记下**整窗截图**，运行时先认窗口、只在窗口里找控件；相似度阈值每步可调 |
+| **桌面应用** | 截图定位 + 系统级鼠标键盘（pyautogui），可选 UI Automation 抓控件名字和坐标；捕获时顺手记下**整窗截图**，运行时先认窗口、只在窗口里找控件；相似度阈值每步可调；可选**拟人化鼠标**（光标分步移动过去再点，对付对瞬移敏感的软件） |
 
 流程存成 JSON（`projects/<项目名>/steps.json`），**项目和数据在同一个文件夹里**：拷到别的电脑、放 U 盘，接着跑。
 
@@ -126,7 +126,7 @@ smart_tool/
 │  │  ├─ step_executor.py      执行引擎（Playwright / 桌面 / 数据 / 代码）
 │  │  ├─ data_sources.py       读 txt / csv / excel / json / 文件夹
 │  │  ├─ free_code.py          自由代码节点：语法解析、Python / JS 代码生成
-│  │  ├─ api.py                给 AI / 自动化调用的工具层（36 个工具 + 命令行）
+│  │  ├─ api.py                给 AI / 自动化调用的工具层（37 个工具 + 命令行）
 │  │  ├─ image_locator.py      截图定位（OpenCV 模板匹配 + 多尺度）
 │  │  ├─ desktop*.py           桌面场景（截图、鼠标键盘、UI Automation）
 │  │  ├─ auth_store.py         登录态保存与复用
@@ -204,7 +204,7 @@ powershell -ExecutionPolicy Bypass -File packaging\build.ps1
   Timeouts stop runaway loops.
 - **Data & sessions**: variables, image library, named locators, export collected rows to Excel / CSV,
   save & reuse login state (cookies) so runs skip the login steps when already signed in.
-- **AI-friendly API**: `smart_tool/core/api.py` exposes 36 tools (list capabilities, add/update/delete
+- **AI-friendly API**: `smart_tool/core/api.py` exposes 37 tools (list capabilities, add/update/delete
   steps, validate, run, export records, …) with JSON schemas, plus a small CLI.
 - **Portable by design**: a project folder contains both the flow and its data; copy the folder to move
   a project to another machine. If a hard-coded data path is missing, the file is looked up by name
