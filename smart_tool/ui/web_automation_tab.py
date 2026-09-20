@@ -595,13 +595,8 @@ class WebAutomationTab(QWidget):
         self._append_log("已按横向蛇形重新排版。")
 
     def _make_step_dialog(self, step: Optional[Step] = None,
-                          rule_mode: Optional[str] = None,
-                          insert_at: Optional[int] = None) -> StepEditDialog:
-        """统一构造步骤编辑对话框，带上可用变量供变量下拉使用。
-
-        all_steps / insert_at 是给捕获用的：捕获时会先「回放前面的节点」，
-        得知道当前这一步在整个流程里的位置（新建的还没进列表，靠 insert_at）。
-        """
+                          rule_mode: Optional[str] = None) -> StepEditDialog:
+        """统一构造步骤编辑对话框，带上可用变量供变量下拉使用。"""
         return StepEditDialog(
             self._current_store.dir, step, self,
             variable_names=self.available_variables(),
@@ -609,8 +604,6 @@ class WebAutomationTab(QWidget):
                               if s.action == "navigate" and s.url), ""),
             scene=self._scene,
             rule_mode=rule_mode,
-            all_steps=self._steps,
-            insert_at=insert_at,
         )
 
     # ------------------------------
@@ -647,7 +640,7 @@ class WebAutomationTab(QWidget):
         row = self._selected_row()
         pos = row + 1 if row >= 0 else len(self._steps)
         dlg = self._make_step_dialog(
-            None, blocks.rule_mode_at(self._steps, pos), insert_at=pos)
+            None, blocks.rule_mode_at(self._steps, pos))
         try:
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 self._insert_at(pos, dlg.get_step())
@@ -661,7 +654,7 @@ class WebAutomationTab(QWidget):
         row = self._selected_row()
         pos = row if row >= 0 else len(self._steps)
         dlg = self._make_step_dialog(
-            None, blocks.rule_mode_at(self._steps, pos), insert_at=pos)
+            None, blocks.rule_mode_at(self._steps, pos))
         try:
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 self._insert_at(pos, dlg.get_step())
