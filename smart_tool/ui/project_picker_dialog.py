@@ -61,7 +61,7 @@ class NewProjectDialog(QDialog):
             "· 网页：打开网页 / 点击 / 填入 / 下拉选择，靠 XPath 定位，\n"
             "  可以用【捕获元素…】点一下抓元素；\n"
             "· 桌面：激活窗口 / 点击(截图) / 输入文字 / 按键 / 等待，\n"
-            "  靠【截屏取模板…】框选图片定位，适合操作本机上的软件。"
+            "  靠【定位匹配…】框选图片定位，适合操作本机上的软件。"
         )
         self.scene_combo.currentIndexChanged.connect(self._on_scene_changed)
         form.addRow("场景：", self.scene_combo)

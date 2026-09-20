@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from smart_tool import paths
-from smart_tool.core import blocks, datastore, free_code
+from smart_tool.core import blocks, captcha as captcha_mod, datastore, free_code
 from smart_tool.core.auth_store import state_path
 from smart_tool.core.data_sources import FILE_FIELDS
 from smart_tool.core.project_store import (
@@ -173,6 +173,34 @@ ACTION_SPECS: Dict[str, Dict[str, Any]] = {
               "\"locator\":\"在当前行里找的 XPath\",\"extra\":\"属性名/整页/坐标\"}]", True),
         ] + WAIT_FIELDS,
     },
+    "captcha": {
+        "label": "验证码", "scenes": [SCENE_WEB, SCENE_DESKTOP],
+        "desc": "识别并处理验证码：滑块拼图 / 文字点选 / 计算题。"
+                "验证码图本身用 locator 指认；滑块还要给 captcha_slider（拖动起点）。"
+                "文字点选要给 captcha_prompt（题干文字）或 captcha_tip（题干元素）；"
+                "计算题可以给 captcha_input（答案填哪，留空＝敲进当前焦点）。"
+                "识别没过会点 captcha_refresh 换一张重试。"
+                "注意：「文字点选 / 计算题」需要 ddddocr（可选依赖，没装会报错提示）；"
+                "滑块不需要它。",
+        "fields": [
+            f("locator", "str|dict",
+              "验证码图在哪（**必填**）：那一整张验证码图；滑块的话是带缺口的背景图。"
+              "直接写 XPath 字符串，或写 {\"type\":\"xpath\"|\"image\",\"value\":\"...\"}；"
+              "桌面场景填项目 img/ 里的模板图名", True),
+            f("captcha_kind", "str", "哪种验证码", default="slider",
+              choices=[k for k, _ in captcha_mod.KINDS]),
+            f("captcha_slider", "str|dict",
+              "滑块手柄（拖动的起点）的位置；kind=slider 必填"),
+            f("captcha_tip", "str|dict",
+              "题干所在元素：页面上写着「请点击 xxx」的那块；取它的文字"),
+            f("captcha_prompt", "str",
+              "手写题干文字（如：圈、流、伟）；填了就不看 captcha_tip"),
+            f("captcha_input", "str|dict",
+              "答案填到哪个输入框；留空＝直接敲进当前焦点"),
+            f("captcha_refresh", "str|dict", "「换一张」按钮的位置（可选）"),
+            f("captcha_retry", "int", "最多试几次（含第一次）", default=3),
+        ] + WAIT_FIELDS,
+    },
     "read_data": {
         "label": "读取数据", "scenes": [SCENE_WEB, SCENE_DESKTOP],
         "desc": "读本机文件/文件夹，产出一个列表变量（配「循环」逐项处理）。"
@@ -304,8 +332,8 @@ def _all_fields(action: str, spec: Dict[str, Any]) -> List[Dict[str, Any]]:
     fields = list(spec["fields"]) + COMMON_FIELDS
     if action != "condition_start":
         fields += RULE_FIELDS
-    if action in ("click", "fill", "select"):
-        fields += IMAGE_FIELDS      # 这三个动作可能用截图定位
+    if action in ("click", "fill", "select", "captcha"):
+        fields += IMAGE_FIELDS      # 这几个动作都会用到图片匹配
     return fields
 
 
@@ -610,6 +638,11 @@ def _summary(step: Step) -> str:
         loc = (step.locator.value if step.locator else "")
         extra = f" = {step.value}" if a in ("fill", "select") and step.value else ""
         return f"{ACTION_SPECS[a]['label']} {loc}{extra}"
+    if a == "captcha":
+        kind = dict(captcha_mod.KINDS).get(step.captcha_kind, step.captcha_kind)
+        loc = (step.locator.value if step.locator else "")
+        return (f"{kind}验证码 {loc}"
+                f"（最多试 {int(step.captcha_retry or 1)} 次）")
     if a == "collect":
         names = "、".join(str(x.get("name") or "") for x in (step.collect_fields or []))
         mode = "列表" if (step.collect_mode or "page") == "list" else "当前页"
@@ -700,6 +733,32 @@ def list_steps(project: str, with_notes: bool = False) -> Dict[str, Any]:
             "steps": items, "blocks": sp_list}
 
 
+def _locator_arg(raw: Any, name: str = "locator") -> Locator:
+    """「XPath 字符串」或 {type,value,image,...} 字典 → Locator。
+
+    验证码节点里那几个副定位（滑块手柄 / 题干 / 换一张 / 答案输入框）也走它，
+    所以写法跟主 locator 完全一样：直接给字符串，或给一个带 type 的对象。
+    """
+    if isinstance(raw, str):
+        return Locator(type="xpath", value=raw)
+    if not isinstance(raw, dict):
+        raise ApiError(f"{name} 要么写 XPath 字符串，要么写 {{type,value,image}}")
+
+    def nums(key):
+        try:
+            return [float(v) for v in (raw.get(key) or [])]
+        except (TypeError, ValueError):
+            return []
+
+    return Locator(type=str(raw.get("type") or "xpath"),
+                   value=str(raw.get("value") or ""),
+                   image=str(raw.get("image") or ""),
+                   window=str(raw.get("window") or ""),
+                   window_size=nums("window_size"),
+                   offset=nums("offset"),
+                   feature=str(raw.get("feature") or ""))
+
+
 def _step_from_dict(d: Dict[str, Any]) -> Step:
     """把 AI/JSON 传来的字典变成一个 Step（顺手把常见错误说清楚）。"""
     if not isinstance(d, dict):
@@ -740,24 +799,13 @@ def _step_from_dict(d: Dict[str, Any]) -> Step:
     # 定位：允许直接写 XPath 字符串，也允许写 {"type","value","image"}
     loc = d.get("locator")
     if loc is not None:
-        if isinstance(loc, str):
-            kw["locator"] = Locator(type="xpath", value=loc)
-        elif isinstance(loc, dict):
-            def nums(key):
-                raw = loc.get(key) or []
-                try:
-                    return [float(v) for v in raw]
-                except (TypeError, ValueError):
-                    return []
-            kw["locator"] = Locator(type=str(loc.get("type") or "xpath"),
-                                    value=str(loc.get("value") or ""),
-                                    image=str(loc.get("image") or ""),
-                                    window=str(loc.get("window") or ""),
-                                    window_size=nums("window_size"),
-                                    offset=nums("offset"),
-                                    feature=str(loc.get("feature") or ""))
-        else:
-            raise ApiError("locator 要么写 XPath 字符串，要么写 {type,value,image}")
+        kw["locator"] = _locator_arg(loc)
+    if action == "captcha":
+        # 验证码的几个副定位，写法跟主 locator 一样
+        for key in ("captcha_slider", "captcha_tip", "captcha_input",
+                    "captcha_refresh"):
+            if kw.get(key) is not None:
+                kw[key] = _locator_arg(kw[key], key)
     if action == "collect" and d.get("collect_fields"):
         kw["collect_fields"] = [dict(x) for x in d["collect_fields"] if isinstance(x, dict)]
     if action == "read_data" and d.get("data_cfg"):
@@ -768,7 +816,7 @@ def _step_from_dict(d: Dict[str, Any]) -> Step:
             kw["image_threshold"] = float(d["image_threshold"])
         except (TypeError, ValueError):
             raise ApiError("image_threshold 要填个数字，如 0.7（留空＝用默认 0.80）")
-    if d.get("win_title") and action in ("click", "fill", "select"):
+    if d.get("win_title") and action in ("click", "fill", "select", "captcha"):
         # 桌面场景：这几个动作用 win_title 记「属于哪个窗口」
         kw["win_title"] = str(d["win_title"])
 

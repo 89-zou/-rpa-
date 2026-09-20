@@ -61,6 +61,22 @@ class Locator:
     feature: str = ""
 
 
+def locator_to_dict(loc: Optional["Locator"]) -> Optional[Dict[str, Any]]:
+    """Locator → 字典；空字段不写进文件（跟主 locator 一个规矩）。"""
+    if loc is None:
+        return None
+    d = asdict(loc)
+    for k in ("image", "window", "window_size", "offset", "feature"):
+        if not d.get(k):
+            d.pop(k, None)
+    return d
+
+
+def locator_from_dict(raw: Any) -> Optional["Locator"]:
+    """字典 → Locator（给验证码节点那几个副定位用）。"""
+    return Locator(**raw) if isinstance(raw, dict) and raw else None
+
+
 @dataclass
 class Step:
     """单个步骤。"""
@@ -143,6 +159,22 @@ class Step:
     # 浅色 / 低对比界面里匹配分数天然偏低，可以调低一点；调高则更严、宁可不点。
     # 对这一步里的所有图片匹配都生效（定位、等待图片出现/消失）。
     image_threshold: float = 0.0
+    # ---- captcha 专用：验证码节点（滑块 / 文字点选 / 计算题）----
+    # captcha_kind：slider＝滑块拼图 / click_text＝文字点选 / math＝计算题
+    # 「验证码图片」直接用主 locator 存（这样元素捕获/定位匹配那套按钮直接能用）；
+    # 下面几个副定位按需填，用不到的留空。
+    captcha_kind: str = "slider"
+    # slider：滑块手柄（拖动起点）。图内偏移由识别算出来，加在这个位置上。
+    captcha_slider: Optional[Locator] = None
+    # click_text：题干。它是个元素（取文本，桌面场景取图再认字）；
+    # 题干不是页面元素时，直接把文字写在 captcha_prompt 里，填了就不看这个。
+    captcha_tip: Optional[Locator] = None
+    captcha_prompt: str = ""             # 手写题干（如「圈、流、伟」）
+    # math：答案填到哪。留空＝直接往当前焦点里敲（配在前面的「点击」之后）。
+    captcha_input: Optional[Locator] = None
+    # 识别没过 / 拖过去没通过校验时，点它换一张再试（空＝不换，原地重试）
+    captcha_refresh: Optional[Locator] = None
+    captcha_retry: int = 3               # 最多试几次（含第一次）
     # ---- collect 专用：把页面上的东西采下来（存 data/ + 进变量）----
     # collect_mode: page＝当前页面采一条；list＝页面上多行，每行采一条
     # collect_row ：list 模式里「每一行」的 XPath
@@ -169,11 +201,7 @@ class Step:
         if self.url:
             d["url"] = self.url
         if self.locator:
-            loc = asdict(self.locator)
-            for k in ("image", "window", "window_size", "offset", "feature"):
-                if not loc.get(k):
-                    loc.pop(k, None)        # 空字段别往文件里塞
-            d["locator"] = loc
+            d["locator"] = locator_to_dict(self.locator)
         if self.value:
             d["value"] = self.value
         if self.action == "navigate":
@@ -235,7 +263,18 @@ class Step:
             # 这个动作节点摆在「条件」里，自带一条规则（判断方式 + 值）
             d["cond_op"] = self.cond_op
             d["cond_value"] = self.cond_value
-        if self.win_title and self.action in ("win_activate", "click", "fill", "select"):
+        if self.action == "captcha":
+            d["captcha_kind"] = self.captcha_kind or "slider"
+            d["captcha_retry"] = int(self.captcha_retry or 1)
+            for key in ("captcha_slider", "captcha_tip", "captcha_input",
+                        "captcha_refresh"):
+                sub = locator_to_dict(getattr(self, key))
+                if sub:
+                    d[key] = sub
+            if self.captcha_prompt:
+                d["captcha_prompt"] = self.captcha_prompt
+        if self.win_title and self.action in ("win_activate", "click", "fill",
+                                              "select", "captcha"):
             # 桌面场景：点击 / 填入 也用 win_title 记「这一步属于哪个窗口」
             # （运行时先按窗口名找窗口），不只是「激活窗口」那一步
             d["win_title"] = self.win_title
@@ -308,6 +347,13 @@ class Step:
             keys=d.get("keys", ""),
             click_times=int(d.get("click_times", 1) or 1),
             image_threshold=float(d.get("image_threshold", 0) or 0),
+            captcha_kind=d.get("captcha_kind") or "slider",
+            captcha_slider=locator_from_dict(d.get("captcha_slider")),
+            captcha_tip=locator_from_dict(d.get("captcha_tip")),
+            captcha_prompt=str(d.get("captcha_prompt") or ""),
+            captcha_input=locator_from_dict(d.get("captcha_input")),
+            captcha_refresh=locator_from_dict(d.get("captcha_refresh")),
+            captcha_retry=int(d.get("captcha_retry", 3) or 1),
             skip_if_logged_in=bool(d.get("skip_if_logged_in")),
             text=str(d.get("text") or ""),
         )
