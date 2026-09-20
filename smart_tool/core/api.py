@@ -86,6 +86,15 @@ LOCATOR_FIELD = f(
     "{\"type\":\"xpath\"|\"image\",\"value\":\"...\",\"image\":\"img/兜底图.png\"}；"
     "XPath 里可以写 {{元素定位变量名}}", True)
 
+#: 条件块里的**动作节点**才用得上：判断方式＋值（写在动作节点自己身上，不在条件节点上）。
+#: 条件节点只提供「判断的数据」，块里从上往下第一个成立的动作节点执行。
+RULE_FIELDS = [
+    f("cond_op", "str", "【条件里的动作节点】判断方式：contains / not_contains / eq / ne / "
+      "gt / lt / ge / le；留空＝兜底（上面都不成立时走它，必须放最后一个）"),
+    f("cond_value", "str", "【条件里的动作节点】要比较的值；包含 / 不包含 / 等于 / 不等于 "
+      "可写多个（逗号分隔＝任一命中）"),
+]
+
 COLLECT_KINDS = [
     ("text", "取文字（默认）"),
     ("attr", "取属性：extra 里写属性名，如 href / src / data-id"),
@@ -231,12 +240,7 @@ ACTION_SPECS: Dict[str, Dict[str, Any]] = {
               choices=["rule", "expr"]),
             f("cond_expr", "str", "判断的数据（rule，如 {{loop.item.标题}}）"
               "或 Python 表达式（expr，如 len({{loop.item.内容}}) > 500）", True),
-            f("cond_op", "str", "【写在块里的动作节点上】判断方式："
-              "contains / not_contains / eq / ne / gt / lt / ge / le；"
-              "留空＝兜底（上面都不成立时走它，必须放最后一个）"),
-            f("cond_value", "str", "【写在块里的动作节点上】要比较的值；"
-              "包含 / 不包含 / 等于 / 不等于 可写多个（逗号分隔＝任一命中）"),
-        ],
+        ] + RULE_FIELDS,
     },
     "group_start": {
         "label": "组合", "scenes": [SCENE_WEB, SCENE_DESKTOP],
@@ -278,6 +282,18 @@ ACTION_SPECS: Dict[str, Dict[str, Any]] = {
 AUTO_MARKERS = ("loop_end", "condition_end", "group_end")
 
 
+def _all_fields(action: str, spec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """某个动作的完整字段清单：自己的字段 + 公共字段 + 条件规则字段。
+
+    cond_op / cond_value 是「条件块里的动作节点」才用得上，但任何动作都可能被放进
+    条件里当动作节点，所以除了条件节点自己（它的字段里已经列了），其余都带上。
+    """
+    fields = list(spec["fields"]) + COMMON_FIELDS
+    if action != "condition_start":
+        fields += RULE_FIELDS
+    return fields
+
+
 def list_actions(scene: str = "") -> List[Dict[str, Any]]:
     """列出所有能用的动作（可按场景过滤）。
 
@@ -294,7 +310,7 @@ def list_actions(scene: str = "") -> List[Dict[str, Any]]:
             "label": spec["label"],
             "scenes": list(spec["scenes"]),
             "desc": spec["desc"],
-            "fields": spec["fields"] + COMMON_FIELDS,
+            "fields": _all_fields(name, spec),
         })
     return out
 
@@ -305,7 +321,7 @@ def describe_action(action: str) -> Dict[str, Any]:
     if spec is None:
         raise ApiError(f"不认识的 action：{action}。可用动作：{'、'.join(ACTION_SPECS)}")
     return {"action": action, "label": spec["label"], "scenes": spec["scenes"],
-            "desc": spec["desc"], "fields": spec["fields"] + COMMON_FIELDS}
+            "desc": spec["desc"], "fields": _all_fields(action, spec)}
 
 
 def free_code_guide() -> Dict[str, str]:
@@ -587,7 +603,8 @@ def _summary(step: Step) -> str:
     if a == "loop_end":
         return "循环结束"
     if a == "condition_start":
-        return f"条件（{step.cond_mode}）{step.cond_expr}"
+        how = "表达式" if (step.cond_mode or "rule") == "expr" else "规则"
+        return f"条件（{how}）{step.cond_expr}"
     if a == "condition_end":
         return "条件结束"
     if a == "group_start":
@@ -605,10 +622,27 @@ def _summary(step: Step) -> str:
     return a
 
 
+def _rule_texts(steps: List[Step], all_spans: List[blocks.Span]) -> Dict[int, str]:
+    """「条件」里每个动作节点的规则摘要（按行号索引）。
+
+    跟画布 / 流程编辑里显示的那一句是同一份（都走 blocks.rule_summary），
+    条件外的步骤、以及嵌套块内部的步骤都不会出现。
+    """
+    out: Dict[int, str] = {}
+    for sp in all_spans:
+        if sp.kind != "condition":
+            continue
+        mode = steps[sp.start].cond_mode or "rule"
+        for k, row in enumerate(blocks.direct_children(all_spans, sp)):
+            out[row] = blocks.rule_summary(steps[row], k, mode)
+    return out
+
+
 def list_steps(project: str, with_notes: bool = False) -> Dict[str, Any]:
     """看项目的流程：顺序、缩进层级、结构块范围（插步骤的时候要用到）。
 
-    返回 steps（每项含 index / id / action / title / summary / depth）和
+    返回 steps（每项含 index / id / action / title / summary / depth；
+    在「条件」里的动作节点还多一个 cond_rule＝它的规则）和
     blocks（每个循环、条件、组合占了哪几行，以及它的「体内」范围）。
     往某个块里加步骤：用 add_steps(project, [...], at=块的 body_end)。
     """
@@ -616,16 +650,20 @@ def list_steps(project: str, with_notes: bool = False) -> Dict[str, Any]:
     steps = store.load_steps()
     dep = blocks.depths(steps)
     nums = blocks.step_numbers(steps)
+    all_spans = blocks.spans(steps)
+    rules = _rule_texts(steps, all_spans)
     items = []
     for i, s in enumerate(steps):
         item = {"index": i, "id": s.id, "action": s.action,
                 "title": s.title or "", "summary": _summary(s), "depth": dep[i],
                 "number": nums[i]}
+        if i in rules:
+            item["cond_rule"] = rules[i]
         if with_notes:
             item["note"] = s.note or ""
         items.append(item)
     sp_list = []
-    for sp in blocks.spans(steps):
+    for sp in all_spans:
         sp_list.append({"kind": sp.kind, "start": sp.start, "end": sp.end,
                         "depth": sp.depth,
                         "body_start": sp.inner_lo, "body_end": sp.inner_hi,
@@ -648,7 +686,8 @@ def _step_from_dict(d: Dict[str, Any]) -> Step:
                 "系统会自动补齐配对标记。")
         raise ApiError(f"不认识的 action：{action}。可用动作：{'、'.join(ACTION_SPECS)}")
 
-    common = {"title", "note", "pos", "id", "action"}
+    # 任何动作只要被放进「条件」里，就是那个条件的一个动作节点，可以带自己的判断规则
+    common = {"title", "note", "pos", "id", "action", "cond_op", "cond_value"}
     allowed = common | {x["name"] for x in spec["fields"]}
     unknown = [k for k in d if k not in allowed]
     if unknown:
@@ -730,6 +769,10 @@ def add_steps(project: str, steps: List[Dict[str, Any]],
         raise ApiError(f"at 超出范围：{pos}（当前一共 {len(current)} 个步骤，"
                        f"合法范围 0~{len(current)}）")
     result = current[:pos] + new + current[pos:]
+    for k in range(pos, pos + len(new)):
+        # 插进「条件」里的新节点：补一条默认规则（包含，值留空＝暂时不成立），
+        # 不然它就是「兜底」——无条件成立，会把后面的动作节点全挡住
+        blocks.apply_default_rule(result, k)
     _save_checked(store, result)
     return {"added": len(new), "at": pos,
             "range": [pos, pos + len(new) - 1],
@@ -825,6 +868,7 @@ def add_loop(project: str, loop_expr: str = "",
                 title=title, note=note)
     new = [head] + inner + [Step(id=0, action="loop_end")]
     result = steps[:pos] + new + steps[pos:]
+    blocks.apply_default_rule(result, pos)   # 整个循环被放进「条件」时，规则挂在循环上
     _save_checked(store, result)
     return {"range": [pos, pos + len(new) - 1],
             "body_range": [pos + 1, pos + len(inner)],
@@ -833,12 +877,12 @@ def add_loop(project: str, loop_expr: str = "",
 
 
 def add_condition(project: str, cond_expr: str,
-                  branches: Optional[List[Dict[str, Any]]] = None,
+                  rules: Optional[List[Dict[str, Any]]] = None,
                   cond_mode: str = "rule", at: Optional[int] = None,
                   title: str = "", note: str = "") -> Dict[str, Any]:
     """加一个条件判断（自动补「条件结束」）。
 
-    branches：一个动作节点一条，顺序＝优先级：
+    rules：一个动作节点一条，顺序＝优先级：
         [{"op": "contains", "value": "公示", "steps": [...这里的步骤...]}, …]
     · rule 模式：cond_expr 是「判断的数据」（如 {{loop.item.标题}}），
       每条给的 op + value 写在**这一组的动作节点**上（op 留空＝兜底，放最后）；
@@ -849,12 +893,12 @@ def add_condition(project: str, cond_expr: str,
     store = _store(project)
     steps = store.load_steps()
     pos = len(steps) if at is None else int(at)
-    items = branches or [{"op": "contains"}, {"op": ""}]
+    items = rules or [{"op": "contains"}, {"op": ""}]
     if not items:
         raise ApiError("至少要有一个动作节点")
     new: List[Step] = [Step(id=0, action="condition_start", cond_mode=cond_mode,
                             cond_expr=str(cond_expr), title=title, note=note)]
-    body_ranges = []
+    rule_ranges = []
     for item in items:
         op = str(item.get("op") or "")
         value = str(item.get("value") or "")
@@ -874,12 +918,13 @@ def add_condition(project: str, cond_expr: str,
                             cond_value=value))
             new.extend(body)
             new.append(Step(id=0, action=blocks.GROUP_END))
-        body_ranges.append([pos + start, pos + len(new) - 1])
+        rule_ranges.append([pos + start, pos + len(new) - 1])
     new.append(Step(id=0, action="condition_end"))
     result = steps[:pos] + new + steps[pos:]
     _save_checked(store, result)
-    return {"range": [pos, pos + len(new) - 1], "branch_bodies": body_ranges,
-            "summary": f"条件（{cond_mode}）{cond_expr}，{len(items)} 个动作节点"}
+    how = "表达式" if cond_mode == "expr" else "规则"
+    return {"range": [pos, pos + len(new) - 1], "rule_ranges": rule_ranges,
+            "summary": f"条件（{how}）{cond_expr}，{len(items)} 个动作节点"}
 
 
 def add_group(project: str, title: str, body: Optional[List[Dict]] = None,
@@ -897,6 +942,7 @@ def add_group(project: str, title: str, body: Optional[List[Dict]] = None,
                 skip_if_logged_in=bool(skip_if_logged_in))] + inner \
         + [Step(id=0, action="group_end")]
     result = steps[:pos] + new + steps[pos:]
+    blocks.apply_default_rule(result, pos)   # 整个组合被放进「条件」时，规则挂在组合上
     _save_checked(store, result)
     return {"range": [pos, pos + len(new) - 1],
             "body_range": [pos + 1, pos + len(inner)],
