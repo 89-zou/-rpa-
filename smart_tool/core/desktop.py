@@ -14,6 +14,7 @@
 没有 XPath，也没有 DOM：所以定位精度天然不如网页，模板要裁得干净
 （只框控件本身，别带上大片背景）。
 """
+import random
 import re
 import sys
 import time
@@ -59,6 +60,15 @@ WINDOW_THRESHOLD = 0.75
 WINDOW_OFFSET_MIN_CONF = 0.85
 #: 在窗口矩形外再放宽几个像素（窗口阴影、边框抖动）
 WINDOW_MARGIN = 12
+
+#: 鼠标行为（项目级设置，运行开始时由执行器调 configure_mouse 设一次）
+#: human＝拟人化移动（分步 + 缓入缓出 + 轻微抖动）；speed＝移过去大概用几秒
+_MOUSE = {"human": False, "speed": 0.3}
+#: 拟人化移动的速度预设（秒）——界面上是「快 / 中 / 慢」三个选项
+MOUSE_SPEED_PRESETS = (("fast", "快（0.15 秒）", 0.15),
+                       ("mid", "中（0.3 秒）", 0.3),
+                       ("slow", "慢（0.6 秒）", 0.6))
+DEFAULT_MOUSE_SPEED = 0.3
 
 
 def available() -> bool:
@@ -681,19 +691,70 @@ def exists(template_path, threshold: Optional[float] = None) -> bool:
 
 
 def move(x: float, y: float):
-    _gui().moveTo(int(round(x)), int(round(y)))
+    """把光标移到 (x, y)。开了拟人化就分步挪过去，否则一步到位。"""
+    gui = _gui()
+    human, speed = _MOUSE["human"], _MOUSE["speed"]
+    if human and speed > 0:
+        _human_move(gui, x, y, speed)
+    else:
+        gui.moveTo(int(round(x)), int(round(y)))
 
 
 def click(x: float, y: float, times: int = 1):
-    """在屏幕坐标点一下（times=2 就是双击）。"""
+    """在屏幕坐标点一下（times=2 就是双击）。
+
+    开了「拟人化鼠标」时：光标分步移动过去（带一点抖动）、稍等一下再点，
+    更像人手；不勾就是原来的「瞬移到位 + 立刻点」（最快）。
+    """
     note(f"桌面：点击 ({x:.0f},{y:.0f}) x{times}")
     gui = _gui()
     _ensure_dpi_aware()
-    gui.moveTo(int(round(x)), int(round(y)))
+    move(x, y)
+    human, _speed = _MOUSE["human"], _MOUSE["speed"]
+    # 落点后稍微停一下再按下（真实操作里手也会停一下）
+    time.sleep(random.uniform(0.05, 0.12) if human else 0.0)
     if int(times) >= 2:
         gui.doubleClick()
     else:
         gui.click()
+
+
+def configure_mouse(human: bool = False, speed: float = 0.3) -> None:
+    """设置桌面点击的鼠标行为（每次运行开始时由执行器调一次）。
+
+    :param human: 拟人化移动（分步 + 缓入缓出 + 轻微抖动）
+    :param speed: 移过去大概用多少秒（0＝不拟人，直接到位）
+    """
+    _MOUSE["human"] = bool(human)
+    _MOUSE["speed"] = max(0.0, float(speed or 0))
+
+
+def mouse_setting() -> Tuple[bool, float]:
+    """当前的鼠标设置 (拟人化, 秒)。"""
+    return bool(_MOUSE["human"]), float(_MOUSE["speed"])
+
+
+def _human_move(gui, x: float, y: float, duration: float):
+    """分步把光标挪过去：缓入缓出 + 轻微抖动，最后精确落到目标点。
+
+    为什么不用 pyautogui 自带的 moveTo(duration=...)：它是一步插值到底、
+    走的是直线匀速，跟人手差得远；而且它不发中间位置，某些程序看不到
+    「鼠标一路移过来」的过程。这里自己发每一步，中途带点抖动，收尾拉直。
+    """
+    try:
+        sx, sy = gui.position()
+    except Exception:
+        sx, sy = x, y
+    steps = max(6, min(40, int(duration / 0.02)))
+    for i in range(1, steps + 1):
+        t = i / steps
+        t = t * t * (3 - 2 * t)              # ease-in-out：起步慢、中间快、收尾慢
+        jitter = 1.5 if i < steps else 0.0   # 最后一步不抖，保证落到点上
+        nx = sx + (x - sx) * t + random.uniform(-jitter, jitter)
+        ny = sy + (y - sy) * t + random.uniform(-jitter, jitter)
+        gui.moveTo(int(round(nx)), int(round(ny)))
+        time.sleep(duration / steps)
+    gui.moveTo(int(round(x)), int(round(y)))
 
 
 def clear_field(log: Callable[[str], None] = print):

@@ -425,6 +425,8 @@ class ProjectStore:
         )
         if old.get("real_mouse"):
             data["real_mouse"] = True     # 项目级开关，别被保存步骤时弄丢
+        if old.get("human_mouse"):
+            data["human_mouse"] = dict(old["human_mouse"])   # 桌面鼠标行为同理
         if old.get("auth"):
             data["auth"] = dict(old["auth"])   # 登录态配置同理
         if old.get("locators"):
@@ -489,6 +491,28 @@ class ProjectStore:
         """只更新「真实鼠标」开关，其余配置保持不变。"""
         data = dict(self.load())
         data["real_mouse"] = bool(on)
+        self._write(data)
+
+    def load_human_mouse(self) -> Dict[str, Any]:
+        """桌面场景的鼠标行为：{"human": 拟人化?, "speed": 移过去用几秒}。
+
+        默认 human=False（一步到位 + 立刻点，最快）；勾上以后光标分步挪过去
+        （缓入缓出 + 轻微抖动）、落点停一下再按，更像人手。
+        """
+        raw = self.load().get("human_mouse") or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        try:
+            speed = float(raw.get("speed") or 0.3)
+        except (TypeError, ValueError):
+            speed = 0.3
+        return {"human": bool(raw.get("human")),
+                "speed": speed if 0.02 <= speed <= 3.0 else 0.3}
+
+    def save_human_mouse(self, human: bool, speed: float = 0.3):
+        """只更新桌面鼠标行为，其余配置保持不变。"""
+        data = dict(self.load())
+        data["human_mouse"] = {"human": bool(human), "speed": round(float(speed), 3)}
         self._write(data)
 
     def load_scene(self) -> str:
