@@ -26,7 +26,10 @@ from smart_tool.core.element_picker import (
     HIGHLIGHT_JS, PICKER_JS, TOAST_JS, next_shot_path,
 )
 
-NAV_TIMEOUT_MS = 120_000
+#: 打开网址的超时。这是**交互式**捕获，不是批量跑流程：站点真慢到这份上，
+#: 与其让你对着一个「正在打开…」干等两分钟，不如早点说清、让你重试。
+#: （跑流程那边还是 120 秒，见 step_executor.NAV_TIMEOUT_DEFAULT_S）
+NAV_TIMEOUT_MS = 45_000
 #: 主循环里「等命令」和「喂一下 Playwright」的节奏
 CMD_WAIT_S = 0.05
 #: 试运行时点/填的超时（毫秒）——比跑流程时短，就是看一眼效果
@@ -354,10 +357,18 @@ class PickerSession(QThread):
     # 收尾
     # ------------------------------
     def _close_browser_quietly(self):
+        """把浏览器收掉。
+
+        先问一句 `is_closed()` 再关：用户直接把浏览器窗口点掉时，连接已经断了，
+        这时候还去调 `close()` 有可能卡在那儿等一个永远不会来的回应 —— 整个程序
+        就跟着僵住（这个坑踩过）。已经没了就干脆什么都不做，让它随进程一起走。
+        """
         page, self._page = self._page, None
         if page is None:
             return
         try:
+            if page.is_closed():
+                return
             page.context.browser.close()
         except Exception:
             pass

@@ -35,7 +35,7 @@ from smart_tool.ui.code_editor import CodeEditor
 from smart_tool.ui.collect_panel import CollectPanel
 from smart_tool.ui.desktop_picker import DesktopPickerDialog
 from smart_tool.ui.element_picker_dialog import (
-    drop_capture_image, pick_element, save_captured_locator,
+    drop_capture_image, pick_element, pick_element_result, save_captured_locator,
 )
 from smart_tool.ui.help_tip import HelpButton, help_row
 from smart_tool.ui.read_data_panel import ReadDataPanel
@@ -1414,6 +1414,8 @@ class StepEditDialog(QDialog):
 
     def _capture_element(self, target: str):
         """捕获元素（按钮槽：整段包住，异常绝不能逃进 Qt 的事件分发）。"""
+        # 上一次没抓成可能把提示染成了橙色，这里先复位，免得新结果看着还像出错
+        self.capture_hint.setStyleSheet("color: #0f766e;")
         try:
             if self.desktop:
                 self._capture_desktop_control(target)
@@ -1447,6 +1449,7 @@ class StepEditDialog(QDialog):
 
         # 先接好再发命令：万一会话那边回得快，别让结果跑在连接前面
         session.tried.connect(done)
+        self.capture_hint.setStyleSheet("color: #0f766e;")
         self.capture_hint.setText(
             "试运行中…（浏览器会切到前面，先把元素圈出来再动手，"
             "结果会贴在页面顶端）")
@@ -1462,7 +1465,12 @@ class StepEditDialog(QDialog):
         浏览器由常驻会话端着（见 ui/picker_session）：抓到不关，下一步捕获接着用。
         """
         url = self.url_edit.text().strip() or self._default_url
-        data = pick_element(self, url, self.project_dir)
+        data, err = pick_element_result(self, url, self.project_dir)
+        if err:
+            # 捕获条自己会关掉（模态窗口留着会把主界面卡住），所以原因写在这儿
+            self.capture_hint.setStyleSheet("color: #b45309;")
+            self.capture_hint.setText("没抓到：" + err)
+            return
         if not data:
             return
         xpath = (data.get("xpath") or "").strip()
