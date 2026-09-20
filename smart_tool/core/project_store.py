@@ -46,6 +46,13 @@ class Locator:
     # 改用这张截图做模板匹配（OpenCV）再试一次。
     # 路径相对项目目录，如 img/cap_20260917_203512_1.png（捕获元素时自动生成）
     image: str = ""
+    # 桌面场景：捕获时顺手裁下来的**整窗截图**（相对项目目录，如 img/xx_窗口.png）。
+    # 运行时先用它认出窗口，再把「找控件」的范围缩到一个窗口里；
+    # 空＝没有（老项目 / 拿不到窗口），行为跟以前一样：全屏匹配。
+    window: str = ""
+    # 红框相对**窗口左上角**的位置 [dx, dy, 宽, 高]（窗口图的像素）。
+    # 窗口内没匹配到控件时，就按它的中心点（这就是「点红框中心」）。
+    offset: List[float] = field(default_factory=list)
 
 
 @dataclass
@@ -126,6 +133,10 @@ class Step:
     win_title: str = ""                  # win_activate：窗口标题里的一小段
     keys: str = ""                       # hotkey：要按的键，如 ctrl+s、enter
     click_times: int = 1                 # click：点几次（2＝双击）
+    # 图片匹配的相似度阈值（0.5~0.99；0＝用默认 0.8）。
+    # 浅色 / 低对比界面里匹配分数天然偏低，可以调低一点；调高则更严、宁可不点。
+    # 对这一步里的所有图片匹配都生效（定位、等待图片出现/消失）。
+    image_threshold: float = 0.0
     # ---- collect 专用：把页面上的东西采下来（存 data/ + 进变量）----
     # collect_mode: page＝当前页面采一条；list＝页面上多行，每行采一条
     # collect_row ：list 模式里「每一行」的 XPath
@@ -153,8 +164,9 @@ class Step:
             d["url"] = self.url
         if self.locator:
             loc = asdict(self.locator)
-            if not loc.get("image"):
-                loc.pop("image", None)      # 没配兜底截图就别往文件里塞空字段
+            for k in ("image", "window", "offset"):
+                if not loc.get(k):
+                    loc.pop(k, None)        # 空字段别往文件里塞
             d["locator"] = loc
         if self.value:
             d["value"] = self.value
@@ -223,6 +235,8 @@ class Step:
             d["keys"] = self.keys
         if self.action == "click" and int(self.click_times or 1) != 1:
             d["click_times"] = int(self.click_times)
+        if self.image_threshold:
+            d["image_threshold"] = float(self.image_threshold)
         if self.pos is not None:
             d["pos"] = [float(self.pos[0]), float(self.pos[1])]
         if self.skip_if_logged_in:
@@ -285,6 +299,7 @@ class Step:
             win_title=d.get("win_title", ""),
             keys=d.get("keys", ""),
             click_times=int(d.get("click_times", 1) or 1),
+            image_threshold=float(d.get("image_threshold", 0) or 0),
             skip_if_logged_in=bool(d.get("skip_if_logged_in")),
             text=str(d.get("text") or ""),
         )

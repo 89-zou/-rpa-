@@ -1662,10 +1662,26 @@ class StepExecutor:
     # ------------------------------
     # 动作（桌面场景）
     # ------------------------------
-    def _desktop_locate(self, image: str) -> "desktop.DesktopMatch":
-        """在屏幕上找这张模板图（找不到会等一会儿再试）。"""
+    def _desktop_locate(self, image: str, step: Optional[Step] = None
+                        ) -> "desktop.DesktopMatch":
+        """在屏幕上找这张模板图（找不到会等一会儿再试）。
+
+        这一步的定位如果带了「整窗模板」（捕获时顺手存下来的），就先认窗口、
+        只在窗口里找控件；窗口里没找到才退回全屏匹配（见 desktop.locate_by_window）。
+        步骤上还能设「相似度」阈值，浅色界面调低一点更容易命中。
+        """
+        loc = step.locator if step is not None else None
         path = self._resolve_image_path(Locator(type="image", value=image))
-        return desktop.locate(path, wait_s=DESKTOP_IMAGE_WAIT_S, log=self.log)
+        threshold = float(getattr(step, "image_threshold", 0) or 0) or None
+        window = str(getattr(loc, "window", "") or "").strip() if loc else ""
+        offset = list(getattr(loc, "offset", []) or []) if loc else []
+        if window:
+            wpath = self._resolve_image_path(Locator(type="image", value=window))
+            return desktop.locate_by_window(
+                wpath, path, offset=offset, threshold=threshold,
+                wait_s=DESKTOP_IMAGE_WAIT_S, log=self.log)
+        return desktop.locate(path, threshold=threshold,
+                              wait_s=DESKTOP_IMAGE_WAIT_S, log=self.log)
 
     def _desktop_click(self, step: Step):
         """桌面点击：屏幕上找模板 → 按坐标点（可双击）。"""
@@ -1676,10 +1692,11 @@ class StepExecutor:
                 "桌面场景的「点击」必须选一张模板图。\n"
                 "   双击这一步，在「图片模板」那一行点【截屏取模板…】框一个控件。"
             )
-        m = self._desktop_locate(image)
+        m = self._desktop_locate(image, step)
         times = 2 if int(step.click_times or 1) >= 2 else 1
         self.log(f"  在屏幕 ({m.x:.0f},{m.y:.0f}) "
-                 f"{'双击' if times == 2 else '单击'}（置信度 {m.confidence:.2f}）")
+                 f"{'双击' if times == 2 else '单击'}（置信度 {m.confidence:.2f}"
+                 + (f"，{m.how}" if m.how else "") + "）")
         desktop.click(m.x, m.y, times)
 
     def _desktop_fill(self, step: Step):
@@ -1691,9 +1708,10 @@ class StepExecutor:
         text = self._resolve_value(step.value)
         image = (step.locator.value if step.locator else "").strip()
         if image:
-            m = self._desktop_locate(image)
+            m = self._desktop_locate(image, step)
             self.log(f"  先点一下输入位置 ({m.x:.0f},{m.y:.0f})"
-                     f"（置信度 {m.confidence:.2f}）")
+                     f"（置信度 {m.confidence:.2f}"
+                     + (f"，{m.how}" if m.how else "") + "）")
             desktop.click(m.x, m.y)
             time.sleep(0.2)
         else:
@@ -2399,7 +2417,7 @@ class StepExecutor:
             return
         target = self._resolve_value(step.wait_target or "").strip()
         if self.desktop:
-            self._wait_after_desktop(step.wait_after, target)
+            self._wait_after_desktop(step, step.wait_after, target)
             return
         if step.wait_after == "element_present":
             if not target:
@@ -2423,10 +2441,11 @@ class StepExecutor:
         elif step.wait_after == "manual":
             pass
 
-    def _wait_after_desktop(self, mode: str, target: str):
+    def _wait_after_desktop(self, step: Step, mode: str, target: str):
         """桌面场景的「步骤后等待」：等图片出现 / 等图片消失。
 
         桌面没有 URL、也没有 DOM，所以网页那些等待方式在这里不适用。
+        相似度阈值跟这一步的定位共用（浅色界面调低一点）。
         """
         if mode == "manual":
             return
@@ -2434,14 +2453,17 @@ class StepExecutor:
             self.log("  桌面场景的「步骤后等待」要填一张图片模板，这一步跳过等待")
             return
         path = self._resolve_image_path(Locator(type="image", value=target))
+        threshold = float(getattr(step, "image_threshold", 0) or 0) or None
         if mode == "element_present":
             self.log(f"  等待图片出现：{Path(target).name}")
-            desktop.locate(path, wait_s=WAIT_ELEMENT_TIMEOUT_MS / 1000,
+            desktop.locate(path, threshold=threshold,
+                           wait_s=WAIT_ELEMENT_TIMEOUT_MS / 1000,
                            log=self.log)
             return
         if mode == "image_gone":
             self.log(f"  等待图片消失：{Path(target).name}")
-            desktop.wait_gone(path, wait_s=WAIT_ELEMENT_TIMEOUT_MS / 1000,
+            desktop.wait_gone(path, threshold=threshold,
+                              wait_s=WAIT_ELEMENT_TIMEOUT_MS / 1000,
                               log=self.log)
             return
         self.log(f"  桌面场景不支持「{mode}」这种等待，已跳过（可改用「等待图片出现」）")

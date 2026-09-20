@@ -301,6 +301,18 @@ WAIT_OPTIONS = [
     ("network_idle", "等待网络空闲"),
     ("manual", "手动（不自动等）"),
 ]
+THRESHOLD_HELP = (
+    "图片匹配要「像到什么程度」才算找到，范围 0.5~0.99，默认 0.80。\n"
+    "\n"
+    "为什么要能调：浅色 / 低对比的界面（按钮和背景几乎同色、窗口失焦变灰、\n"
+    "深色主题）里，匹配分数天然偏低，0.80 可能就找不到了——调到 0.70 左右试试。\n"
+    "\n"
+    "反过来，调高（0.9 以上）更严格：宁可报错停下，也不在「一片都差不多」的地方\n"
+    "乱点。不确定就留空用默认。\n"
+    "\n"
+    "顺带说明：模板四周的空白背景会被自动裁掉再匹配（背景一变色就不受影响）；\n"
+    "屏幕上要是有好几处长得一模一样的，程序会判为「不可信」并报错，不会随便挑一个点。"
+)
 # 桌面场景：没有 URL / DOM，只能等图片
 DESKTOP_WAIT_OPTIONS = [
     ("", "不等待"),
@@ -370,6 +382,10 @@ class StepEditDialog(QDialog):
         self._default_url = (default_url or "").strip()
         # 场景决定能选哪些动作：网页（浏览器）/ 桌面（截图定位 + 鼠标键盘）
         self.desktop = scene == "desktop"
+        # 桌面场景：捕获时顺手存下来的「整窗截图」+ 红框相对窗口左上角的位置，
+        # 保存步骤时写进 locator.window / locator.offset（运行时靠它先认窗口）
+        self._window_path = ""
+        self._window_offset: list = []
         self._actions = DESKTOP_ACTIONS if self.desktop else WEB_ACTIONS
         self.setWindowTitle(("编辑步骤" if self._editing else "新建步骤")
                             + ("（桌面应用）" if self.desktop else ""))
@@ -573,6 +589,23 @@ class StepEditDialog(QDialog):
             "border: 1px dashed #bbb; border-radius: 4px; color: #999;"
         )
         form.addRow("截图预览：", self.preview)
+
+        # --- 相似度阈值（图片匹配）：浅色界面里分数天然偏低，可以放宽 ---
+        self.threshold_spin = QDoubleSpinBox()
+        self.threshold_spin.setRange(0.0, 0.99)
+        self.threshold_spin.setSingleStep(0.01)
+        self.threshold_spin.setDecimals(2)
+        self.threshold_spin.setSpecialValueText("用默认（0.80）")
+        self.threshold_spin.setToolTip(
+            "图片匹配的相似度阈值：0.80 是默认。\n"
+            "浅色 / 低对比界面里分数天然偏低，可以调到 0.70 左右；\n"
+            "调高（0.9 以上）更严格，宁可报错也不点错地方。"
+        )
+        form.addRow("相似度：", self.threshold_spin)
+        self.threshold_hint = help_row(
+            "匹配到多少才算数（默认 0.80）。片子太像、浅色界面认不准时调它。",
+            "相似度", THRESHOLD_HELP)
+        form.addRow("", self.threshold_hint)
 
         # --- 兜底截图（XPath 失效时用）---
         self.fallback_edit = QLineEdit()
@@ -976,6 +1009,9 @@ class StepEditDialog(QDialog):
             self._show(w, is_xpath)
         for w in self._image_widgets:
             self._show(w, is_image)
+        # 「相似度」凡是会用图片匹配的地方都给：网页的截图定位 + 桌面场景（截图就是主力）
+        for w in (self.threshold_spin, self.threshold_hint):
+            self._show(w, is_image or self.desktop)
         for w in self._value_widgets:
             self._show(w, is_fill)
         for w in self._wait_widgets:
@@ -1304,6 +1340,8 @@ class StepEditDialog(QDialog):
         rel = self._copy_into_img(Path(path))
         if rel:
             self.locator_value.setText(rel)
+            # 手选的图跟上一张捕获的窗口没有关系了，窗口信息一起清掉
+            self._window_path, self._window_offset = "", []
             self._show_preview(self.project_dir / rel)
 
     def _pick_fallback_image(self):
@@ -1405,8 +1443,12 @@ class StepEditDialog(QDialog):
                 self.capture_hint.setText(f"已捕获等待模板：{text}")
             else:
                 self.locator_value.setText(dlg.result_path)
+                self._window_path = dlg.window_path
+                self._window_offset = list(dlg.offset or [])
+                more = ("　已记下窗口截图，运行时先认窗口、只在窗口里找"
+                        if dlg.window_path else "")
                 self.capture_hint.setText(
-                    f"已捕获：{text}　→　{dlg.result_path}"
+                    f"已捕获：{text}　→　{dlg.result_path}{more}"
                     + ("　（窗口标题可填到【激活窗口】那一步里）"
                        if dlg.window_title else "")
                 )
@@ -1427,9 +1469,14 @@ class StepEditDialog(QDialog):
                 self.capture_hint.setText(f"已取等待模板：{dlg.result_path}")
             else:
                 self.locator_value.setText(dlg.result_path)
+                self._window_path = dlg.window_path
+                self._window_offset = list(dlg.offset or [])
+                more = ("　已记下窗口截图，运行时先认窗口、只在窗口里找"
+                        if dlg.window_path else "")
                 self.capture_hint.setText(
-                    f"已取模板：{dlg.result_path}（只框控件本身，别带大片背景）"
+                    f"已取模板：{dlg.result_path}（只框控件本身，别带大片背景）{more}"
                 )
+            self._show_preview(self.project_dir / dlg.result_path)
             self._sync_visibility()
         except Exception as e:
             QMessageBox.critical(self, "截屏取模板失败",
@@ -1464,10 +1511,13 @@ class StepEditDialog(QDialog):
             )
             self.locator_value.setText(s.locator.value)
             self.fallback_edit.setText(s.locator.image or "")
+            self._window_path = str(getattr(s.locator, "window", "") or "")
+            self._window_offset = list(getattr(s.locator, "offset", []) or [])
             if s.locator.type == "image" and s.locator.value:
                 img_path = self.project_dir / s.locator.value
                 if img_path.exists():
                     self._show_preview(img_path)
+        self.threshold_spin.setValue(float(getattr(s, "image_threshold", 0) or 0))
         self.value_edit.setText(s.value)
 
         wait_idx = self.wait_combo.findData(s.wait_after)
@@ -1735,7 +1785,10 @@ class StepEditDialog(QDialog):
                 type="image" if self.desktop else self.locator_type.currentData(),
                 value=self.locator_value.text().strip(),
                 image="" if self.desktop else self.fallback_edit.text().strip(),
+                window=self._window_path,
+                offset=list(self._window_offset),
             )
+            step.image_threshold = float(self.threshold_spin.value() or 0)
             if self.desktop and action == "click":
                 step.click_times = int(self.click_times_combo.currentData() or 1)
             if action in ("fill", "select"):

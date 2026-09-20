@@ -266,6 +266,8 @@ class DesktopPickerDialog(QDialog):
         self.result_path = ""       # img/xxx.png
         self.result_text = ""       # 控件描述（写进步骤编辑器的提示）
         self.window_title = ""      # 控件所属窗口标题（可以填进「激活窗口」）
+        self.window_path = ""       # 顺手存下来的整窗截图（运行时认窗口用）
+        self.offset: list = []      # 红框相对窗口左上角的位置 [dx,dy,宽,高]
 
         self._point: Optional[Tuple[int, int]] = None
         self._ctrl: Optional[UiControl] = None
@@ -554,6 +556,14 @@ class DesktopPickerDialog(QDialog):
             return
         self._captured = True
         self.result_path = f"img/{path.name}"
+        # 顺手存一张整窗截图 + 红框相对窗口的位置：运行时先认窗口，
+        # 把找控件的范围缩到一个窗口里；认不到就退回全屏匹配。
+        try:
+            from smart_tool.ui.screen_capture import save_window_template
+            self.window_path, self.offset = save_window_template(
+                img, box, (ox, oy), self.img_dir, path.stem)
+        except Exception:
+            self.window_path, self.offset = "", []
 
     def _show_overlay(self):
         """把遮罩恢复成可见状态（截图失败、要继续选时用）。"""
