@@ -32,18 +32,11 @@ packaging/*.ico
 ms-playwright/
 
 # ---------- 发行版专用部件（本机保留，打包自己的 exe 照常用，只是不提交）----------
-# main.py 里对它们的导入都是可选的：缺了照样能跑，直接进主界面。
-# 启动广告海报
+# main.py 里对它的导入是可选的：缺了照样能跑，直接进主界面。
+# 启动广告海报 + 启动广告页
 assets/求打赏.jpg
 assets/求打赏.png
-# 启动广告页
 smart_tool/ui/splash.py
-# 安装向导（选文件夹 / 建快捷方式 / 登记卸载）
-smart_tool/setup_wizard.py
-# 卸载程序 + 注册表卸载入口 + 建快捷方式
-smart_tool/uninstall.py
-smart_tool/core/uninstall_reg.py
-smart_tool/core/shortcut.py
 # 作者自己的开发进度笔记（含内部计划）
 项目进度.md
 

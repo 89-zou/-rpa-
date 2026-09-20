@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
-"""Playwright 浏览器内核的检测与安装（打包后第一次运行要用）。
+"""Playwright 浏览器内核的检测与安装（第一次运行要用）。
 
 打包出来的程序里只有 playwright 的驱动（node.exe + cli.js），**没有**浏览器本体
-（Chromium 约 150 MB）。内核放哪儿按这个顺序找：
+（Chromium 约 150 MB）。内核就放在**用户数据目录**下的 `浏览器/` 里：
 
-1. 环境变量 `PLAYWRIGHT_BROWSERS_PATH`（设了就听它的）；
-2. **程序目录旁的「浏览器」文件夹** —— 建了它就用它（放 D 盘/U 盘/项目里都行，
-   绿色版、不想往 C 盘塞东西、或者怕被清理软件删掉，就建这个目录）；
-3. 默认 `%LOCALAPPDATA%\\ms-playwright`。
+    <数据目录>\\浏览器\\chromium-1243\\…
+
+数据目录是什么见 `paths.DATA_DIR`（程序旁边有 projects/ 就是程序目录本身，
+绿色版；否则是首次运行让用户选的那个位置）。这样整个文件夹拷走就能搬家，
+也不会往 C 盘塞东西。
+
+例外：环境变量 `PLAYWRIGHT_BROWSERS_PATH` 设了就先听它的（调试用）。
 
 `ensure_env()` 会把最终选中的目录写进 `PLAYWRIGHT_BROWSERS_PATH`，这样
 playwright 自己去启动浏览器、以及 `install()` 下载，用的都是同一个地方。
 
-· 安装向导 / `install()` 用它下载 Chromium（带日志）；
+· 首次运行的设置窗口 `install()` 用它下载 Chromium（带日志）；
 · 运行时用 `is_installed()` 先看一眼，没装就给出中文提示，别让用户看到
   Playwright 那句英文报错。
 """
@@ -26,28 +29,43 @@ from smart_tool import paths
 
 #: Playwright 自己的环境变量（设了就优先用它）
 ENV_KEY = "PLAYWRIGHT_BROWSERS_PATH"
-#: 程序目录旁边这个文件夹名（建了就用它装内核，不往 C 盘塞）
+#: 数据目录下这个文件夹名（内核装在这里，跟项目数据住一起）
 PORTABLE_DIR_NAME = "浏览器"
 
 
 def portable_dir() -> Path:
-    """程序目录旁的浏览器文件夹（绿色位置）。"""
-    return paths.app_dir() / PORTABLE_DIR_NAME
+    """内核目录：数据目录下的「浏览器」文件夹。"""
+    return paths.DATA_DIR / PORTABLE_DIR_NAME
 
 
-def browsers_dir() -> Path:
-    """浏览器装在哪（跟 Playwright 的规则保持一致，外加"程序旁的浏览器文件夹"）。"""
-    custom = os.environ.get(ENV_KEY)
-    if custom and custom != "0":
-        return Path(custom).expanduser()
-    portable = portable_dir()
-    # 有内核 → 当然用它；只有空文件夹也算数（说明用户想让内核装在这儿）
-    if portable.is_dir():
-        return portable
+def default_dir() -> Path:
+    """Playwright 自己的默认位置（源码运行时 `playwright install` 装在这儿）。"""
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
         return Path(base) / "ms-playwright"
     return Path.home() / ".cache" / "ms-playwright"
+
+
+def browsers_dir() -> Path:
+    """浏览器装在哪 —— 找到哪个用哪个，都没有就返回「准备装的那个」。
+
+    1) `PLAYWRIGHT_BROWSERS_PATH` 设了就听它的；
+    2) 数据目录下的「浏览器」里有内核 → 用它（正常情况，整个文件夹拷走就能搬走）；
+    3) 默认位置 `%LOCALAPPDATA%\\ms-playwright` 里有内核 → 用它
+       （源码运行时用 `python -m playwright install chromium` 装在的就是那儿，
+       不必再下一遍）；
+    4) 哪儿都没有 → 返回数据目录下的「浏览器」，下一步要下载就装在这里。
+    """
+    custom = os.environ.get(ENV_KEY)
+    if custom and custom != "0":
+        return Path(custom).expanduser()
+    portable = portable_dir()
+    if is_installed(portable):
+        return portable
+    fallback = default_dir()
+    if is_installed(fallback):
+        return fallback
+    return portable
 
 
 def ensure_env() -> Path:
@@ -60,17 +78,22 @@ def ensure_env() -> Path:
     return target
 
 
-def installed_kinds() -> List[str]:
-    """已经下载好的浏览器目录名（chromium-1243 这种）。"""
-    d = browsers_dir()
+def installed_kinds(directory: Optional[Path] = None) -> List[str]:
+    """某个目录里已经下载好的浏览器目录名（chromium-1243 这种）。
+
+    不给目录就看当前选定的内核目录；首次运行的设置窗口会拿它检查
+    「用户刚选的那个位置里是不是已经有内核了」。
+    """
+    d = Path(directory) if directory is not None else browsers_dir()
     if not d.is_dir():
         return []
     return sorted(p.name for p in d.iterdir() if p.is_dir())
 
 
-def is_installed() -> bool:
+def is_installed(directory: Optional[Path] = None) -> bool:
     """Chromium 装好了没（有 chromium / chromium_headless_shell 都算）。"""
-    return any(name.startswith("chromium") for name in installed_kinds())
+    return any(name.startswith("chromium")
+               for name in installed_kinds(directory))
 
 
 def driver_command() -> tuple:
@@ -123,17 +146,14 @@ def install(on_log: Optional[Callable[[str], None]] = None,
         return False
     ok = proc.returncode == 0 and is_installed()
     if on_log:
-        on_log("Chromium 装好了 ✓" if ok else "没装成功，可以稍后在向导里重试")
+        on_log("Chromium 装好了 ✓" if ok else "没装成功，可以关掉程序重开再试一次")
     return ok
 
 
 def hint() -> str:
     """没装浏览器时给用户看的提示（中文，能照着做）。"""
-    from smart_tool import paths
-
     if paths.is_production():
-        how = ("   最简单的办法：跑一次安装向导，它会在「环境构建」这一步自动下载：\n"
-               "       小邹RPA.exe --setup\n")
+        how = ("   把程序关掉重新打开，首次运行的窗口里勾上「下载浏览器内核」就行；\n")
     else:
         how = ("   源码运行时装一次就行（约 150 MB）：\n"
                "       .venv\\Scripts\\python -m playwright install chromium\n")

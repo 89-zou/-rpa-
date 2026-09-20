@@ -77,10 +77,12 @@ py -3 -m venv .venv
 .venv\Scripts\python -m smart_tool.main
 ```
 
-> **内核装哪儿？** 默认在 `%LOCALAPPDATA%\ms-playwright`。想让它待在项目里
-> （不往 C 盘塞东西、拷 U 盘就能带走、也不怕被清理软件删），**在项目目录下建一个
-> 叫 `浏览器` 的文件夹**就行——程序会自动认这个目录，下载和启动都用它。
-> 也可以直接设环境变量 `PLAYWRIGHT_BROWSERS_PATH` 指到别处（优先级最高）。
+> **内核装哪儿？** 跟着**数据目录**走：`<数据目录>\浏览器\`。
+> 数据目录就是「程序旁边有 `projects/` 就用程序目录，否则是第一次运行时你选的那个位置」，
+> 所以在源码运行的仓库里，它就在 **`浏览器/`**（整个仓库拷走即可搬家）。
+> 你要是用 `python -m playwright install chromium` 装到了默认位置
+> `%LOCALAPPDATA%\ms-playwright`，程序也认（不会重复下载）。
+> `PLAYWRIGHT_BROWSERS_PATH` 优先级最高。
 > 下载慢的话用国内镜像：
 >
 > ```powershell
@@ -131,7 +133,7 @@ smart_tool/
 │  │  └─ crash_guard.py        原生崩溃兜底（写 crash.log）
 │  ├─ ui/                    PyQt6 界面（画布、流程编辑、各类面板）
 │  └─ assets/ …              随程序走的资源
-├─ assets/                   logo、演示项目模板（安装时复制到用户目录）
+├─ assets/                   logo、示例项目模板（首次运行复制到数据目录）
 ├─ packaging/                打包成单文件 exe 的脚本（.spec + build.ps1）
 ├─ projects/                 你的项目（只有内置示例进版本库）
 ├─ run_cli.py                命令行跑一个项目
@@ -166,20 +168,21 @@ powershell -ExecutionPolicy Bypass -File packaging\build.ps1
 
 | 现象 | 怎么办 |
 |---|---|
-| 报「还没装浏览器内核」 | 跑一次 `.venv\Scripts\python -m playwright install chromium`（慢就用上面的国内镜像） |
-| 想让内核待在项目里 / 不占 C 盘 | 在项目目录下建一个 `浏览器` 文件夹，内核就装在那儿、也从那儿启动（也可以设 `PLAYWRIGHT_BROWSERS_PATH`） |
-| 内核莫名不见了（清理软件、卸载程序删过） | 重新装一次即可；装到项目旁的 `浏览器` 文件夹里最不容易被波及 |
+| 报「还没装浏览器内核」 | 跑一次 `.venv\Scripts\python -m playwright install chromium`（慢就用上面的国内镜像）；打包版重开程序，首次运行窗口里勾上「下载浏览器内核」 |
+| 想让内核待在数据目录里 / 不占 C 盘 | 默认就是：内核装在 `<数据目录>\浏览器\`。程序旁有 `projects/` 时数据目录就是程序目录，整个文件夹拷走即可搬家 |
+| 内核莫名不见了 | 重开一次程序，在首次运行窗口里勾「下载浏览器内核」重装 |
 | 元素点不到 | 优先用【捕获元素】取 XPath；页面结构会变的，给定位配一张截图兜底（点不到就用模板匹配再试） |
 | 程序闪退、没提示 | 看 `crash.log`（在用户数据目录里），里面有异常调用栈 |
 | 换了电脑 / 项目搬家后「文件不存在」 | 不用改：数据源路径找不到时，会按文件名在项目目录里自动找同名文件，日志里会写一句 |
 | 卡在某个循环里 | 每个节点都能设超时；自由代码的循环也有超时刹车，到点中断 |
-| 想改默认数据目录 | 删掉 `%APPDATA%\小邹RPA\config.json` 重开程序，或直接改里面的 `data_dir` |
+| 想改默认数据目录 | 直接改 `%APPDATA%\小邹RPA\config.json` 里的 `data_dir`；删掉这一行则重新按「程序旁有没有 projects/」判断 |
 
 ## 开源版说明
 
-这个仓库是**开发版**：直接源码运行，进去就是主界面。作者发行版里的**启动广告页**、
-**安装向导**（选安装文件夹、建快捷方式、登记系统卸载入口）和**卸载程序**不在这里——
-`main.py` 对它们的导入是可选的，所以缺了这些文件照样跑，写流程、跑流程都不受影响。
+这个仓库是**开发版**：直接源码运行，进去就是主界面 —— 仓库里本来就有 `projects/`
+和 `浏览器/`，所以不会弹首次运行窗口，写流程、跑流程都不受影响。
+作者发行版里多一个**启动广告页**（`ui/splash.py`，不在这个仓库里），
+`main.py` 对它的导入是可选的，缺了照样跑。
 
 ## English
 
@@ -223,11 +226,12 @@ The bundled demo project `采集示例-登录与采集` (42 nodes, two practice 
 launch and exercises every node type. Headless run of a project:
 `.venv\Scripts\python run_cli.py 采集示例-登录与采集`.
 
-> **Where the browser kernel lives**: by default `%LOCALAPPDATA%\ms-playwright`. To keep it
-> inside the project (nothing on the C: drive, portable on a USB stick), just create a folder
-> named `浏览器` next to the code — the app will download to and launch from it automatically.
-> `PLAYWRIGHT_BROWSERS_PATH` still wins if it is set. In mainland China the CDN can be very slow;
-> use a mirror:
+> **Where the browser kernel lives**: `<data folder>\浏览器\`. The data folder is the program
+> folder when a `projects/` folder sits next to it (portable — copy the whole folder to move
+> everything), otherwise the location you pick on first launch. A kernel installed the usual way
+> via `python -m playwright install chromium` (i.e. `%LOCALAPPDATA%\ms-playwright`) is also picked
+> up, so you don't download it twice. `PLAYWRIGHT_BROWSERS_PATH` still wins if it is set.
+> In mainland China the CDN can be very slow; use a mirror:
 >
 > ```powershell
 > $env:PLAYWRIGHT_DOWNLOAD_HOST = "https://cdn.npmmirror.com/binaries/playwright"
@@ -239,11 +243,13 @@ launch and exercises every node type. Headless run of a project:
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging\build.ps1
 # -> dist\小邹RPA.exe (~144 MB, single file)
+# First launch asks where to keep your data, then creates the demo project
+# and downloads Chromium into <that folder>\浏览器\.
 ```
 
-**Note on this repository**: it is the *developer* build. The author's distribution-only parts — the
-startup ad page, the installer wizard (install folder / shortcuts / uninstall entry) and the
-uninstaller — are intentionally not included; `main.py` imports them optionally, so everything still
-runs from source.
+**Note on this repository**: it is the *developer* build — run it from source and you land straight
+in the main window (the repo already ships `projects/` and `浏览器/`, so no first-run dialog).
+The author's distribution adds a **startup ad page** (`ui/splash.py`), which is intentionally not
+included; `main.py` imports it optionally, so everything still runs from source.
 
 **License**: [MIT](LICENSE) ｜ **Author**: @小邹

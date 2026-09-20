@@ -1,24 +1,20 @@
 # -*- coding: utf-8 -*-
 """程序入口（GUI）。
 
-源码运行（开发版）：
-    直接进主界面 —— 不弹安装向导、不显示启动海报、不往系统里写任何东西。
+启动顺序：
 
-打包后的 exe（生产版）：
-    第一次运行 → 先弹【安装向导】（选一个文件夹、构建环境、建快捷方式、登记卸载入口）
-    → 每次启动显示启动海报（加载完才让点，或者 8 秒后自动进）
-    → 主窗口（默认载入演示项目，删了就是空项目）。
+    1. 后台清掉单文件版被强杀留下的解包残渣（不耽误开界面）；
+    2. 建 QApplication、装崩溃日志钩子；
+    3. **首次运行的准备**：程序旁边就有 `projects/`（绿色版），或者以前选过位置
+       → 直接进主界面；否则弹一个窗口让用户选「数据放哪儿」，顺手在里面建好
+       示例项目、把浏览器内核下载到那个目录下的 `浏览器/`；
+    4. 生产版（打包出来的 exe）显示启动海报，然后进主窗口。
 
-两种情况不启动主界面：
-    · 用户在向导里点了【取消】；
-    · 程序被复制到了安装目录 —— 改为启动那边的程序（当前进程退出）。
+用户点了【取消】：位置还没定时直接退出（没地方存数据没法用）；
+位置已经定过、只是缺浏览器内核时照常进主界面（以后重开程序再装一次）。
 
-命令行（两个版本都支持）：
-    --setup      重跑安装向导（补装浏览器内核、改安装位置、重建快捷方式）
-    --uninstall  卸载（系统「设置 → 应用」里点卸载执行的就是这条）
-
-开源版没有「启动广告页」和「安装向导 / 卸载」这几个部件（作者发行版专用），
-所以它们的导入都是可选的：文件不在就照常进主界面，不影响写流程、跑流程。
+开源版没有「启动广告页」（作者发行版专用），导入是可选的：
+文件不在就照常进主界面，不影响写流程、跑流程。
 """
 import sys
 import traceback
@@ -28,7 +24,7 @@ from PyQt6.QtGui import QFont, QIcon
 from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from smart_tool import paths
-from smart_tool.core import crash_guard, temp_cleanup
+from smart_tool.core import browser_setup, crash_guard, temp_cleanup
 from smart_tool.ui.main_window import MainWindow
 
 try:                     # 开源版不带启动广告页
@@ -46,8 +42,8 @@ def install_crash_handler():
     另外再挂一层「原生崩溃兜底」：像访问冲突、回调里逃出异常这类崩溃，
     Python 层根本来不及反应，由 crash_guard 记下异常代码和最后一步在干什么。
 
-    日志写在**用户数据目录**（不是程序目录）：装到 Program Files 时程序目录
-    不可写，写不进去就等于崩溃线索全丢了。
+    日志写在**用户数据目录**（不是程序目录）：程序目录不可写时，
+    写不进去就等于崩溃线索全丢了。
     """
     log_file = paths.crash_log()
     crash_guard.install(log_file)
@@ -71,31 +67,28 @@ def install_crash_handler():
     sys.excepthook = hook
 
 
-def run_first_time_setup() -> str:
-    """第一次运行先弹安装向导（选目录、构建环境、建捷径、登记卸载入口）。
+def prepare_first_run() -> bool:
+    """首次运行：确认「数据位置」和「浏览器内核」都齐了。返回 False＝退出程序。
 
-    返回接下来该干什么：
-        "continue"  正常继续（装过了 / 装好了，就地运行）
-        "relaunch"  程序已经复制到安装目录 → 去启动那边的，当前进程退出
-        "quit"      用户取消了安装向导 → 什么都不做，直接退出
+    判断依据（都不用问用户）：
+    · 程序旁边就有 `projects/`（绿色版），或者以前选过位置 → 位置算定好了；
+    · `<数据目录>/浏览器/` 里有 chromium → 内核算装好了。
 
-    用户取消就不再往下走（不会偷偷启动程序，也不会把取消记成"装过了"）——
-    下次运行还会弹向导。
+    两样都齐就什么都不弹，直接进主界面；缺哪样弹窗口补哪样。
     """
-    if paths.load_config().get("installed"):
-        return "continue"
-    try:
-        from smart_tool.setup_wizard import SetupWizard
-    except ImportError:      # 开源版没有安装向导：直接进主界面
-        return "continue"
+    need_path = not paths.data_dir_ready()
+    need_kernel = not browser_setup.is_installed()
+    if not need_path and not need_kernel:
+        return True
 
-    wizard = SetupWizard(first_run=True)
-    if wizard.exec() != QDialog.DialogCode.Accepted:
-        return "quit"
-    if wizard.relaunch_target:
-        wizard._launch(wizard.relaunch_target)
-        return "relaunch"
-    return "continue"
+    from smart_tool.ui.first_run_dialog import FirstRunDialog
+
+    dlg = FirstRunDialog(need_path=need_path, need_kernel=need_kernel)
+    if dlg.exec() == QDialog.DialogCode.Accepted:
+        return True
+    # 取消：位置都没定就没法用（没地方放项目），只能退出；
+    # 只是缺内核的话，让他先进去写流程，跑之前再把内核装上。
+    return not need_path
 
 
 def clean_temp_leftovers():
@@ -118,26 +111,6 @@ def clean_temp_leftovers():
 
 
 def main():
-    # 卸载入口：系统「设置 → 应用 → 小邹RPA → 卸载」执行的就是这条
-    # （注册表里的 UninstallString 写着 "<本程序>" --uninstall）
-    if "--uninstall" in sys.argv[1:]:
-        try:
-            from smart_tool.uninstall import main as uninstall_main
-        except ImportError:
-            print("这个版本不带卸载程序（那是作者发行版里的部件）。")
-            return
-        sys.exit(uninstall_main())
-
-    # 重跑安装向导（补装浏览器内核、改安装位置、重建快捷方式都用它）。
-    # 开发时也留着这条：想看那套流程就 `python -m smart_tool.main --setup`。
-    if "--setup" in sys.argv[1:]:
-        try:
-            from smart_tool.setup_wizard import main as setup_main
-        except ImportError:
-            print("这个版本不带安装向导：直接 `python -m smart_tool.main` 就能跑。")
-            return
-        sys.exit(setup_main())
-
     # 顺手清掉上次被强杀留下的解包残渣（后台做，不影响启动）
     clean_temp_leftovers()
 
@@ -150,22 +123,17 @@ def main():
     icon = paths.icon_file()
     if icon.is_file():
         app.setWindowIcon(QIcon(str(icon)))
-    paths.ensure_dirs()
     install_crash_handler()
 
-    # 开发版（源码运行）与生产版（打包 exe）从这里分开：
-    #   生产版：第一次运行弹安装向导 → 启动海报 → 主界面；
-    #   开发版：跳过这两样，直接开主界面（写代码时不用每次点一遍向导）。
+    # 第一次使用：先让用户选好数据位置、把示例项目和浏览器内核准备出来。
+    # 用户放弃且位置还没定 → 什么都不启动。
+    if not prepare_first_run():
+        return
+    paths.ensure_dirs()
+
+    # 启动海报：先画出来，再去建主窗口（建窗口最慢，海报上会写进度）。
+    # 海报是给最终用户看的，写代码时（源码运行）每次挡一下太烦，所以只在 exe 里显示。
     production = paths.is_production()
-
-    if production:
-        # 第一次运行：先把环境装好（安装位置、演示项目、浏览器内核、快捷方式）
-        # 用户点了取消 → 直接退出，什么都不启动
-        action = run_first_time_setup()
-        if action in ("quit", "relaunch"):
-            return
-
-    # 启动海报：先画出来，再去建主窗口（建窗口最慢，海报上会写进度）
     splash = AdSplash.try_create() if (production and AdSplash is not None) else None
     if splash is not None:
         splash.show()

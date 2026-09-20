@@ -9,7 +9,7 @@
 打了什么进去：
     · smart_tool 全部代码 + assets（logo、海报、演示项目模板）；
     · playwright 的驱动（node.exe + cli.js，约 107MB）——浏览器本体不打包，
-      由安装向导下载到 %LOCALAPPDATA%\\ms-playwright（约 150MB）；
+      第一次运行时由程序下载到 <数据目录>\浏览器\（约 150MB）；
     · PyQt6、opencv(cv2)、numpy、Pillow、openpyxl、xlrd、pyautogui、uiautomation、comtypes。
 
 怎么用：

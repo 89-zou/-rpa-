@@ -1012,6 +1012,25 @@ def validate_project_name(name: str) -> Optional[str]:
     return None
 
 
+def install_demo_project(
+        projects_dir: Optional[Path] = None) -> Optional[Path]:
+    """把内置的示例项目复制到 projects/ 下（已经有了就不动）。
+
+    首次运行准备环境时用。返回新复制出来的项目目录；模板不在、或者同名项目
+    已经有了，就返回 None（当作「不用管」）。
+    """
+    root = Path(projects_dir) if projects_dir is not None else paths.PROJECTS_DIR
+    src = paths.demo_template_dir()
+    if not src.is_dir():
+        return None
+    dst = root / src.name
+    if dst.exists():
+        return None
+    root.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, dst)
+    return dst
+
+
 def list_projects() -> List[ProjectStore]:
     """列出所有项目（含 steps.json 的目录）。"""
     paths.ensure_dirs()
