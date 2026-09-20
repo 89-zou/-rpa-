@@ -143,6 +143,40 @@ def control_at(x: float, y: float, up: int = 0) -> Optional[UiControl]:
         return None
 
 
+def window_at(x: float, y: float) -> Optional[UiControl]:
+    """这个屏幕坐标所在的**顶层窗口**（整窗矩形 + 窗口标题）。
+
+    和 control_at 的区别：这个一路走到顶层窗口。用途是把「找控件的范围」
+    从整屏缩到一个窗口，也用来在捕获时把整窗裁出来当窗口模板。
+
+    注意：**最大化窗口的矩形就是整屏**，所以这里不能像 _describe 那样
+    把「整屏大小」当成桌面根节点丢掉 —— 那会漏掉最常见的情况。
+    整个函数不会抛异常（调用方可能是 Qt 定时器槽）。
+    """
+    try:
+        auto = _auto()
+        ctrl = auto.ControlFromPoint(int(round(x)), int(round(y)))
+        if ctrl is None:
+            return None
+        root = ctrl.GetTopLevelControl() or ctrl
+        r = root.BoundingRectangle
+        rect = (int(r.left), int(r.top), int(r.right), int(r.bottom))
+        if rect[2] <= rect[0] or rect[3] <= rect[1]:
+            return None
+        try:
+            name = root.Name or ""
+        except Exception:
+            name = ""
+        try:
+            cls = root.ClassName or ""
+        except Exception:
+            cls = ""
+        return UiControl(name=name, kind="WindowControl", cls=cls,
+                         rect=rect, window_title=name)
+    except Exception:
+        return None
+
+
 def _describe(ctrl) -> Optional[UiControl]:
     """UIA 控件 → UiControl；不合适的（桌面根、空矩形）返回 None。"""
     if ctrl is None:

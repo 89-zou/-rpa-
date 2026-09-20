@@ -49,6 +49,16 @@ class DesktopMatch:
     height: float
     confidence: float
     scale: float
+    how: str = ""     # 怎么找到的：窗口内匹配 / 红框偏移 / 全屏匹配（写日志用）
+
+
+#: 整窗模板的默认阈值：窗口是大图，内容一直在变，别拿控件的 0.8 去卡它
+WINDOW_THRESHOLD = 0.75
+#: 只有窗口匹配得**足够确定**，才允许「窗口内没找到控件 → 按红框偏移点」。
+#: 窗口认错的话，偏移是相对错误原点算的，点了就是乱点 —— 宁可不点。
+WINDOW_OFFSET_MIN_CONF = 0.85
+#: 在窗口矩形外再放宽几个像素（窗口阴影、边框抖动）
+WINDOW_MARGIN = 12
 
 
 def available() -> bool:
@@ -153,22 +163,27 @@ def locate(template_path: Path, threshold: Optional[float] = None,
     limit = threshold if threshold is not None else image_locator.DEFAULT_THRESHOLD
     deadline = time.monotonic() + max(0.0, wait_s)
     tries = 0
+    trace: List[str] = []
     while True:
         tries += 1
         screen = _grab_bgr()
-        found = image_locator.best_match(screen, template, threshold=limit)
-        if found:
-            conf, x, y, w, h, scale = found
+        trace = []
+        found = image_locator.best_match(screen, template, threshold=limit,
+                                         key=str(path), trace=trace)
+        if found is not None:
             ox, oy = screen_origin()        # 图内坐标 → 屏幕坐标
-            log(f"  截图匹配成功：屏幕({ox + x + w / 2:.0f},{oy + y + h / 2:.0f}) "
-                f"置信度={conf:.3f} 缩放={scale}")
-            return DesktopMatch(ox + x + w / 2, oy + y + h / 2, w, h, conf, scale)
+            x, y = ox + found.x, oy + found.y
+            log(f"  截图匹配成功：屏幕({x:.0f},{y:.0f}) "
+                f"{image_locator.describe(found)}")
+            return DesktopMatch(x, y, found.width, found.height,
+                                found.confidence, found.scale)
         if time.monotonic() >= deadline:
             raise DesktopError(
                 f"屏幕上没找到这张图（{path.name}，试了 {tries} 次，"
                 f"阈值 {limit}）。\n"
                 "    可能原因：目标窗口不在最前面、图被裁得不干净、"
                 "程序还没画出来，或这张模板是别的分辨率下截的。"
+                + "".join(f"\n    · {t}" for t in dict.fromkeys(trace[-2:]))
             )
         time.sleep(POLL_S)
 
@@ -178,6 +193,160 @@ def _grab_bgr():
     import numpy as np
     img = grab_screen().convert("RGB")
     return np.array(img)[:, :, ::-1].copy()
+
+
+# ------------------------------
+# 窗口：先找到窗口，再在窗口里找控件
+# ------------------------------
+def window_rect_at(x: float, y: float) -> Optional[Tuple[int, int, int, int]]:
+    """(x, y) 所在**顶层窗口**的屏幕矩形；问不到就返回 None。
+
+    先用 UI Automation（准、还带窗口标题），失败退回 Win32 的
+    WindowFromPoint + GetAncestor(GA_ROOT)。自绘界面、权限不足时可能都拿不到。
+    """
+    try:
+        from smart_tool.core import desktop_uia
+        ctrl = desktop_uia.window_at(x, y)
+        if ctrl is not None:
+            return ctrl.rect
+    except Exception:
+        pass
+    return _win32_window_rect(x, y)
+
+
+def _win32_window_rect(x: float, y: float) -> Optional[Tuple[int, int, int, int]]:
+    """Win32 兜底：点 → 窗口句柄 → 根窗口矩形（含标题栏和边框）。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        hwnd = u.WindowFromPoint(wintypes.POINT(int(x), int(y)))
+        if not hwnd:
+            return None
+        root = u.GetAncestor(hwnd, 2)        # GA_ROOT = 2
+        rect = wintypes.RECT()
+        if not u.GetWindowRect(root, ctypes.byref(rect)):
+            return None
+        box = (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+        if box[2] <= box[0] or box[3] <= box[1]:
+            return None
+        return box
+    except Exception:
+        return None
+
+
+def find_window(window_template: Path, threshold: Optional[float] = None,
+                wait_s: float = DEFAULT_WAIT_S,
+                log: Callable[[str], None] = print) -> Optional[DesktopMatch]:
+    """用「整窗截图」在屏幕上找窗口 → 它现在的位置和大小；没找到返回 None。
+
+    窗口模板的阈值默认比控件低（WINDOW_THRESHOLD）：整窗图里内容一直在变
+    （标题、列表、输入框），拿控件的 0.8 去卡它基本卡不住。
+    """
+    try:
+        return locate(window_template, threshold=threshold or WINDOW_THRESHOLD,
+                      wait_s=wait_s, log=log)
+    except DesktopError as e:
+        log("  没找到窗口：" + str(e).splitlines()[0])
+        return None
+
+
+def _window_box_in_image(win: DesktopMatch,
+                         shape: Tuple[int, ...]) -> Optional[Tuple[int, int, int, int]]:
+    """窗口命中 → 截图图像里的裁剪范围（外扩 WINDOW_MARGIN，并夹在图内）。"""
+    ox, oy = screen_origin()
+    ih, iw = shape[:2]
+    left = int(round(win.x - win.width / 2 - ox)) - WINDOW_MARGIN
+    top = int(round(win.y - win.height / 2 - oy)) - WINDOW_MARGIN
+    right = int(round(win.x + win.width / 2 - ox)) + WINDOW_MARGIN
+    bottom = int(round(win.y + win.height / 2 - oy)) + WINDOW_MARGIN
+    left, top = max(0, left), max(0, top)
+    right, bottom = min(iw, right), min(ih, bottom)
+    if right - left < 4 or bottom - top < 4:
+        return None
+    return left, top, right, bottom
+
+
+def locate_in_window(win: DesktopMatch, template_path: Path,
+                     threshold: Optional[float] = None, wait_s: float = 6.0,
+                     log: Callable[[str], None] = print) -> Optional[DesktopMatch]:
+    """只在**窗口矩形内**找控件（不再全屏找）—— 范围小了，假匹配少、也快。"""
+    path = Path(template_path)
+    if not path.is_file():
+        raise DesktopError(f"模板图不存在：{path}")
+    template = image_locator.imread_unicode(path)
+    limit = threshold if threshold is not None else image_locator.DEFAULT_THRESHOLD
+    key = str(path)
+    deadline = time.monotonic() + max(0.0, wait_s)
+    trace: List[str] = []
+    while True:
+        screen = _grab_bgr()
+        box = _window_box_in_image(win, screen.shape)
+        if box is not None:
+            l, t, r, b = box
+            sub = screen[t:b, l:r]
+            trace = []
+            hit = image_locator.best_match(sub, template, threshold=limit,
+                                           key=key, trace=trace)
+            if hit is not None:
+                ox, oy = screen_origin()
+                x, y = ox + l + hit.x, oy + t + hit.y
+                log(f"  窗口内匹配到控件：屏幕({x:.0f},{y:.0f}) "
+                    f"{image_locator.describe(hit)}")
+                return DesktopMatch(x, y, hit.width, hit.height,
+                                    hit.confidence, hit.scale, how="窗口内匹配")
+        if time.monotonic() >= deadline:
+            log("  窗口内没匹配到控件"
+                + (f"：{trace[-1]}" if trace else ""))
+            return None
+        time.sleep(POLL_S)
+
+
+def locate_by_window(window_template, target_template: Path, offset=(),
+                     threshold: Optional[float] = None,
+                     wait_s: float = DEFAULT_WAIT_S,
+                     log: Callable[[str], None] = print) -> DesktopMatch:
+    """桌面定位主流程：先找到窗口 → 在窗口里找控件 → 都没有再退。
+
+    为什么这样找：整屏匹配等于「在两百万个位置里挑一个最像的」，浅色界面很容易挑错；
+    先认出窗口，范围就只剩这个窗口（面积常常小一个数量级），再全屏兜底。
+
+    三条路，从上往下：
+    1. 窗口内匹配到控件 → 点命中点（最准，抗窗口内布局微调）
+    2. 窗口找到了、控件没匹配上 → 按捕获时记下的**红框偏移**点（你说的「点红框中心」）
+    3. 窗口都没找到 → 退回全屏匹配（没有窗口模板的老项目走这条，行为不变）
+    """
+    limit = threshold if threshold is not None else image_locator.DEFAULT_THRESHOLD
+    if window_template and Path(window_template).is_file():
+        log(f"  先找窗口：{Path(window_template).name}")
+        win = find_window(window_template, wait_s=min(wait_s, 8.0), log=log)
+        if win is not None:
+            log(f"  窗口在屏幕({win.x - win.width / 2:.0f},{win.y - win.height / 2:.0f}) "
+                f"大小 {win.width:.0f}×{win.height:.0f}")
+            hit = locate_in_window(win, target_template, threshold=limit,
+                                   wait_s=min(wait_s, 6.0), log=log)
+            if hit is not None:
+                return hit
+            if offset and len(offset) >= 4:
+                if win.confidence < WINDOW_OFFSET_MIN_CONF:
+                    log(f"  窗口匹配得不够确定（置信度 {win.confidence:.3f} < "
+                        f"{WINDOW_OFFSET_MIN_CONF}），不敢按红框偏移点 → 退回全屏匹配")
+                else:
+                    dx, dy, dw, dh = (float(v) for v in offset[:4])
+                    s = float(win.scale or 1.0)
+                    x = win.x - win.width / 2 + (dx + dw / 2) * s
+                    y = win.y - win.height / 2 + (dy + dh / 2) * s
+                    log(f"  按红框偏移点：屏幕({x:.0f},{y:.0f})（窗口缩放 {s:g}）")
+                    return DesktopMatch(x, y, dw * s, dh * s, win.confidence, s,
+                                        how="红框偏移")
+            log("  窗口里没匹配到控件，也没记红框偏移 → 退回全屏匹配")
+    elif window_template:
+        log(f"  窗口模板不存在，退回全屏匹配：{window_template}")
+    hit = locate(target_template, threshold=limit, wait_s=wait_s, log=log)
+    hit.how = "全屏匹配"
+    return hit
 
 
 def wait_gone(template_path: Path, wait_s: float = DEFAULT_WAIT_S,
