@@ -266,8 +266,9 @@ class DesktopPickerDialog(QDialog):
         self.result_path = ""       # img/xxx.png
         self.result_text = ""       # 控件描述（写进步骤编辑器的提示）
         self.window_title = ""      # 控件所属窗口标题（可以填进「激活窗口」）
-        self.window_path = ""       # 顺手存下来的整窗截图（运行时认窗口用）
-        self.offset: list = []      # 红框相对窗口左上角的位置 [dx,dy,宽,高]
+        self.window_path = ""       # 顺手存下来的整窗图（运行时认窗口用）
+        self.window_size: list = []  # 捕获时窗口长宽
+        self.offset: list = []      # 控件框在窗口图上的位置 [x,y,宽,高]
 
         self._point: Optional[Tuple[int, int]] = None
         self._ctrl: Optional[UiControl] = None
@@ -516,7 +517,10 @@ class DesktopPickerDialog(QDialog):
         self.accept()
 
     def _capture(self, rect: Tuple[int, int, int, int]):
-        """把这块屏幕裁下来存进 img/（rect 是屏幕物理像素）。
+        """把控件那块的图存进 img/（rect 是屏幕物理像素）。
+
+        规则：**只截控件所在的窗口**（不截整屏），窗口图顺便存下来 —— 运行时就靠
+        窗口名 + 窗口图「先认窗口、只在窗口里找控件」。拿不到窗口信息才退回整屏截一张。
 
         截之前先把遮罩「清空」成完全透明：不然裁出来的模板会带上遮罩的暗色和橙框，
         匹配置信度明显变差（实测从 1.00 掉到 0.89）。
@@ -525,7 +529,9 @@ class DesktopPickerDialog(QDialog):
         self.overlay.update()
         QApplication.processEvents()
         time.sleep(0.08)                # 等这一帧真的合成上去
-        crash_guard.note("桌面捕获：截屏取模板")
+        crash_guard.note("桌面捕获：捕获元素")
+        if self._capture_from_window(rect):
+            return
         try:
             img = desktop.grab_screen()
         except Exception as e:
@@ -536,6 +542,52 @@ class DesktopPickerDialog(QDialog):
         box = (rect[0] - ox, rect[1] - oy, rect[2] - ox, rect[3] - oy)
         box = (max(0, box[0]), max(0, box[1]),
                min(img.width, box[2]), min(img.height, box[3]))
+        self._save_crop(img, box)
+
+    def _capture_from_window(self, rect: Tuple[int, int, int, int]) -> bool:
+        """只截控件所在的窗口，成功返回 True。
+
+        拿窗口图 + 控件在窗口图上的位置，运行时就能「先按窗口名找窗口、
+        只在窗口里找控件」——窗口挪位置、改大小都不怕。
+        """
+        try:
+            cx = (rect[0] + rect[2]) / 2
+            cy = (rect[1] + rect[3]) / 2
+            info = desktop.window_info_at(cx, cy)
+            if not info or not info[0]:
+                return False
+            title, wrect = info
+            img, wrect = desktop.grab_window(title, log=lambda *_: None)
+            box = (int(rect[0] - wrect[0]), int(rect[1] - wrect[1]),
+                   int(rect[2] - wrect[0]), int(rect[3] - wrect[1]))
+            if not (0 <= box[0] < box[2] <= img.width
+                    and 0 <= box[1] < box[3] <= img.height):
+                return False            # 控件不在窗口图范围里，交给老路
+            self._window_title = title
+            self._window_img = img
+            self._window_box = box
+            self._save_crop(img, box)
+            if not self.result_path:
+                return False
+            # 窗口名：只留「不会老是变」的那截，运行时靠它找窗口
+            self.window_title = desktop.guess_window_keyword(title)
+            # 窗口图也存一份
+            try:
+                self.img_dir.mkdir(parents=True, exist_ok=True)
+                stem = Path(self.result_path).stem
+                wpath = self.img_dir / f"{stem}_窗口.png"
+                img.save(str(wpath))
+                self.window_path = f"img/{wpath.name}"
+                self.window_size = [float(img.width), float(img.height)]
+                self.offset = [float(v) for v in box]
+            except Exception:
+                self.window_path, self.offset, self.window_size = "", [], []
+            return True
+        except Exception:
+            return False
+
+    def _save_crop(self, img, box) -> None:
+        """把 img 上的 box 裁下来存进 img/（两条路共用）。"""
         if box[2] - box[0] < MIN_SIZE or box[3] - box[1] < MIN_SIZE:
             self._show_overlay()
             QMessageBox.information(self, "这块太小了",
@@ -556,14 +608,6 @@ class DesktopPickerDialog(QDialog):
             return
         self._captured = True
         self.result_path = f"img/{path.name}"
-        # 顺手存一张整窗截图 + 红框相对窗口的位置：运行时先认窗口，
-        # 把找控件的范围缩到一个窗口里；认不到就退回全屏匹配。
-        try:
-            from smart_tool.ui.screen_capture import save_window_template
-            self.window_path, self.offset = save_window_template(
-                img, box, (ox, oy), self.img_dir, path.stem)
-        except Exception:
-            self.window_path, self.offset = "", []
 
     def _show_overlay(self):
         """把遮罩恢复成可见状态（截图失败、要继续选时用）。"""

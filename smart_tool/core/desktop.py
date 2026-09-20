@@ -214,6 +214,46 @@ def window_rect_at(x: float, y: float) -> Optional[Tuple[int, int, int, int]]:
     return _win32_window_rect(x, y)
 
 
+def window_info_at(x: float, y: float) -> Optional[Tuple[str, Tuple[int, int, int, int]]]:
+    """(x, y) 所在顶层窗口的 (标题, 矩形)；问不到返回 None。
+
+    捕获时用它：知道是哪个窗口，才能「只截这个窗口」并把窗口名记下来。
+    """
+    try:
+        from smart_tool.core import desktop_uia
+        ctrl = desktop_uia.window_at(x, y)
+        if ctrl is not None and ctrl.window_title:
+            return ctrl.window_title, ctrl.rect
+    except Exception:
+        pass
+    rect = _win32_window_rect(x, y)
+    if rect is None:
+        return None
+    return _win32_window_title(x, y) or "", rect
+
+
+def _win32_window_title(x: float, y: float) -> str:
+    """Win32 兜底：拿这个位置所在根窗口的标题。"""
+    if sys.platform != "win32":
+        return ""
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        from ctypes import wintypes
+        hwnd = u.WindowFromPoint(wintypes.POINT(int(x), int(y)))
+        if not hwnd:
+            return ""
+        root = u.GetAncestor(hwnd, 2)
+        length = u.GetWindowTextLengthW(root)
+        if length <= 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(length + 1)
+        u.GetWindowTextW(root, buf, length + 1)
+        return buf.value or ""
+    except Exception:
+        return ""
+
+
 def _win32_window_rect(x: float, y: float) -> Optional[Tuple[int, int, int, int]]:
     """Win32 兜底：点 → 窗口句柄 → 根窗口矩形（含标题栏和边框）。"""
     if sys.platform != "win32":
@@ -304,44 +344,121 @@ def locate_in_window(win: DesktopMatch, template_path: Path,
         time.sleep(POLL_S)
 
 
+def _rect_from_match(win: DesktopMatch) -> Tuple[float, float, float, float]:
+    """窗口命中（中心 + 宽高）→ 矩形 (左, 上, 右, 下)。"""
+    return (win.x - win.width / 2, win.y - win.height / 2,
+            win.x + win.width / 2, win.y + win.height / 2)
+
+
+def _match_once_in_rect(rect, template_path: Path, threshold: float,
+                        key: str, trace: List[str]) -> Optional[DesktopMatch]:
+    """截一张全屏图，在 rect 那块里匹配模板 → 屏幕坐标（一次尝试）。"""
+    path = Path(template_path)
+    template = image_locator.imread_unicode(path)
+    screen = _grab_bgr()
+    ox, oy = screen_origin()
+    left = int(round(rect[0] - ox)) - WINDOW_MARGIN
+    top = int(round(rect[1] - oy)) - WINDOW_MARGIN
+    right = int(round(rect[2] - ox)) + WINDOW_MARGIN
+    bottom = int(round(rect[3] - oy)) + WINDOW_MARGIN
+    ih, iw = screen.shape[:2]
+    left, top = max(0, left), max(0, top)
+    right, bottom = min(iw, right), min(ih, bottom)
+    if right - left < 4 or bottom - top < 4:
+        return None
+    trace.clear()
+    hit = image_locator.best_match(screen[top:bottom, left:right], template,
+                                   threshold=threshold, key=key, trace=trace)
+    if hit is None:
+        return None
+    return DesktopMatch(ox + left + hit.x, oy + top + hit.y,
+                        hit.width, hit.height, hit.confidence, hit.scale)
+
+
 def locate_by_window(window_template, target_template: Path, offset=(),
                      threshold: Optional[float] = None,
                      wait_s: float = DEFAULT_WAIT_S,
-                     log: Callable[[str], None] = print) -> DesktopMatch:
-    """桌面定位主流程：先找到窗口 → 在窗口里找控件 → 都没有再退。
+                     log: Callable[[str], None] = print,
+                     title: str = "", window_size=(),
+                     feature: str = "", feature_offset=()) -> DesktopMatch:
+    """桌面定位主流程：**先认窗口，再在窗口里找控件**。
 
-    为什么这样找：整屏匹配等于「在两百万个位置里挑一个最像的」，浅色界面很容易挑错；
-    先认出窗口，范围就只剩这个窗口（面积常常小一个数量级），再全屏兜底。
+    认窗口的顺序（从上往下）：
+    1. **窗口名**（捕获时记下的标题关键字）→ 直接问系统要窗口矩形，最稳最快，
+       窗口挪了位置、改了大小都不怕；
+    2. 没窗口名 / 名字对不上 → 拿「整窗截图」当模板在屏幕上找；
+    3. 都不行 → 退回全屏匹配控件（老项目走这条，行为不变）。
 
-    三条路，从上往下：
-    1. 窗口内匹配到控件 → 点命中点（最准，抗窗口内布局微调）
-    2. 窗口找到了、控件没匹配上 → 按捕获时记下的**红框偏移**点（你说的「点红框中心」）
-    3. 窗口都没找到 → 退回全屏匹配（没有窗口模板的老项目走这条，行为不变）
+    认到窗口之后（三条路都试，从准到稳）：
+    - **深度定位**（勾了才有）：先在窗口里对一下**特征图**（捕获时框的那块“不会变的地方”）。
+      对不上说明窗口内容跟捕获时差太多 → 不点，报错；
+    - 在窗口里匹配**控件本身** → 点命中点（抗窗口内布局微调）；
+    - 都没有 → 按**红框中心**点（窗口原点 + 记录的红框位置 × 窗口缩放）。
+
+    窗口缩放怎么算：`当前窗口宽 ÷ 捕获时窗口宽`，红框坐标按这个比例换算，
+    所以窗口被放大 / 换分辨率之后照样对得上。
     """
     limit = threshold if threshold is not None else image_locator.DEFAULT_THRESHOLD
-    if window_template and Path(window_template).is_file():
-        log(f"  先找窗口：{Path(window_template).name}")
+    rect: Optional[Tuple[float, float, float, float]] = None
+    scale = 1.0
+
+    if title:
+        r = window_rect_by_title(title)
+        if r:
+            rect = tuple(float(v) for v in r)
+            log(f"  按窗口名找到「{title}」：屏幕({rect[0]:.0f},{rect[1]:.0f}) "
+                f"大小 {rect[2] - rect[0]:.0f}×{rect[3] - rect[1]:.0f}")
+        else:
+            log(f"  没找到标题里含「{title}」的窗口")
+
+    if rect is None and window_template and Path(window_template).is_file():
+        log(f"  改用整窗截图找窗口：{Path(window_template).name}")
         win = find_window(window_template, wait_s=min(wait_s, 8.0), log=log)
         if win is not None:
-            log(f"  窗口在屏幕({win.x - win.width / 2:.0f},{win.y - win.height / 2:.0f}) "
-                f"大小 {win.width:.0f}×{win.height:.0f}")
-            hit = locate_in_window(win, target_template, threshold=limit,
-                                   wait_s=min(wait_s, 6.0), log=log)
+            rect = _rect_from_match(win)
+
+    if rect is not None:
+        if window_size and len(window_size) >= 2 and window_size[0]:
+            scale = (rect[2] - rect[0]) / float(window_size[0])
+            if abs(scale - 1.0) > 0.02:
+                log(f"  窗口大小跟捕获时不一样了，按比例 {scale:.3f} 换算红框坐标")
+        deadline = time.monotonic() + max(0.0, min(wait_s, 6.0))
+        while True:
+            # 深度定位：先用特征图确认「这个窗口还是那个窗口、内容没跑偏」
+            if feature and Path(feature).is_file():
+                trace: List[str] = []
+                ok = _match_once_in_rect(rect, Path(feature), limit,
+                                         str(feature), trace)
+                if ok is None:
+                    log("  深度定位没对上（特征图没匹配到）："
+                        + (trace[-1] if trace else "窗口内容跟捕获时差太多"))
+                    log("  → 这次不点。确认目标窗口是最前面、内容没变，"
+                        "或重新做一次「定位匹配」")
+                    raise DesktopError(
+                        f"深度定位失败：在窗口「{title or Path(window_template).name}」里"
+                        f"没找到特征图 {Path(feature).name}。\n"
+                        "    这一步不会乱点。请确认目标窗口已打开、内容跟捕获时一致，"
+                        "或者关掉深度定位 / 重新捕获。")
+                log(f"  深度定位通过（特征图匹配 {ok.confidence:.3f}）")
+            hit = _match_once_in_rect(rect, target_template, limit,
+                                      str(target_template), [])
             if hit is not None:
+                hit.how = "窗口内匹配"
+                log(f"  窗口内匹配到控件：屏幕({hit.x:.0f},{hit.y:.0f}) "
+                    f"置信度={hit.confidence:.3f} 缩放={hit.scale:g}")
                 return hit
-            if offset and len(offset) >= 4:
-                if win.confidence < WINDOW_OFFSET_MIN_CONF:
-                    log(f"  窗口匹配得不够确定（置信度 {win.confidence:.3f} < "
-                        f"{WINDOW_OFFSET_MIN_CONF}），不敢按红框偏移点 → 退回全屏匹配")
-                else:
-                    dx, dy, dw, dh = (float(v) for v in offset[:4])
-                    s = float(win.scale or 1.0)
-                    x = win.x - win.width / 2 + (dx + dw / 2) * s
-                    y = win.y - win.height / 2 + (dy + dh / 2) * s
-                    log(f"  按红框偏移点：屏幕({x:.0f},{y:.0f})（窗口缩放 {s:g}）")
-                    return DesktopMatch(x, y, dw * s, dh * s, win.confidence, s,
-                                        how="红框偏移")
-            log("  窗口里没匹配到控件，也没记红框偏移 → 退回全屏匹配")
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(POLL_S)
+        if offset and len(offset) >= 4:
+            dx, dy, dw, dh = (float(v) for v in offset[:4])
+            x = rect[0] + (dx + dw / 2) * scale
+            y = rect[1] + (dy + dh / 2) * scale
+            log(f"  窗口内没匹配到控件，按红框中心点：屏幕({x:.0f},{y:.0f})"
+                f"（窗口缩放 {scale:.3f}）")
+            return DesktopMatch(x, y, dw * scale, dh * scale, 1.0, scale,
+                                how="红框中心")
+        log("  窗口里没匹配到控件，也没记红框坐标 → 退回全屏匹配")
     elif window_template:
         log(f"  窗口模板不存在，退回全屏匹配：{window_template}")
     hit = locate(target_template, threshold=limit, wait_s=wait_s, log=log)
@@ -368,6 +485,175 @@ def wait_gone(template_path: Path, wait_s: float = DEFAULT_WAIT_S,
             return
         time.sleep(POLL_S)
     log(f"  {path.name} 已消失")
+
+
+# ------------------------------
+# 窗口：只截这个窗口（不截全屏）+ 按窗口名定位
+# ------------------------------
+def guess_window_keyword(title: str) -> str:
+    """从窗口标题里猜一个「不会老是变」的关键字（运行时靠它找窗口）。
+
+    「未命名 - 记事本」→ 记事本；「百度一下 - Google Chrome」→ Google Chrome；
+    「文档1 - Word」→ Word。中间那截（文件名、网页标题）最容易变，取最后一段最稳。
+    """
+    text = (title or "").strip()
+    for sep in (" - ", " — ", " – ", " － "):
+        if sep in text:
+            parts = [p.strip() for p in text.split(sep) if p.strip()]
+            if parts:
+                return parts[-1]
+    return text
+
+
+def _find_window(keyword: str):
+    """按标题子串找窗口对象（多个命中时取面积最大的那个）。
+
+    面积最大的通常是主窗口，避免匹配到“另存为”这类小对话框。
+    """
+    try:
+        import pygetwindow as gw
+    except Exception as e:
+        raise DesktopError(f"没能加载 pygetwindow：{e}\n{missing_hint()}") from e
+    kw = (keyword or "").strip().lower()
+    if not kw:
+        raise DesktopError("还没填窗口标题关键字")
+    hits = [w for w in gw.getWindowsWithTitle("")
+            if kw in (w.title or "").lower()]
+    if not hits:
+        titles = [t for t, _ in list_windows()][:10]
+        raise DesktopError(
+            f"没找到标题里含「{keyword}」的窗口。\n"
+            "    当前可见窗口：" + ("、".join(titles) if titles else "（一个都没有）"))
+    return max(hits, key=lambda w: int(getattr(w, "width", 0) or 0)
+               * int(getattr(w, "height", 0) or 0))
+
+
+def window_rect_by_title(keyword: str) -> Optional[Tuple[int, int, int, int]]:
+    """按窗口名找窗口 → 它现在的屏幕矩形（物理像素，含标题栏）。
+
+    这是运行时定位的首选：**窗口名 + 系统给的矩形**，不用靠图像去猜窗口在哪。
+    找不到返回 None（调用方会退回图像匹配或全屏匹配）。
+    """
+    try:
+        w = _find_window(keyword)
+    except DesktopError:
+        return None
+    try:
+        left, top = int(w.left), int(w.top)
+        width, height = int(w.width), int(w.height)
+    except Exception:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return (left, top, left + width, top + height)
+
+
+def grab_window_win32(hwnd: int, rect: Tuple[int, int, int, int]):
+    """用 PrintWindow 把一个窗口画进内存位图（只这个窗口，被遮挡也能截）。
+
+    返回 PIL 图；拿不到（有些程序不支持、或者出来全黑）返回 None。
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        from PIL import Image
+    except Exception:
+        return None
+    left, top, right, bottom = rect
+    w, h = int(right - left), int(bottom - top)
+    if w <= 0 or h <= 0:
+        return None
+
+    user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                    ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                    ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                    ("biSizeImage", wintypes.DWORD),
+                    ("biXPelsPerMeter", wintypes.LONG),
+                    ("biYPelsPerMeter", wintypes.LONG),
+                    ("biClrUsed", wintypes.DWORD),
+                    ("biClrImportant", wintypes.DWORD)]
+
+    class BITMAPINFO(ctypes.Structure):
+        _fields_ = [("bmiHeader", BITMAPINFOHEADER),
+                    ("bmiColors", wintypes.DWORD * 3)]
+
+    hdc = user32.GetWindowDC(hwnd)
+    if not hdc:
+        return None
+    mem = gdi32.CreateCompatibleDC(hdc)
+    bmp = gdi32.CreateCompatibleBitmap(hdc, w, h)
+    if not mem or not bmp:
+        user32.ReleaseDC(hwnd, hdc)
+        return None
+    old = gdi32.SelectObject(mem, bmp)
+    try:
+        if not user32.PrintWindow(hwnd, mem, 2):    # 2 = PW_RENDERFULLCONTENT
+            return None
+        gdi32.SelectObject(mem, old)                # GetDIBits 要求位图不在 DC 里
+        bi = BITMAPINFO()
+        bi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bi.bmiHeader.biWidth = w
+        bi.bmiHeader.biHeight = -h                  # 负＝自上而下
+        bi.bmiHeader.biPlanes = 1
+        bi.bmiHeader.biBitCount = 32
+        bi.bmiHeader.biCompression = 0              # BI_RGB
+        buf = ctypes.create_string_buffer(w * h * 4)
+        if not gdi32.GetDIBits(mem, bmp, 0, h, buf, ctypes.byref(bi), 0):
+            return None
+        img = Image.frombuffer("RGBA", (w, h), buf, "raw", "BGRA", 0, 1)
+        img = img.convert("RGB")
+        import numpy as np
+        g = img.convert("L")
+        if float(np.std(np.asarray(g))) < 3.0:      # 全黑/全白＝没截到
+            return None
+        return img
+    except Exception:
+        return None
+    finally:
+        try:
+            gdi32.SelectObject(mem, old)
+            gdi32.DeleteObject(bmp)
+            gdi32.DeleteDC(mem)
+            user32.ReleaseDC(hwnd, hdc)
+        except Exception:
+            pass
+
+
+def grab_window(title_keyword: str, log: Callable[[str], None] = print):
+    """只截这个窗口（绝不截整屏）：返回 (PIL 图, 窗口矩形)。
+
+    先试 PrintWindow（窗口被挡住也能截）；拿不到就把窗口切到最前、
+    按窗口矩形那一块截。矩形与截图用的是同一套坐标，后面算偏移才准。
+    """
+    win = _find_window(title_keyword)
+    try:
+        title = (win.title or "").strip()
+    except Exception:
+        title = title_keyword
+    rect = (int(win.left), int(win.top),
+            int(win.left) + int(win.width), int(win.top) + int(win.height))
+    hwnd = int(getattr(win, "_hWnd", 0) or 0) or int(getattr(win, "hWnd", 0) or 0)
+    if hwnd:
+        img = grab_window_win32(hwnd, rect)
+        if img is not None:
+            log(f"  已截取窗口「{title}」{img.width}×{img.height}（PrintWindow）")
+            return img, rect
+    try:
+        if getattr(win, "isMinimized", False):
+            win.restore()
+        win.activate()
+        time.sleep(0.35)
+    except Exception:
+        pass
+    from PIL import ImageGrab
+    img = ImageGrab.grab(bbox=rect)
+    log(f"  已截取窗口「{title}」{img.width}×{img.height}（按窗口区域截）")
+    return img, rect
 
 
 # ------------------------------

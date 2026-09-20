@@ -46,13 +46,19 @@ class Locator:
     # 改用这张截图做模板匹配（OpenCV）再试一次。
     # 路径相对项目目录，如 img/cap_20260917_203512_1.png（捕获元素时自动生成）
     image: str = ""
-    # 桌面场景：捕获时顺手裁下来的**整窗截图**（相对项目目录，如 img/xx_窗口.png）。
-    # 运行时先用它认出窗口，再把「找控件」的范围缩到一个窗口里；
+    # 桌面场景：捕获时顺手截下来的**整窗图**（相对项目目录，如 img/xx_窗口.png）。
+    # 运行时先认窗口，再把「找控件」的范围缩到一个窗口里；
     # 空＝没有（老项目 / 拿不到窗口），行为跟以前一样：全屏匹配。
     window: str = ""
-    # 红框相对**窗口左上角**的位置 [dx, dy, 宽, 高]（窗口图的像素）。
-    # 窗口内没匹配到控件时，就按它的中心点（这就是「点红框中心」）。
+    # 捕获时那个窗口的长宽 [宽, 高]（窗口图的像素）。
+    # 运行时用「当前窗口宽 ÷ 这个宽」算比例，窗口被放大/换分辨率后照样对得上。
+    window_size: List[float] = field(default_factory=list)
+    # 控件框相对**窗口左上角**的位置 [x, y, 宽, 高]（窗口图的像素）。
+    # 窗口内没匹配到控件时，就按它的中心点（＝点红框中心）。
     offset: List[float] = field(default_factory=list)
+    # 「深度定位」用的特征图（可选）：捕获时在窗口上框的那块**不会变的地方**
+    # （标题栏、固定图标）。运行时先在窗口里对一下它，对不上就不点、直接报错。
+    feature: str = ""
 
 
 @dataclass
@@ -164,7 +170,7 @@ class Step:
             d["url"] = self.url
         if self.locator:
             loc = asdict(self.locator)
-            for k in ("image", "window", "offset"):
+            for k in ("image", "window", "window_size", "offset", "feature"):
                 if not loc.get(k):
                     loc.pop(k, None)        # 空字段别往文件里塞
             d["locator"] = loc
@@ -229,7 +235,9 @@ class Step:
             # 这个动作节点摆在「条件」里，自带一条规则（判断方式 + 值）
             d["cond_op"] = self.cond_op
             d["cond_value"] = self.cond_value
-        if self.action == "win_activate" and self.win_title:
+        if self.win_title and self.action in ("win_activate", "click", "fill", "select"):
+            # 桌面场景：点击 / 填入 也用 win_title 记「这一步属于哪个窗口」
+            # （运行时先按窗口名找窗口），不只是「激活窗口」那一步
             d["win_title"] = self.win_title
         if self.action == "hotkey" and self.keys:
             d["keys"] = self.keys

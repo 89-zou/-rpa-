@@ -1666,20 +1666,29 @@ class StepExecutor:
                         ) -> "desktop.DesktopMatch":
         """在屏幕上找这张模板图（找不到会等一会儿再试）。
 
-        这一步的定位如果带了「整窗模板」（捕获时顺手存下来的），就先认窗口、
-        只在窗口里找控件；窗口里没找到才退回全屏匹配（见 desktop.locate_by_window）。
-        步骤上还能设「相似度」阈值，浅色界面调低一点更容易命中。
+        桌面场景的定位现在长这样（见 desktop.locate_by_window）：
+        先按**窗口名**找到窗口（窗口挪位置、改大小都不怕）→ 可选先用**特征图**确认
+        窗口内容没跑偏（深度定位）→ 在窗口里匹配控件 → 都没有才按**红框中心**点 →
+        窗口都认不出来时退回全屏匹配（老项目就是这条，行为不变）。
+        「相似度」阈值每步可调，浅色界面调低一点更容易命中。
         """
         loc = step.locator if step is not None else None
         path = self._resolve_image_path(Locator(type="image", value=image))
         threshold = float(getattr(step, "image_threshold", 0) or 0) or None
         window = str(getattr(loc, "window", "") or "").strip() if loc else ""
         offset = list(getattr(loc, "offset", []) or []) if loc else []
-        if window:
-            wpath = self._resolve_image_path(Locator(type="image", value=window))
+        size = list(getattr(loc, "window_size", []) or []) if loc else []
+        feature = str(getattr(loc, "feature", "") or "").strip() if loc else ""
+        title = str(getattr(step, "win_title", "") or "").strip() if step else ""
+        if window or title:
+            wpath = (self._resolve_image_path(Locator(type="image", value=window))
+                     if window else None)
+            fpath = (self._resolve_image_path(Locator(type="image", value=feature))
+                     if feature else "")
             return desktop.locate_by_window(
                 wpath, path, offset=offset, threshold=threshold,
-                wait_s=DESKTOP_IMAGE_WAIT_S, log=self.log)
+                wait_s=DESKTOP_IMAGE_WAIT_S, log=self.log,
+                title=title, window_size=size, feature=fpath)
         return desktop.locate(path, threshold=threshold,
                               wait_s=DESKTOP_IMAGE_WAIT_S, log=self.log)
 

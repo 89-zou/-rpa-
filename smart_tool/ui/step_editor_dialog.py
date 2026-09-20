@@ -15,6 +15,8 @@ import shutil
 from pathlib import Path
 from typing import List, Optional
 
+from PIL import Image
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QPixmap
 from PyQt6.QtWidgets import (
@@ -35,7 +37,7 @@ from smart_tool.ui.element_picker_dialog import (
 )
 from smart_tool.ui.help_tip import HelpButton, help_row
 from smart_tool.ui.read_data_panel import ReadDataPanel
-from smart_tool.ui.screen_capture import ScreenCaptureDialog
+from smart_tool.ui.window_match_dialog import WindowMatchDialog
 
 # 网页场景能用的动作
 WEB_ACTIONS = [
@@ -382,10 +384,13 @@ class StepEditDialog(QDialog):
         self._default_url = (default_url or "").strip()
         # 场景决定能选哪些动作：网页（浏览器）/ 桌面（截图定位 + 鼠标键盘）
         self.desktop = scene == "desktop"
-        # 桌面场景：捕获时顺手存下来的「整窗截图」+ 红框相对窗口左上角的位置，
-        # 保存步骤时写进 locator.window / locator.offset（运行时靠它先认窗口）
+        # 桌面场景：定位匹配捕获回来的东西，保存时写进 locator / win_title
+        # （窗口名 / 窗口图 / 窗口长宽 / 控件框位置 / 深度定位的特征图）
         self._window_path = ""
+        self._window_size: list = []
         self._window_offset: list = []
+        self._feature_path = ""
+        self._window_title = ""
         self._actions = DESKTOP_ACTIONS if self.desktop else WEB_ACTIONS
         self.setWindowTitle(("编辑步骤" if self._editing else "新建步骤")
                             + ("（桌面应用）" if self.desktop else ""))
@@ -543,12 +548,15 @@ class StepEditDialog(QDialog):
         loc_layout.setContentsMargins(0, 0, 0, 0)
         self.locator_value = QLineEdit()
         self.locator_value.setPlaceholderText("//input[@id='username']")
-        self.btn_shot = QPushButton("截屏取模板…")
-        self.btn_shot.setToolTip(
-            "桌面场景的定位方式：截一张全屏图，在图上拖框圈住控件，\n"
-            "存进项目 img/ 当模板（运行时靠它在这块屏幕上找位置）。"
+        self.btn_match = QPushButton("定位匹配…")
+        self.btn_match.setToolTip(
+            "桌面场景的主力：选一个窗口 → **只截这个窗口** → 在窗口图上框要点的控件。\n"
+            "结果记下「窗口名 + 窗口图 + 控件框的位置」：运行时先按窗口名找到窗口，\n"
+            "再在窗口里找控件——窗口挪位置、改大小都不怕。\n"
+            "想更保险就勾上「深度定位」，再框一块不会变的地方（标题栏、固定图标）\n"
+            "当特征图，对不上就报错停下，不会乱点。"
         )
-        self.btn_shot.clicked.connect(lambda: self._capture_screen("main"))
+        self.btn_match.clicked.connect(lambda: self._open_window_match("main"))
         self.btn_capture = QPushButton("捕获元素…")
         self.btn_capture.setToolTip(
             "打开浏览器窗口，在页面上点一下目标元素：\n"
@@ -558,7 +566,7 @@ class StepEditDialog(QDialog):
         self.btn_pick_image = QPushButton("选择截图…")
         self.btn_pick_image.clicked.connect(self._pick_image)
         loc_layout.addWidget(self.locator_value, 1)
-        loc_layout.addWidget(self.btn_shot)
+        loc_layout.addWidget(self.btn_match)
         loc_layout.addWidget(self.btn_capture)
         loc_layout.addWidget(self.btn_pick_image)
         self.loc_row = loc_row
@@ -662,9 +670,10 @@ class StepEditDialog(QDialog):
         self.wait_target.setPlaceholderText(
             "只填 XPath，如 //*[@id='wpadminbar']（说明文字请写到【备注】里）"
         )
-        self.btn_wait_shot = QPushButton("截屏取模板…")
-        self.btn_wait_shot.setToolTip("截屏框选一张图当等待目标（桌面场景用）")
-        self.btn_wait_shot.clicked.connect(lambda: self._capture_screen("wait"))
+        self.btn_wait_shot = QPushButton("定位匹配…")
+        self.btn_wait_shot.setToolTip(
+            "抓一张图当等待目标（桌面场景用）：只截选中的那个窗口，在图上框出要等的控件。")
+        self.btn_wait_shot.clicked.connect(lambda: self._open_window_match("wait"))
         self.wait_target_row = QWidget()
         wt_layout = QHBoxLayout(self.wait_target_row)
         wt_layout.setContentsMargins(0, 0, 0, 0)
@@ -1003,15 +1012,20 @@ class StepEditDialog(QDialog):
                    self.desktop and action == "click")
         self.btn_pick_image.setVisible(is_image or (is_locate and self.desktop))
         self.btn_capture.setVisible(is_xpath or (is_locate and self.desktop))
-        self.btn_shot.setVisible(is_locate and self.desktop)
+        self.btn_match.setVisible(is_locate and self.desktop)
         self._show(self.capture_hint, is_locate)
         for w in (self.fallback_row, self.fallback_hint):
             self._show(w, is_xpath)
         for w in self._image_widgets:
             self._show(w, is_image)
-        # 「相似度」凡是会用图片匹配的地方都给：网页的截图定位 + 桌面场景（截图就是主力）
+        # 「相似度」只在**这一步真的会用图片匹配**时才出现：
+        # 定位是图片，或者桌面的「步骤后等待」等的是图片。
+        # 不是一进桌面场景就人人一行 —— 那样等于每个节点都多一个没用的输入框。
+        uses_image = is_image or (
+            self.desktop
+            and self.wait_combo.currentData() in ("element_present", "image_gone"))
         for w in (self.threshold_spin, self.threshold_hint):
-            self._show(w, is_image or self.desktop)
+            self._show(w, uses_image)
         for w in self._value_widgets:
             self._show(w, is_fill)
         for w in self._wait_widgets:
@@ -1445,12 +1459,19 @@ class StepEditDialog(QDialog):
                 self.locator_value.setText(dlg.result_path)
                 self._window_path = dlg.window_path
                 self._window_offset = list(dlg.offset or [])
-                more = ("　已记下窗口截图，运行时先认窗口、只在窗口里找"
+                self._window_size = list(getattr(dlg, "window_size", []) or [])
+                if not self._window_size and dlg.window_path:
+                    # 老捕获器只给了窗口图，长宽从图里读
+                    try:
+                        with Image.open(self.project_dir / dlg.window_path) as im:
+                            self._window_size = [float(im.width), float(im.height)]
+                    except Exception:
+                        self._window_size = []
+                self._window_title = dlg.window_title or self._window_title
+                more = ("　已记下窗口名与窗口图，运行时先按窗口名找窗口"
                         if dlg.window_path else "")
                 self.capture_hint.setText(
                     f"已捕获：{text}　→　{dlg.result_path}{more}"
-                    + ("　（窗口标题可填到【激活窗口】那一步里）"
-                       if dlg.window_title else "")
                 )
             self._show_preview(self.project_dir / dlg.result_path)
             self._sync_visibility()
@@ -1458,28 +1479,39 @@ class StepEditDialog(QDialog):
             # 用完就销毁：捕获器里有个全屏遮罩窗口，攒着不放会越堆越多
             dlg.deleteLater()
 
-    def _capture_screen(self, target: str):
-        """截屏拖框取模板（桌面场景）：target=main 填定位，wait 填等待目标。"""
+    def _open_window_match(self, target: str):
+        """定位匹配（桌面场景）：选窗口 → 只截这个窗口 → 在窗口图上框控件。
+
+        target=main 填定位（并记下窗口名 / 窗口图 / 框的位置）；
+        target=wait 只拿那张控件图当「等待目标」。
+        """
         try:
-            dlg = ScreenCaptureDialog(self.project_dir, self)
+            dlg = WindowMatchDialog(self.project_dir, self,
+                                    initial_title=self._window_title)
             if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_path:
                 return
             if target == "wait":
                 self.wait_target.setText(dlg.result_path)
-                self.capture_hint.setText(f"已取等待模板：{dlg.result_path}")
-            else:
-                self.locator_value.setText(dlg.result_path)
-                self._window_path = dlg.window_path
-                self._window_offset = list(dlg.offset or [])
-                more = ("　已记下窗口截图，运行时先认窗口、只在窗口里找"
-                        if dlg.window_path else "")
+                self._show_preview(self.project_dir / dlg.result_path)
                 self.capture_hint.setText(
-                    f"已取模板：{dlg.result_path}（只框控件本身，别带大片背景）{more}"
-                )
+                    f"已取等待模板：{dlg.result_path}（窗口「{dlg.window_title}」）")
+                self._sync_visibility()
+                return
+            self.locator_value.setText(dlg.result_path)
+            self._window_path = dlg.window_path
+            self._window_size = list(dlg.window_size or [])
+            self._window_offset = list(dlg.offset or [])
+            self._feature_path = dlg.feature_path
+            self._window_title = dlg.window_title
+            deep = "　已开深度定位（特征图对不上就不点）" if dlg.feature_path else ""
+            self.capture_hint.setText(
+                f"已捕获：{dlg.result_path}　窗口「{dlg.window_title}」"
+                f"（{int(dlg.window_size[0])}×{int(dlg.window_size[1])}）"
+                f"　运行时先按窗口名找窗口、只在窗口里找{deep}")
             self._show_preview(self.project_dir / dlg.result_path)
             self._sync_visibility()
         except Exception as e:
-            QMessageBox.critical(self, "截屏取模板失败",
+            QMessageBox.critical(self, "定位匹配失败",
                                  f"{type(e).__name__}: {e}")
 
     def _show_preview(self, path: Path):
@@ -1512,11 +1544,21 @@ class StepEditDialog(QDialog):
             self.locator_value.setText(s.locator.value)
             self.fallback_edit.setText(s.locator.image or "")
             self._window_path = str(getattr(s.locator, "window", "") or "")
+            self._window_size = list(getattr(s.locator, "window_size", []) or [])
             self._window_offset = list(getattr(s.locator, "offset", []) or [])
+            self._feature_path = str(getattr(s.locator, "feature", "") or "")
             if s.locator.type == "image" and s.locator.value:
                 img_path = self.project_dir / s.locator.value
                 if img_path.exists():
                     self._show_preview(img_path)
+        if self.desktop and s.action in ("click", "fill", "select"):
+            self._window_title = str(getattr(s, "win_title", "") or "")
+            if self._window_path:
+                self.capture_hint.setText(
+                    f"这一步记着窗口「{self._window_title or '（没记窗口名）'}」"
+                    f"＋窗口图 {self._window_path}"
+                    + ("　已开深度定位" if self._feature_path else "")
+                    + "　（重新做一次「定位匹配…」可更新）")
         self.threshold_spin.setValue(float(getattr(s, "image_threshold", 0) or 0))
         self.value_edit.setText(s.value)
 
@@ -1786,9 +1828,14 @@ class StepEditDialog(QDialog):
                 value=self.locator_value.text().strip(),
                 image="" if self.desktop else self.fallback_edit.text().strip(),
                 window=self._window_path,
+                window_size=list(self._window_size),
                 offset=list(self._window_offset),
+                feature=self._feature_path,
             )
             step.image_threshold = float(self.threshold_spin.value() or 0)
+            if self.desktop:
+                # 桌面场景：窗口名写在 win_title 上，运行时靠它找窗口
+                step.win_title = self._window_title
             if self.desktop and action == "click":
                 step.click_times = int(self.click_times_combo.currentData() or 1)
             if action in ("fill", "select"):
