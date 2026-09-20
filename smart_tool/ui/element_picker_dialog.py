@@ -14,12 +14,17 @@ from typing import Optional
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
+    QApplication, QDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton,
+    QVBoxLayout,
 )
 
 from smart_tool.core.project_store import ProjectStore
 from smart_tool.ui import picker_session
 from smart_tool.ui.help_tip import HelpButton
+
+#: 这次运行里「要不要自动重跑前面的节点」问过没有 / 用户怎么答的。
+#: 问一次就记住：问太勤很烦，不问又可能把文章重发一遍（真事）。
+_replay_consent = None
 
 #: 【?】里的完整说明（用户点开看的是纯文本，别用 markdown 记号）
 PICKER_HELP = (
@@ -43,11 +48,18 @@ PICKER_HELP = (
     "【不想抓了】按 Esc，或者点这条上的【取消】，主界面一样会回来。"
 )
 
+#: 待命时状态栏那句话（几处都用它，免得写得不一样）
+READY_HINT = (
+    "按住 Ctrl 划过元素看橙框，按住 Ctrl 点一下＝捕获；"
+    "不按 Ctrl 时页面照常能用。Esc＝不抓了。"
+)
+
 
 class ElementPickerDialog(QDialog):
     """捕获条（accept 后用 result_data 取结果）。"""
 
-    def __init__(self, url: str, project_dir: Path, parent=None):
+    def __init__(self, url: str, project_dir: Path, parent=None,
+                 replay=None):
         # 故意**不要父窗口**：捕获期间主界面要藏起来，有父子关系的话会把它一起带走
         super().__init__(None)
         self.setWindowTitle("元素捕获")
@@ -55,6 +67,10 @@ class ElementPickerDialog(QDialog):
         self.project_dir = Path(project_dir)
         self.img_dir = self.project_dir / "img"
         self._url = (url or "").strip()
+        # 「回放」用的料：{"steps": [...], "variables": {...}, "entry_url": "..."}
+        # 有它就会在开抓之前先把前面的节点跑一遍，直接停在当前这一步的页面上
+        self._replay = dict(replay or {})
+        self._replaying = False
         self._home = parent.window() if parent is not None else None
         self._home_hidden = False
         self._also_hidden: list = []    # 藏主界面时一并收起来的其它窗口（步骤编辑器等）
@@ -75,7 +91,7 @@ class ElementPickerDialog(QDialog):
     # UI
     # ------------------------------
     def _init_ui(self):
-        self.setFixedWidth(430)
+        self.setFixedWidth(560)
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
         root.setSpacing(6)
@@ -94,13 +110,120 @@ class ElementPickerDialog(QDialog):
         root.addWidget(self.status)
 
         row = QHBoxLayout()
+        row.setSpacing(6)
+        self.btn_replay = QPushButton("重跑前面的节点")
+        self.btn_replay.setToolTip(
+            "把当前这一步**之前**的节点在这个浏览器里跑一遍，直接停在\n"
+            "当前这一步该在的页面上。注意那些节点会真的执行（真点、真填、真发）。")
+        self.btn_replay.clicked.connect(self._on_replay_clicked)
+        row.addWidget(self.btn_replay)
+
+        self.btn_reload = QPushButton("重新加载")
+        self.btn_reload.setToolTip("把这个页面重新加载一遍（等于按 F5）。")
+        self.btn_reload.clicked.connect(self._on_reload_clicked)
+        row.addWidget(self.btn_reload)
+
+        self.btn_entry = QPushButton("回到入口页")
+        self.btn_entry.setToolTip("打开流程里第一个【打开网页】节点的地址。")
+        self.btn_entry.clicked.connect(self._on_entry_clicked)
+        row.addWidget(self.btn_entry)
+
         row.addStretch(1)
         self.btn_cancel = QPushButton("取消（Esc）")
         self.btn_cancel.setToolTip(
             "不抓了。已经开着的浏览器不会关，下次捕获接着用。")
-        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_cancel.clicked.connect(self._on_cancel_clicked)
         row.addWidget(self.btn_cancel)
         root.addLayout(row)
+        self._sync_buttons()
+
+    # ------------------------------
+    # 那排按钮
+    # ------------------------------
+    def _sync_buttons(self):
+        """按「有没有得回放 / 是不是正在回放」调整按钮。
+
+        回放期间【取消】变成【跳过回放】：这时候想退出，多半是想让流程停下来
+        （而不是把捕获条关掉），所以复用同一个按钮，省一个位置。
+        """
+        busy = self._replaying
+        self.btn_replay.setEnabled(
+            bool(self._replay.get("steps")) and not busy)
+        self.btn_reload.setEnabled(not busy)
+        self.btn_entry.setEnabled(bool(self._replay.get("entry_url")) and not busy)
+        if busy:
+            self.btn_cancel.setText("跳过回放")
+            self.btn_cancel.setToolTip("让回放停下来，直接进入捕获状态。")
+        else:
+            self.btn_cancel.setText("取消（Esc）")
+            self.btn_cancel.setToolTip(
+                "不抓了。已经开着的浏览器不会关，下次捕获接着用。")
+
+    def _on_cancel_clicked(self):
+        if self._replaying:
+            if self._session is not None:
+                self._session.skip_replay()
+            self.status.setText("已请求跳过回放，这一步跑完就停…")
+            return
+        self.reject()
+
+    def _on_replay_clicked(self):
+        if not self._replaying and self._session is not None:
+            self._ask_then_replay(manual=True)
+
+    def _on_reload_clicked(self):
+        if self._session is not None and not self._replaying:
+            self._session.reload_page()
+
+    def _on_entry_clicked(self):
+        if self._session is not None and not self._replaying:
+            self._session.open_entry(self._replay.get("entry_url") or "")
+
+    def _ask_then_replay(self, manual: bool, why: str = ""):
+        """回放前先问一句（每次运行只问一次）。
+
+        为什么要问：回放就是把前面那些节点**真跑一遍**。你前面要是有点「发布」
+        「提交」之类的节点，这就是真的会再发一次 —— 不打招呼就干这种事不行。
+        """
+        global _replay_consent
+        steps = self._replay.get("steps") or []
+        if not steps:
+            self.status.setText("当前这一步前面没有节点，不用回放。")
+            return
+        if not manual:
+            if _replay_consent is None:
+                reply = QMessageBox.warning(
+                    self, "要先把前面的节点跑一遍吗",
+                    f"{why}\n"
+                    f"要不要先把当前这一步「前面」的 {len(steps)} 个节点跑一遍，"
+                    "让它自己走到当前这一步该在的页面上？\n\n"
+                    "注意：那些节点会真的执行 —— 真点、真填、真提交。\n"
+                    "如果里面有「发布 / 提交」这类节点，会再发一次。\n\n"
+                    "（选「不要」就自己点过去；条上有【重跑前面的节点】随时可跑。）",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                _replay_consent = (reply == QMessageBox.StandardButton.Yes)
+                if not _replay_consent:
+                    self.status.setText(
+                        "好，先不重跑。自己在浏览器里点到这一步的页面，"
+                        "然后按住 Ctrl 点元素＝捕获（想重跑就点【重跑前面的节点】）。")
+                    return
+            elif not _replay_consent:
+                return
+        self._replaying = True
+        self._sync_buttons()
+        self._session.replay({
+            "steps": steps,
+            "variables": self._replay.get("variables") or {},
+            "project_dir": self.project_dir,
+        })
+
+    def _on_replayed(self, ok: bool, message: str):
+        self._replaying = False
+        self._sync_buttons()
+        self.status.setText(("✓ " if ok else "✗ ") + message
+                            + "　现在按住 Ctrl 点元素＝捕获。")
 
     # ------------------------------
     # 开窗即开始捕获
@@ -120,7 +243,10 @@ class ElementPickerDialog(QDialog):
         session = picker_session.shared()
         self._session = session
         self._wire(session)
-        session.capture(self._url, self.img_dir)
+        # 有回放要做的话，先不装捕获脚本（免得回放途中被 Ctrl+点击抢走一个元素），
+        # 等回放跑完由会话那边再装、再开始等捕获
+        session.capture(self._url, self.img_dir,
+                        arm=not self._replay.get("steps"))
 
     def _check_session(self):
         """会话在后台死了就把条收掉 —— 宁可不抓，也不留一个模态框把主界面卡住。"""
@@ -147,6 +273,7 @@ class ElementPickerDialog(QDialog):
             (session.gone, self._on_gone),
             (session.failed, self._on_failed),
             (session.log, self._on_log),
+            (session.replayed, self._on_replayed),
         ]
         for sig, slot in self._wired:
             sig.connect(slot)
@@ -221,14 +348,23 @@ class ElementPickerDialog(QDialog):
         self.status.setText(message)
 
     def _on_opened(self, _url: str):
-        self.status.setText(
-            "页面已打开。按住 Ctrl 划过元素看橙框，按住 Ctrl 点一下＝捕获；"
-            "不按 Ctrl 时页面照常能用。")
+        if self._auto_replay("这次的浏览器是刚开的，页面还停在入口页。"):
+            return
+        self.status.setText(READY_HINT)
 
     def _on_reused(self, url: str):
+        if self._auto_replay(f"浏览器里现在停在：{url or '空白页'}。"):
+            return
         self.status.setText(
-            f"接着用已经开着的浏览器（当前：{url or '空白页'}）。"
-            "按住 Ctrl 点一下＝捕获。")
+            f"接着用已经开着的浏览器（当前：{url or '空白页'}）。\n"
+            + READY_HINT)
+
+    def _auto_replay(self, why: str) -> bool:
+        """问一句要不要先把前面的节点跑一遍（不自动跑：那可能真的又发一篇文章）。"""
+        if not self._replay.get("steps"):
+            return False
+        self._ask_then_replay(manual=False, why=why)
+        return True
 
     def _on_picked(self, payload: dict):
         self._unwire()
@@ -275,9 +411,10 @@ class ElementPickerDialog(QDialog):
 
         页面里也接了 Esc（浏览器有焦点时走那条），这里管的是「焦点在这条上」
         的情况 —— 两条路都通，随便按哪个都能出来。
+        正在回放时，Esc 是「跳过回放」而不是把条关掉。
         """
         if event.key() == Qt.Key.Key_Escape:
-            self.reject()
+            self._on_cancel_clicked()
             return
         super().keyPressEvent(event)
 
@@ -301,20 +438,23 @@ class ElementPickerDialog(QDialog):
         super().closeEvent(event)
 
 
-def pick_element_result(parent, url: str, project_dir):
+def pick_element_result(parent, url: str, project_dir, replay=None):
     """跑一次捕获 → (结果, 出错原因)。用户取消时是 (None, "")。
 
     出错原因要交回去显示：捕获那条一定会自己关掉（模态窗口留着会把主界面卡住），
     所以原因得由调用方写在自己的界面上。
+
+    replay 给了就让浏览器先「回放前面的节点」走到当前这一步的页面，见
+    ElementPickerDialog 的同名参数。
     """
-    dlg = ElementPickerDialog(url, Path(project_dir), parent)
+    dlg = ElementPickerDialog(url, Path(project_dir), parent, replay=replay)
     dlg.exec()
     if dlg.result_data:
         return dlg.result_data, ""
     return None, dlg.error
 
 
-def pick_element(parent, url: str, project_dir) -> Optional[dict]:
+def pick_element(parent, url: str, project_dir, replay=None) -> Optional[dict]:
     """开捕获条让用户抓一个元素，返回它的信息（取消返回 None）。
 
     返回值就是 ElementPickerDialog.result_data：
@@ -322,7 +462,7 @@ def pick_element(parent, url: str, project_dir) -> Optional[dict]:
     给「不想要元素截图、只要一个 XPath」的地方用（比如登录态体检、采集行定位）。
     需要知道「为什么没抓成」的，用 pick_element_result()。
     """
-    data, _err = pick_element_result(parent, url, project_dir)
+    data, _err = pick_element_result(parent, url, project_dir, replay=replay)
     return data
 
 

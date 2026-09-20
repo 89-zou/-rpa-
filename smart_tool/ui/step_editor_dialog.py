@@ -372,7 +372,9 @@ class StepEditDialog(QDialog):
     def __init__(self, project_dir: Path, step: Optional[Step] = None,
                  parent=None, variable_names: Optional[List[str]] = None,
                  default_url: str = "", scene: str = "web",
-                 rule_mode: Optional[str] = None):
+                 rule_mode: Optional[str] = None,
+                 all_steps: Optional[List[Step]] = None,
+                 insert_at: Optional[int] = None):
         super().__init__(parent)
         self.project_dir = Path(project_dir)
         self.img_dir = self.project_dir / "img"
@@ -395,6 +397,10 @@ class StepEditDialog(QDialog):
         self._feature_path = ""
         self._window_title = ""
         self._actions = DESKTOP_ACTIONS if self.desktop else WEB_ACTIONS
+        # 整个流程 + 当前这一步在里面的位置：捕获时「回放前面的节点」要用
+        # （新建的步骤还没进列表，所以位置由调用方用 insert_at 告诉一声）
+        self._all_steps = list(all_steps or [])
+        self._insert_at = insert_at
         self.setWindowTitle(("编辑步骤" if self._editing else "新建步骤")
                             + ("（桌面应用）" if self.desktop else ""))
         self.setMinimumWidth(760)
@@ -1459,13 +1465,40 @@ class StepEditDialog(QDialog):
             "value": self.value_edit.text().strip(),
         })
 
+    def _replay_spec(self):
+        """「回放前面的节点」要用的料：当前这一步**之前**的那些步骤。
+
+        交给捕获会话用**真正的执行器**在同一个浏览器里跑一遍 —— 所以循环、条件、
+        变量替换、步骤后等待全部照常，跟你点「运行」跑出来的一样。
+        """
+        if not self._all_steps:
+            return None
+        if self._insert_at is not None:
+            idx = self._insert_at                       # 新建的步骤：位置由调用方给
+        else:
+            idx = next((i for i, s in enumerate(self._all_steps)
+                        if s.id == self._step_id), None)
+        if not idx:                                     # 找不到，或者它就是第一步
+            return None
+        entry = next((s.url for s in self._all_steps
+                      if s.action == "navigate" and s.url), "")
+        try:
+            variables = project_store.ProjectStore(
+                self.project_dir).load_all_variables()
+        except Exception:
+            variables = {}
+        return {"steps": list(self._all_steps[:idx]),
+                "variables": variables,
+                "entry_url": entry or self._default_url}
+
     def _capture_web_element(self, target: str):
         """网页场景：按住 Ctrl 点元素 → 拿到 XPath + 元素图（截图进兜底栏）。
 
         浏览器由常驻会话端着（见 ui/picker_session）：抓到不关，下一步捕获接着用。
         """
         url = self.url_edit.text().strip() or self._default_url
-        data, err = pick_element_result(self, url, self.project_dir)
+        data, err = pick_element_result(self, url, self.project_dir,
+                                        replay=self._replay_spec())
         if err:
             # 捕获条自己会关掉（模态窗口留着会把主界面卡住），所以原因写在这儿
             self.capture_hint.setStyleSheet("color: #b45309;")
