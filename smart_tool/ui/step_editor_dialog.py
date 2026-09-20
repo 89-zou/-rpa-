@@ -1122,7 +1122,10 @@ class StepEditDialog(QDialog):
         is_cond = self.loop_mode_combo.currentData() == "cond"
         self._show(self.loop_expr_row, not is_cond)
         self._show(self.loop_hint, not is_cond)
+        # 「变量判断」是「条件 → 变量满足条件」才用的那一行；先跟着方式一起显隐，
+        # 下面再按「判断什么」细化。漏掉它的话，次数/列表方式下它会一直杵在那儿。
         for w in (self.loop_cond_kind_combo, self.loop_cond_arg_row,
+                  self.loop_cond_rule_row,
                   self.loop_cond_stop_combo, self.loop_interval_spin,
                   self.loop_max_spin, self.loop_cond_hint):
             self._show(w, is_cond)
