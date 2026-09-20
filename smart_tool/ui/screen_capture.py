@@ -10,7 +10,7 @@
 """
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from PyQt6.QtCore import QPoint, QRect, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
@@ -34,6 +34,42 @@ def pil_to_pixmap(img) -> QPixmap:
     qimg = QImage(data, rgb.width, rgb.height, rgb.width * 3,
                   QImage.Format.Format_RGB888)
     return QPixmap.fromImage(qimg.copy())
+
+
+def save_window_template(img, box, origin, img_dir: Path, stem: str):
+    """顺手把「整窗截图」也存一张，并算出红框相对窗口左上角的位置。
+
+    为什么要在捕获时做：运行时先认出窗口（整窗当模板），再把「找控件」的范围
+    缩到一个窗口里——比在两百万个像素里挑最像的靠谱得多；万一控件图没匹配上，
+    还能按这个偏移直接点红框中心（见 desktop.locate_by_window）。
+
+    :param img: 刚截下来的全屏图（PIL，图像坐标）
+    :param box: 控件框，图像坐标 (x1, y1, x2, y2)
+    :param origin: 虚拟桌面原点（desktop.screen_origin()），图像坐标 ↔ 屏幕坐标
+    返回 (窗口模板的相对路径 或 "", 偏移 [dx, dy, 宽, 高] 或 [])
+    """
+    from smart_tool.core import desktop
+    cx = origin[0] + (box[0] + box[2]) / 2
+    cy = origin[1] + (box[1] + box[3]) / 2
+    wrect = desktop.window_rect_at(cx, cy)          # 屏幕坐标
+    if not wrect:
+        return "", []
+    left, top = wrect[0] - origin[0], wrect[1] - origin[1]
+    right, bottom = wrect[2] - origin[0], wrect[3] - origin[1]
+    left, top = max(0, left), max(0, top)
+    right, bottom = min(img.width, right), min(img.height, bottom)
+    if right - left < 8 or bottom - top < 8:
+        return "", []
+    try:
+        img_dir.mkdir(parents=True, exist_ok=True)
+        wpath = img_dir / f"{stem}_窗口.png"
+        img.crop((left, top, right, bottom)).save(str(wpath))
+    except Exception:
+        return "", []
+    # 偏移用「未夹取」的窗口原点算，保证红框与窗口的相对关系准确
+    offset = [box[0] - (wrect[0] - origin[0]), box[1] - (wrect[1] - origin[1]),
+              box[2] - box[0], box[3] - box[1]]
+    return f"img/{wpath.name}", offset
 
 
 class _ShotView(QWidget):
@@ -165,6 +201,8 @@ class ScreenCaptureDialog(QDialog):
         self._img = None                    # PIL 原图（裁剪用）
         self._left = countdown_s
         self.result_path: str = ""
+        self.window_path: str = ""          # 顺手存下来的整窗截图（认窗口用）
+        self.offset: List[float] = []       # 红框相对窗口左上角的位置
         self._init_ui()
         self._start_countdown()
 
@@ -346,4 +384,11 @@ class ScreenCaptureDialog(QDialog):
             QMessageBox.critical(self, "保存失败", f"模板图存不进去：\n{e}")
             return
         self.result_path = f"img/{path.name}"
+        # 顺手存一张整窗截图：运行时先认窗口（认不到就退回现在的全屏匹配）
+        try:
+            self.window_path, self.offset = save_window_template(
+                self._img, (x, y, x + w, y + h), desktop.screen_origin(),
+                self.img_dir, path.stem)
+        except Exception:
+            self.window_path, self.offset = "", []
         self.accept()
