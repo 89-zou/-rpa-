@@ -932,7 +932,10 @@ class StepEditDialog(QDialog):
         is_collect = action == "collect"
         is_locate = action in ("click", "fill", "select")
         is_fill = action in ("fill", "select")
-        is_image = is_locate and self.locator_type.currentData() == "image"
+        # 桌面场景只有「图片模板」一种定位方式：定位方式那个下拉在这儿没有意义
+        # （选了也不作数，保存时一律按截图存），下面会把它整行收起来
+        loc_kind = "image" if self.desktop else self.locator_type.currentData()
+        is_image = is_locate and loc_kind == "image"
         is_pause = action == "pause_for_human"
         is_script = action == "script"
         is_call = action == "call"
@@ -941,8 +944,7 @@ class StepEditDialog(QDialog):
         is_delay = action == "delay"
         cond = self.resume_combo.currentData()
         # 桌面场景：定位一律是「图片模板」，没有 XPath / 兜底截图这些概念
-        is_xpath = is_locate and not self.desktop \
-            and self.locator_type.currentData() == "xpath"
+        is_xpath = is_locate and loc_kind == "xpath"
         need_target = self.wait_combo.currentData() in WAIT_NEEDS_TARGET
 
         for w in self._navigate_widgets:
@@ -961,6 +963,7 @@ class StepEditDialog(QDialog):
         self._show(self.output_var_edit, is_read or is_collect)
         for w in self._locator_widgets:
             self._show(w, is_locate)
+        self._show(self.locator_type, is_locate and not self.desktop)
         self._show(self.win_title_edit, is_win)
         self._show(self.keys_edit, is_keys)
         self._show(self.click_times_combo,
