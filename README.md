@@ -122,7 +122,7 @@ smart_tool/
 │  ├─ paths.py               三种目录：程序 / 资源 / 用户数据
 │  ├─ core/                  不依赖界面的核心
 │  │  ├─ project_store.py      项目与步骤读写（steps.json）
-│  │  ├─ blocks.py             把线性步骤解析成块树（循环 / 条件 / 分支 / 组合）
+│  │  ├─ blocks.py             把线性步骤解析成块树（循环 / 条件 / 组合）
 │  │  ├─ step_executor.py      执行引擎（Playwright / 桌面 / 数据 / 代码）
 │  │  ├─ data_sources.py       读 txt / csv / excel / json / 文件夹
 │  │  ├─ free_code.py          自由代码节点：语法解析、Python / JS 代码生成
@@ -131,9 +131,8 @@ smart_tool/
 │  │  ├─ desktop*.py           桌面场景（截图、鼠标键盘、UI Automation）
 │  │  ├─ auth_store.py         登录态保存与复用
 │  │  └─ crash_guard.py        原生崩溃兜底（写 crash.log）
-│  ├─ ui/                    PyQt6 界面（画布、流程编辑、各类面板）
-│  └─ assets/ …              随程序走的资源
-├─ assets/                   logo、示例项目模板（首次运行复制到数据目录）
+│  └─ ui/                    PyQt6 界面（画布、流程编辑、各类面板）
+├─ assets/                   logo、求打赏海报、示例项目模板（首次运行复制到数据目录）
 ├─ packaging/                打包成单文件 exe 的脚本（.spec + build.ps1）
 ├─ projects/                 你的项目（只有内置示例进版本库）
 ├─ run_cli.py                命令行跑一个项目
