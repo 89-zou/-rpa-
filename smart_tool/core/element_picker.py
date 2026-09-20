@@ -284,11 +284,12 @@ PICKER_JS = r"""
   function onKey(e) {
     if (e.key === 'Control' || e.key === 'Ctrl') { setArmed(true); return; }
     if (e.key === 'Escape') {
-      // 兜底出口：用户改主意了就按 Esc，主界面一样会回来
+      // Esc＝**强制退出**：关掉浏览器、回主界面。这是最后的出口，
+      // 任何状态下都必须管用 —— 所以这里不是「取消这次捕获」，而是硬中止。
       hide();
       disarm();
       if (typeof window.__trae_pick === 'function') {
-        window.__trae_pick({ kind: 'cancel', reason: '按了 Esc' });
+        window.__trae_pick({ kind: 'abort', reason: '在页面里按了 Esc' });
       }
     }
   }

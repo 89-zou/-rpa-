@@ -59,6 +59,7 @@ class PickerSession(QThread):
     log = pyqtSignal(str)
     tried = pyqtSignal(bool, str)         # 试运行结果（成功?, 给人看的说明）
     replayed = pyqtSignal(bool, str)      # 回放前面的节点结果（成功?, 说明）
+    aborted = pyqtSignal(str)             # 页面里按了 Esc：要求强制退出
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -76,14 +77,47 @@ class PickerSession(QThread):
     # ------------------------------
     # 主线程调用：只往队列里放命令，绝不碰 Playwright
     # ------------------------------
-    def capture(self, url: str, img_dir: Path, arm: bool = True):
+    def capture(self, url: str, img_dir: Path):
         """开始一次捕获：没有浏览器就开（并打开 url），有就直接复用。
 
-        :param arm: 是否立刻进入捕获待命。后面还要先「回放前面的节点」时传 False ——
-                    回放期间别让 Ctrl+点击抢走一个元素，等回放完了再由回放那边装上。
+        一进来就把捕获脚本装上（每个 frame），**不等回放**：这样按住 Ctrl 能抓、
+        按 Esc 能退 —— 上一版的错就在这儿，回放前不装脚本，用户一旦不回放，
+        页面里就既抓不了也退不出来，看着就是卡死。
         """
         self._shot_dir = Path(img_dir)
-        self._cmd.put(("capture", (url or "", bool(arm))))
+        self._cmd.put(("capture", url or ""))
+
+    def force_abort(self):
+        """**强制打断**：关掉浏览器、丢掉还没执行的命令，让一切回到干净状态。
+
+        主线程直接调用（不走队列）：正卡在 `goto` / `reload` 里时，队列要等它
+        出来才轮得到，那就不叫「强制」了。这里先把该清的标记清掉、该丢的命令丢掉，
+        浏览器由会话线程腾出手来立刻关（关不掉也不影响界面已经恢复）。
+        """
+        self._drop_pending()
+        ex = self._replay_exec
+        if ex is not None:
+            try:
+                ex._stop = True
+            except Exception:
+                pass
+        with self._lock:
+            self._busy = False
+        self._picks = queue.Queue()
+        self._cmd.put(("abort", None))
+
+    def _drop_pending(self):
+        """把还没执行的命令全丢掉（强制停止时，排队里的 reload/goto 不该再跑）。"""
+        keep = []
+        while True:
+            try:
+                keep.append(self._cmd.get_nowait())
+            except queue.Empty:
+                break
+        # 只留「退出程序」那条，其余一律作废
+        for item in keep:
+            if item and item[0] == "quit":
+                self._cmd.put(item)
 
     def replay(self, spec: Dict[str, Any]):
         """把当前这一步**之前**的节点在这个浏览器里跑一遍，然后停在那个页面上。
@@ -163,6 +197,8 @@ class PickerSession(QThread):
             self._do_navigate("reload")
         elif name == "entry":
             self._do_navigate("entry", arg)
+        elif name == "abort":
+            self._do_abort()
         elif name == "trial":
             self._do_trial(arg)
         self._pump()
@@ -199,18 +235,16 @@ class PickerSession(QThread):
     # ------------------------------
     # 捕获
     # ------------------------------
-    def _do_capture(self, arg):
-        url, arm = arg if isinstance(arg, (tuple, list)) else (arg, True)
+    def _do_capture(self, url: str):
         page = self._ensure_page(url)
         if page is None:
             return
-        if arm:
-            # 先挂上「在等结果」的牌子，再去装脚本 —— 装脚本会喂一次 Playwright，
-            # 万一这时候回调到了，也不能被当成上一轮的残留丢掉
-            with self._lock:
-                self._busy = True
-            self._drop_stale_picks()
-            self._arm(page)
+        # 先挂上「在等结果」的牌子，再去装脚本 —— 装脚本会喂一次 Playwright，
+        # 万一这时候回调到了，也不能被当成上一轮的残留丢掉
+        with self._lock:
+            self._busy = True
+        self._drop_stale_picks()
+        self._arm(page)
         try:
             current = page.url or ""
         except Exception:
@@ -222,6 +256,14 @@ class PickerSession(QThread):
             self.reused.emit(current)
         else:
             self.opened.emit(current)
+
+    def _do_abort(self):
+        """强制停止的落地：关浏览器、清干净，下次捕获重新开一个。"""
+        self._close_browser_quietly()
+        with self._lock:
+            self._busy = False
+        self._picks = queue.Queue()
+        self.log.emit("已强制停止：浏览器关掉了，下次捕获会重新开一个。")
 
     def _drop_stale_picks(self):
         """清掉上一轮可能残留的回调，免得「一按捕获就蹦出个旧结果」。"""
@@ -294,6 +336,9 @@ class PickerSession(QThread):
                     continue            # 上一次已经收工了，这条是迟到的
                 self._busy = False
             kind = (payload.get("kind") or "pick").strip()
+            if kind == "abort":
+                self.aborted.emit(payload.get("reason") or "已强制退出")
+                continue
             if kind == "cancel":
                 self.canceled.emit(payload.get("reason") or "已取消")
                 continue

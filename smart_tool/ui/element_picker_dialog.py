@@ -45,13 +45,24 @@ PICKER_HELP = (
     "【抓到的是元素，不是坐标】抓下来的是 XPath，页面改版时换个元素重抓就行，\n"
     "不依赖屏幕位置；这也正是网页场景比桌面场景耐用的地方。\n"
     "\n"
-    "【不想抓了】按 Esc，或者点这条上的【取消】，主界面一样会回来。"
+    "【不想抓了 / 卡住了】按 Esc 或点【强制停止】＝强制退出：\n"
+    "关掉浏览器、把主界面还回来，不管当时卡在哪一步。这是最后的出口。\n"
+    "只想关掉这条小条、浏览器留着下次接着用，就点【取消】。"
 )
 
 #: 待命时状态栏那句话（几处都用它，免得写得不一样）
 READY_HINT = (
     "按住 Ctrl 划过元素看橙框，按住 Ctrl 点一下＝捕获；"
-    "不按 Ctrl 时页面照常能用。Esc＝不抓了。"
+    "不按 Ctrl 时页面照常能用。Esc＝立刻退出（会关掉浏览器）。"
+)
+
+#: 不回放时状态栏怎么说 —— 必须写清「现在能抓、怎么退」，
+#: 不然用户只看到一句「正在打开浏览器…」，不知道可以动手了
+SKIP_REPLAY_HINT = (
+    "好，先不重跑 —— 你自己在浏览器里点到这一步的页面就行。\n"
+    "按住 Ctrl 划过元素看橙框、按住 Ctrl 点一下＝捕获；"
+    "想让它自己跑就点【重跑前面的节点】；"
+    "按 Esc 或点【强制停止】＝立刻退出（会关掉浏览器）。"
 )
 
 
@@ -80,6 +91,9 @@ class ElementPickerDialog(QDialog):
         self.result_data: Optional[dict] = None
         self.error: str = ""            # 没抓成时的原因（给调用方拿去做提示）
         self._init_ui()
+        # 万一这个条没走 accept / reject 就被销毁（比如程序直接退出），
+        # 也要把会话的信号摘掉 —— 不然它还会接着收下一条捕获的消息
+        self.destroyed.connect(lambda *_: self._unwire())
         # 看门狗：会话万一在后台死了（线程挂了 / 进程没了），也要把条收掉 ——
         # 绝不能留一个模态框在这儿干等，那会让人以为整个程序卡死了
         self._watch = QTimer(self)
@@ -91,7 +105,7 @@ class ElementPickerDialog(QDialog):
     # UI
     # ------------------------------
     def _init_ui(self):
-        self.setFixedWidth(560)
+        self.setFixedWidth(600)
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
         root.setSpacing(6)
@@ -134,6 +148,14 @@ class ElementPickerDialog(QDialog):
             "不抓了。已经开着的浏览器不会关，下次捕获接着用。")
         self.btn_cancel.clicked.connect(self._on_cancel_clicked)
         row.addWidget(self.btn_cancel)
+
+        self.btn_stop = QPushButton("强制停止")
+        self.btn_stop.setToolTip(
+            "不管现在卡在哪一步，立刻停下：**关掉浏览器**、把主界面还回来。\n"
+            "按 Esc 跟点它是一回事 —— 这是最后的出口，任何状态下都管用。")
+        self.btn_stop.clicked.connect(
+            lambda: self._force_stop("你点了【强制停止】"))
+        row.addWidget(self.btn_stop)
         root.addLayout(row)
         self._sync_buttons()
 
@@ -158,6 +180,8 @@ class ElementPickerDialog(QDialog):
             self.btn_cancel.setText("取消（Esc）")
             self.btn_cancel.setToolTip(
                 "不抓了。已经开着的浏览器不会关，下次捕获接着用。")
+        # 强制停止永远能点：它就是给「已经卡住了」这种情况准备的
+        self.btn_stop.setEnabled(True)
 
     def _on_cancel_clicked(self):
         if self._replaying:
@@ -165,6 +189,24 @@ class ElementPickerDialog(QDialog):
                 self._session.skip_replay()
             self.status.setText("已请求跳过回放，这一步跑完就停…")
             return
+        self.reject()
+
+    def _force_stop(self, reason: str):
+        """**强制打断一切**：关掉浏览器、丢掉排队的命令、把主界面还回来。
+
+        顺序很重要：**先让界面恢复**，再去收拾浏览器。会话那边可能正卡在
+        `goto` / `reload` 里，等它腾出手来才关得掉浏览器 —— 界面绝不能陪它一起等。
+        """
+        self._watch.stop()
+        self._unwire()
+        self.error = f"已强制停止（{reason}）。浏览器关掉了，再点【捕获元素…】重新来。"
+        if self._session is not None:
+            try:
+                self._session.force_abort()
+            except Exception:
+                pass
+        self._replaying = False
+        self._show_home()
         self.reject()
 
     def _on_replay_clicked(self):
@@ -204,12 +246,11 @@ class ElementPickerDialog(QDialog):
                     QMessageBox.StandardButton.Yes,
                 )
                 _replay_consent = (reply == QMessageBox.StandardButton.Yes)
-                if not _replay_consent:
-                    self.status.setText(
-                        "好，先不重跑。自己在浏览器里点到这一步的页面，"
-                        "然后按住 Ctrl 点元素＝捕获（想重跑就点【重跑前面的节点】）。")
-                    return
-            elif not _replay_consent:
+            if not _replay_consent:
+                # 注意：这里**不管答过没答过**都要写状态 ——
+                # 只默默跳过的话，状态栏会停在「正在打开浏览器…」，
+                # 用户根本不知道已经可以动手抓了（上一版就是这么坑人的）
+                self.status.setText(SKIP_REPLAY_HINT)
                 return
         self._replaying = True
         self._sync_buttons()
@@ -243,10 +284,9 @@ class ElementPickerDialog(QDialog):
         session = picker_session.shared()
         self._session = session
         self._wire(session)
-        # 有回放要做的话，先不装捕获脚本（免得回放途中被 Ctrl+点击抢走一个元素），
-        # 等回放跑完由会话那边再装、再开始等捕获
-        session.capture(self._url, self.img_dir,
-                        arm=not self._replay.get("steps"))
+        # 一进来就把捕获脚本装上（不再等回放）：这样按住 Ctrl 能抓、按 Esc 能退。
+        # 回放期间装着它也没关系 —— 它只有按住 Ctrl 才管事，自动化的点击照常通过。
+        session.capture(self._url, self.img_dir)
 
     def _check_session(self):
         """会话在后台死了就把条收掉 —— 宁可不抓，也不留一个模态框把主界面卡住。"""
@@ -274,6 +314,7 @@ class ElementPickerDialog(QDialog):
             (session.failed, self._on_failed),
             (session.log, self._on_log),
             (session.replayed, self._on_replayed),
+            (session.aborted, self._on_aborted),
         ]
         for sig, slot in self._wired:
             sig.connect(slot)
@@ -307,6 +348,9 @@ class ElementPickerDialog(QDialog):
         """
         if self._home_hidden or self._home is None:
             return
+        # **先把标记挂上再去藏**：万一中途哪一步炸了，收工的时候也一定会走
+        # 「把窗口放回来」那段（否则就是收走了再也还不回来 = 假死）
+        self._home_hidden = True
         try:
             self._also_hidden = [
                 w for w in QApplication.topLevelWidgets()
@@ -314,11 +358,13 @@ class ElementPickerDialog(QDialog):
                 and w.windowType() in (Qt.WindowType.Window,
                                        Qt.WindowType.Dialog)
             ]
-            for w in self._also_hidden:
-                w.hide()
-            self._home_hidden = True
         except Exception:
-            pass
+            self._also_hidden = []
+        for w in self._also_hidden:
+            try:
+                w.hide()
+            except Exception:
+                pass
 
     def _show_home(self):
         """收工：把刚才收起来的窗口都放回来（漏放一个就可能让人以为卡死了）。"""
@@ -332,6 +378,15 @@ class ElementPickerDialog(QDialog):
                 w.raise_()
             except Exception:
                 pass
+        # 兜一层：万一还有个模态窗口没被记上（比如藏的时候还没建出来），
+        # 主界面会被它挡着却看不见 —— 那就是「看得见、点哪儿都没反应」。
+        try:
+            modal = QApplication.activeModalWidget()
+            if modal is not None and modal is not self and not modal.isVisible():
+                modal.show()
+                modal.raise_()
+        except Exception:
+            pass
         # 焦点还给「刚才在用的那个」：模态的（步骤编辑器）优先，否则给主界面。
         # 不然回来之后还得自己点一下窗口才接着能操作。
         target = next((w for w in shown if w.isModal()), None) or self._home
@@ -378,8 +433,12 @@ class ElementPickerDialog(QDialog):
         }
         self.accept()
 
+    def _on_aborted(self, reason: str):
+        """页面里按了 Esc：走强制停止那条路。"""
+        self._force_stop(reason)
+
     def _on_canceled(self, _reason: str):
-        """用户在页面里按了 Esc：当取消处理（不算出错，不用提示）。"""
+        """用户在页面里取消了（目前只有老脚本会发这个）：当取消处理。"""
         self._unwire()
         self._show_home()
         self.reject()
@@ -407,14 +466,13 @@ class ElementPickerDialog(QDialog):
     # 收尾
     # ------------------------------
     def keyPressEvent(self, event):
-        """按 Esc 直接退出捕获状态。
+        """按 Esc 直接**强制退出**捕获状态。
 
-        页面里也接了 Esc（浏览器有焦点时走那条），这里管的是「焦点在这条上」
-        的情况 —— 两条路都通，随便按哪个都能出来。
-        正在回放时，Esc 是「跳过回放」而不是把条关掉。
+        页面里也接了 Esc（浏览器有焦点时走那条），这里管的是「焦点在这条上」的
+        情况 —— 两条路都通。而且是硬中止：关浏览器、回主界面，不管现在卡在哪。
         """
         if event.key() == Qt.Key.Key_Escape:
-            self._on_cancel_clicked()
+            self._force_stop("按了 Esc")
             return
         super().keyPressEvent(event)
 
