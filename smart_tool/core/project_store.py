@@ -960,6 +960,29 @@ def _migrate_conditions(steps: List[Dict[str, Any]]) -> None:
     steps[:] = walk(steps)
 
 
+def _alive_edges(edges: Any, steps: List[Dict[str, Any]]) -> List[list]:
+    """只留两端都还指得到步骤的「手动连线」。
+
+    迁移会删掉「分支」标记、还会重排步骤号，而 canvas_edges 是按步骤 id 存的：
+    不清掉就会留下死链（界面上加载时会自己丢掉），重排编号之后更麻烦——旧 id
+    可能正好被别的步骤占用，箭头就悄悄连到不相干的地方去了。
+    端点写法：步骤 id，或 "frame:<起始步骤id>"（循环 / 条件那个虚线框）。
+    """
+    alive = {s.get("id") for s in steps}
+
+    def ok(value: Any) -> bool:
+        if isinstance(value, str) and value.startswith("frame:"):
+            value = value[6:]
+        try:
+            return int(value) in alive
+        except (TypeError, ValueError):
+            return False
+
+    return [list(e) for e in (edges or [])
+            if isinstance(e, (list, tuple)) and len(e) == 2
+            and ok(e[0]) and ok(e[1])]
+
+
 def migrate_project(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """旧项目自动升级（每次 load 都会跑，结果直到下次 save 才落盘）。
 
@@ -976,6 +999,8 @@ def migrate_project(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     steps = [dict(s) for s in (data.get("steps") or []) if isinstance(s, dict)]
     data["steps"] = steps
     _migrate_conditions(steps)                   # 条件节点的新旧写法升级
+    # 迁移删掉的步骤（分支标记）会留下指不到的手动连线，先清掉再往下走
+    data["canvas_edges"] = _alive_edges(data.get("canvas_edges"), steps)
     if not (ds.get("type") and ds.get("path")):
         return data
 
@@ -1017,11 +1042,11 @@ def migrate_project(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         id_map[s.get("id")] = n
         s["id"] = n
     if data.get("canvas_edges"):
-        data["canvas_edges"] = [
+        data["canvas_edges"] = _alive_edges([
             [_remap_endpoint(e[0], id_map), _remap_endpoint(e[1], id_map)]
             for e in data["canvas_edges"]
             if isinstance(e, (list, tuple)) and len(e) == 2
-        ]
+        ], steps)
     return data
 
 
