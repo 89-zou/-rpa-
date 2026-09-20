@@ -25,6 +25,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from smart_tool.core.element_picker import (
     HIGHLIGHT_JS, PICKER_JS, TOAST_JS, next_shot_path,
 )
+from smart_tool.core.step_executor import StepExecutor
 
 #: 打开网址的超时。这是**交互式**捕获，不是批量跑流程：站点真慢到这份上，
 #: 与其让你对着一个「正在打开…」干等两分钟，不如早点说清、让你重试。
@@ -36,6 +37,9 @@ CMD_WAIT_S = 0.05
 TRIAL_TIMEOUT_MS = 8_000
 #: 试运行时先亮绿框多久再动手（让人看清是哪个元素）
 TRIAL_PREVIEW_MS = 450
+#: 「回放前面的节点」最多跑多久（秒）。到点就让执行器停下来，把页面交给捕获 ——
+#: 交互式场景里干等没意义，宁可停下来让人看看到哪一步了。
+REPLAY_MAX_S = 120
 
 
 def _first_line(err: Exception, limit: int = 120) -> str:
@@ -54,6 +58,7 @@ class PickerSession(QThread):
     failed = pyqtSignal(str)              # 起浏览器失败之类的硬错误
     log = pyqtSignal(str)
     tried = pyqtSignal(bool, str)         # 试运行结果（成功?, 给人看的说明）
+    replayed = pyqtSignal(bool, str)      # 回放前面的节点结果（成功?, 说明）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -66,14 +71,49 @@ class PickerSession(QThread):
         self._lock = threading.Lock()
         self._busy = False                # 正在等一次捕获
         self._was_reused = False          # 这一轮是复用了已有的浏览器？
+        self._replay_exec = None          # 正在跑的回放（跳过时要用）
 
     # ------------------------------
     # 主线程调用：只往队列里放命令，绝不碰 Playwright
     # ------------------------------
-    def capture(self, url: str, img_dir: Path):
-        """开始一次捕获：没有浏览器就开（并打开 url），有就直接复用。"""
+    def capture(self, url: str, img_dir: Path, arm: bool = True):
+        """开始一次捕获：没有浏览器就开（并打开 url），有就直接复用。
+
+        :param arm: 是否立刻进入捕获待命。后面还要先「回放前面的节点」时传 False ——
+                    回放期间别让 Ctrl+点击抢走一个元素，等回放完了再由回放那边装上。
+        """
         self._shot_dir = Path(img_dir)
-        self._cmd.put(("capture", url or ""))
+        self._cmd.put(("capture", (url or "", bool(arm))))
+
+    def replay(self, spec: Dict[str, Any]):
+        """把当前这一步**之前**的节点在这个浏览器里跑一遍，然后停在那个页面上。
+
+        spec = {"steps": [Step...], "variables": {...}, "project_dir": Path}
+        """
+        self._cmd.put(("replay", dict(spec or {})))
+
+    def skip_replay(self):
+        """【跳过回放】：让正在跑的回放停下来。
+
+        **故意不走命令队列**：回放期间会话线程正卡在执行器里，队列要等它跑完
+        才轮到 —— 那就白点了。这里直接给执行器置停止标记（它每步之间会看这个
+        bool，跨线程写一个是安全的）。
+        """
+        ex = self._replay_exec
+        if ex is None:
+            return
+        try:
+            ex._stop = True
+        except Exception:
+            pass
+
+    def reload_page(self):
+        """【重新加载】当前页面。"""
+        self._cmd.put(("reload", None))
+
+    def open_entry(self, url: str):
+        """【回到入口页】：打开流程里第一个「打开网页」的地址。"""
+        self._cmd.put(("entry", url or ""))
 
     def trial(self, spec: Dict[str, Any]):
         """试运行：在当前页面里对捕获到的元素跑一次动作。"""
@@ -117,6 +157,12 @@ class PickerSession(QThread):
             self._quit = True
         elif name == "capture":
             self._do_capture(arg)
+        elif name == "replay":
+            self._do_replay(arg)
+        elif name == "reload":
+            self._do_navigate("reload")
+        elif name == "entry":
+            self._do_navigate("entry", arg)
         elif name == "trial":
             self._do_trial(arg)
         self._pump()
@@ -153,16 +199,18 @@ class PickerSession(QThread):
     # ------------------------------
     # 捕获
     # ------------------------------
-    def _do_capture(self, url: str):
+    def _do_capture(self, arg):
+        url, arm = arg if isinstance(arg, (tuple, list)) else (arg, True)
         page = self._ensure_page(url)
         if page is None:
             return
-        # 先挂上「在等结果」的牌子，再去装脚本 —— 装脚本会喂一次 Playwright，
-        # 万一这时候回调到了，也不能被当成上一轮的残留丢掉
-        with self._lock:
-            self._busy = True
-        self._drop_stale_picks()
-        self._arm(page)
+        if arm:
+            # 先挂上「在等结果」的牌子，再去装脚本 —— 装脚本会喂一次 Playwright，
+            # 万一这时候回调到了，也不能被当成上一轮的残留丢掉
+            with self._lock:
+                self._busy = True
+            self._drop_stale_picks()
+            self._arm(page)
         try:
             current = page.url or ""
         except Exception:
@@ -274,6 +322,93 @@ class PickerSession(QThread):
         except Exception as e:
             self.log.emit(f"元素截图失败（XPath 仍然可用）：{_first_line(e, 100)}")
             return ""
+
+    # ------------------------------
+    # 回放 / 重新加载 / 回到入口页
+    # ------------------------------
+    def _alive_page(self, what: str):
+        page = self._page
+        try:
+            if page is not None and not page.is_closed():
+                return page
+        except Exception:
+            pass
+        self.log.emit(f"浏览器没开着，{what}不了。点【捕获元素…】会重新开一个。")
+        return None
+
+    def _do_replay(self, spec: Dict[str, Any]):
+        """把当前这一步**之前**的节点，在这个浏览器里跑一遍。
+
+        用**真正的执行器**跑（借用我们这个页面），所以行为跟跑流程完全一致：
+        循环、条件、变量替换、步骤后等待都照常。代价是那些节点会有真实副作用
+        （真点、真填、真发），所以条上留了【跳过回放】随时能中断。
+        """
+        page = self._alive_page("回放")
+        if page is None:
+            self.replayed.emit(False, "浏览器没开着，没法回放。")
+            return
+        steps = list(spec.get("steps") or [])
+        if not steps:
+            self.replayed.emit(True, "当前这一步前面没有节点，不用回放。")
+            return
+        # 回放没法等人工（那会在这儿挂住），遇到就停在那儿，剩下的交给用户
+        cut = next((i for i, s in enumerate(steps)
+                    if getattr(s, "action", "") == "pause_for_human"), None)
+        note = ""
+        if cut is not None:
+            steps, note = steps[:cut], "；后面有「暂停等人工」，回放到它前面为止"
+        if not steps:
+            self.replayed.emit(True, f"前面的步骤要人工操作，回放跳过{note}。")
+            return
+        self.log.emit(f"重跑前面的 {len(steps)} 个节点 —— 会真的点、真的发，"
+                      f"跑完停在当前这一步的页面{note}。不想等就点【跳过回放】。")
+        ex = StepExecutor(steps, spec.get("variables") or {}, headless=False,
+                          project_dir=spec.get("project_dir"),
+                          log=self.log.emit, page=page)
+        self._replay_exec = ex
+        # 兜底刹车：万一卡在某个页面上，到点让执行器自己停（它每步之间看 _stop）
+        timer = threading.Timer(
+            REPLAY_MAX_S, lambda: setattr(ex, "_stop", True))
+        timer.daemon = True
+        timer.start()
+        try:
+            ex.run()
+            ok, msg = True, f"前面的 {len(steps)} 个节点跑完了{note}。"
+        except Exception as e:
+            ok, msg = False, f"回放中途出错：{_first_line(e)}"
+        finally:
+            timer.cancel()
+            self._replay_exec = None
+        # 回放跑完（或中途被跳过）就把捕获脚本装上、正式开始等捕获
+        try:
+            if not page.is_closed():
+                with self._lock:
+                    self._busy = True
+                self._drop_stale_picks()
+                self._arm(page)
+                page.bring_to_front()
+        except Exception:
+            pass
+        self.replayed.emit(ok, msg)
+
+    def _do_navigate(self, mode: str, url: str = ""):
+        """重新加载当前页 / 回到流程入口页。"""
+        page = self._alive_page("刷新" if mode == "reload" else "打开入口页")
+        if page is None:
+            return
+        try:
+            page.bring_to_front()
+            if mode == "reload":
+                page.reload(wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+                self.log.emit("已重新加载当前页面。")
+            else:
+                if not url:
+                    self.log.emit("流程里还没有「打开网页」的地址，没地方回。")
+                    return
+                page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+                self.log.emit(f"已回到入口页：{url}")
+        except Exception as e:
+            self.log.emit(f"没弄成：{_first_line(e, 150)}")
 
     # ------------------------------
     # 试运行

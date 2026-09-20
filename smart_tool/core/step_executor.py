@@ -601,6 +601,7 @@ class StepExecutor:
         mouse_speed: float = 0.3,
         scene: str = "web",
         auth: Optional[Dict[str, str]] = None,
+        page: Optional[Page] = None,
     ):
         """
         :param project_dir: 项目目录，用于解析 locator.value 中相对路径的截图
@@ -619,6 +620,9 @@ class StepExecutor:
                      name 非空时，启动浏览器就带上 `auth/<name>.json` 里的 cookie；
                      第一个网页打开后做一次体检，失效就清掉重跑一遍（走完整登录），
                      跑完把最新 cookie 存回去（续期）；第一次会自动创建。
+        :param page: **借用外面已经开着的页面**（不自己开浏览器、跑完也不关）。
+                     捕获元素时的「回放」走这条：浏览器是捕获会话端着的，
+                     我们只把步骤跑在它上面，跑完页面还是那个页面，接着抓元素。
         """
         self.steps = steps
         self.variables = variables or {}
@@ -635,6 +639,8 @@ class StepExecutor:
         self.mouse_speed = float(mouse_speed or desktop.DEFAULT_MOUSE_SPEED)
         desktop.configure_mouse(self.human_mouse, self.mouse_speed)
         self.desktop = scene == "desktop"
+        # 借用外面已经开着的页面（捕获时的「回放」用），跑完不关浏览器
+        self._shared_page = page
         self._real_mouse = None
         self._stop = False
         self._page: Optional[Page] = None
@@ -765,6 +771,21 @@ class StepExecutor:
         self._auth_using = bool(use_auth)
         self._auth_checked = False
         self._auth_expired = False
+        if self._shared_page is not None:
+            # 借用外面给的页面（捕获时的「回放」）：不自己开浏览器、跑完也不关 ——
+            # 浏览器是捕获会话端着的，跑完还要接着在上面抓元素。
+            # 用一次就还回去，免得后面「登录态失效重跑」又跑一遍。
+            page, self._shared_page = self._shared_page, None
+            self._page = page
+            try:
+                page.on("dialog", self._on_dialog)
+            except Exception:
+                pass
+            try:
+                self._run_nodes(nodes)
+            finally:
+                self._page = None
+            return
         # 打包版不带浏览器内核：先看一眼，别让用户看到 Playwright 那句英文报错
         if not self.desktop and not browser_setup.is_installed():
             raise RuntimeError(browser_setup.hint())
@@ -1283,7 +1304,7 @@ class StepExecutor:
             # 这个步骤自己设的额外等待（秒）：慢站点、点了没反应时加大它
             if step.action != "delay" and step.wait_seconds and step.wait_seconds > 0:
                 self.log(f"  再固定等 {step.wait_seconds:g}s")
-                time.sleep(float(step.wait_seconds))
+                self._sleep(float(step.wait_seconds))
         except AuthExpired:
             raise                       # 「换条路重跑」，不是步骤出错，别写错误日志
         except Exception as e:
@@ -1763,7 +1784,19 @@ class StepExecutor:
             self.log("  「等待」没填秒数，跳过")
             return
         self.log(f"  等 {secs:g}s")
-        time.sleep(secs)
+        self._sleep(secs)
+
+    def _sleep(self, secs: float):
+        """睡一小段一小段，能被「停止」和「跳过回放」打断。
+
+        直接 time.sleep(60) 的话，这 60 秒里点停止没有任何反应 —— 看起来就是卡住了。
+        """
+        end = time.monotonic() + max(0.0, float(secs or 0))
+        while not self._stop:
+            left = end - time.monotonic()
+            if left <= 0:
+                return
+            time.sleep(min(0.2, left))
 
     def _note(self, step: Step):
         """「提示 / 日志」节点：把写在卡片上的话（含 {{变量}}）打进运行日志。
