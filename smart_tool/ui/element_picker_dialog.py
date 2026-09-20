@@ -14,7 +14,7 @@ from typing import Optional
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
+    QApplication, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
 )
 
 from smart_tool.core.project_store import ProjectStore
@@ -57,10 +57,19 @@ class ElementPickerDialog(QDialog):
         self._url = (url or "").strip()
         self._home = parent.window() if parent is not None else None
         self._home_hidden = False
+        self._also_hidden: list = []    # 藏主界面时一并收起来的其它窗口（步骤编辑器等）
         self._wired: list = []
+        self._session = None
         self._started = False
         self.result_data: Optional[dict] = None
+        self.error: str = ""            # 没抓成时的原因（给调用方拿去做提示）
         self._init_ui()
+        # 看门狗：会话万一在后台死了（线程挂了 / 进程没了），也要把条收掉 ——
+        # 绝不能留一个模态框在这儿干等，那会让人以为整个程序卡死了
+        self._watch = QTimer(self)
+        self._watch.setInterval(1000)
+        self._watch.timeout.connect(self._check_session)
+        self._watch.start()
 
     # ------------------------------
     # UI
@@ -109,8 +118,22 @@ class ElementPickerDialog(QDialog):
         self._hide_home()
         self._move_to_corner()
         session = picker_session.shared()
+        self._session = session
         self._wire(session)
         session.capture(self._url, self.img_dir)
+
+    def _check_session(self):
+        """会话在后台死了就把条收掉 —— 宁可不抓，也不留一个模态框把主界面卡住。"""
+        if not self._wired or self._session is None:
+            return
+        try:
+            alive = self._session.isRunning()
+        except Exception:
+            alive = False
+        if not alive:
+            self._finish_with_error(
+                "捕获用的后台会话意外结束了，这次没抓成。\n"
+                "再点一次【捕获元素…】就行（浏览器会重新开一个）。")
 
     def _wire(self, session):
         """接上会话的信号；收尾时必须摘掉 —— 会话是跨窗口复用的，
@@ -148,25 +171,48 @@ class ElementPickerDialog(QDialog):
     # 主界面的藏 / 还
     # ------------------------------
     def _hide_home(self):
-        if self._home is None or self._home_hidden:
+        """捕获期间把本程序所有露着的窗口都收起来，只留这条捕获条。
+
+        为什么不挑「哪个是主界面」：从步骤编辑器里点捕获时，parent.window() 拿到的
+        是**编辑器自己**（它本身就是顶层窗口）——只藏它的话主界面还在后面露着。
+        而且编辑器是模态的：藏起来之后主界面虽然看得见，却点哪儿都没反应，
+        看起来就是卡死了。所以索性全收走，收工时再逐个放回来。
+        """
+        if self._home_hidden or self._home is None:
             return
         try:
-            self._home.hide()
+            self._also_hidden = [
+                w for w in QApplication.topLevelWidgets()
+                if w is not self and w.isVisible()
+                and w.windowType() in (Qt.WindowType.Window,
+                                       Qt.WindowType.Dialog)
+            ]
+            for w in self._also_hidden:
+                w.hide()
             self._home_hidden = True
         except Exception:
             pass
 
     def _show_home(self):
-        if self._home is None or not self._home_hidden:
+        """收工：把刚才收起来的窗口都放回来（漏放一个就可能让人以为卡死了）。"""
+        if not self._home_hidden:
             return
-        try:
-            self._home.show()
-            self._home.raise_()
-            self._home.activateWindow()
-        except Exception:
-            pass
-        finally:
-            self._home_hidden = False
+        shown, self._also_hidden = self._also_hidden, []
+        self._home_hidden = False
+        for w in shown:
+            try:
+                w.show()
+                w.raise_()
+            except Exception:
+                pass
+        # 焦点还给「刚才在用的那个」：模态的（步骤编辑器）优先，否则给主界面。
+        # 不然回来之后还得自己点一下窗口才接着能操作。
+        target = next((w for w in shown if w.isModal()), None) or self._home
+        if target is not None:
+            try:
+                target.activateWindow()
+            except Exception:
+                pass
 
     # ------------------------------
     # 会话的回调
@@ -196,50 +242,76 @@ class ElementPickerDialog(QDialog):
         }
         self.accept()
 
-    def _on_canceled(self, reason: str):
+    def _on_canceled(self, _reason: str):
+        """用户在页面里按了 Esc：当取消处理（不算出错，不用提示）。"""
         self._unwire()
         self._show_home()
         self.reject()
 
     def _on_gone(self, reason: str):
-        """浏览器被关掉了：把话留在条上让人看见，别弹模态框。"""
-        self._say_and_hold(reason)
+        self._finish_with_error(reason or "浏览器窗口被关掉了。")
 
     def _on_failed(self, message: str):
-        """起不来（没网址、内核没装…）：同样留在条上。"""
-        self._say_and_hold(message)
+        self._finish_with_error(message)
 
-    def _say_and_hold(self, message: str):
-        """出错时：主界面还回来，但这条**不关**，把原因写在上面让人读完再关。
+    def _finish_with_error(self, message: str):
+        """出错 / 浏览器没了：**一定要把这条收掉**，并把原因交给调用方去显示。
 
-        以前这里弹 QMessageBox：既挡视线、又在没有可见父窗口时不稳。
-        写在条上更省事 —— 条是置顶的，一定看得见。
+        为什么不留着让人读：这条是模态窗口，留着的话主界面虽然显示回来了、
+        却点哪儿都没反应 —— 看起来就是整个程序卡死了（这个坑踩过一次）。
+        原因会写到步骤编辑器那行提示上，就在刚才那个按钮旁边，一样看得见。
         """
+        self._watch.stop()
         self._unwire()
+        self.error = message or "这次没抓成。"
         self._show_home()
-        self.status.setText(message)
-        self.status.setStyleSheet("color: #b45309;")
-        self.btn_cancel.setText("关闭")
-        self.btn_cancel.setToolTip("关掉这条提示。")
+        self.reject()
 
     # ------------------------------
     # 收尾
     # ------------------------------
+    def keyPressEvent(self, event):
+        """按 Esc 直接退出捕获状态。
+
+        页面里也接了 Esc（浏览器有焦点时走那条），这里管的是「焦点在这条上」
+        的情况 —— 两条路都通，随便按哪个都能出来。
+        """
+        if event.key() == Qt.Key.Key_Escape:
+            self.reject()
+            return
+        super().keyPressEvent(event)
+
     def accept(self):
+        self._watch.stop()
         self._unwire()
         self._show_home()
         super().accept()
 
     def reject(self):
         """取消（含点右上角 ×、按 Esc）：主界面还回来，但**不关浏览器**。"""
+        self._watch.stop()
         self._unwire()
         self._show_home()
         super().reject()
 
     def closeEvent(self, event):
+        self._watch.stop()
         self._unwire()
         self._show_home()
         super().closeEvent(event)
+
+
+def pick_element_result(parent, url: str, project_dir):
+    """跑一次捕获 → (结果, 出错原因)。用户取消时是 (None, "")。
+
+    出错原因要交回去显示：捕获那条一定会自己关掉（模态窗口留着会把主界面卡住），
+    所以原因得由调用方写在自己的界面上。
+    """
+    dlg = ElementPickerDialog(url, Path(project_dir), parent)
+    dlg.exec()
+    if dlg.result_data:
+        return dlg.result_data, ""
+    return None, dlg.error
 
 
 def pick_element(parent, url: str, project_dir) -> Optional[dict]:
@@ -248,11 +320,10 @@ def pick_element(parent, url: str, project_dir) -> Optional[dict]:
     返回值就是 ElementPickerDialog.result_data：
     `{"xpath":…, "image":"img/xxx.png", "count":命中几个, "desc":元素描述}`。
     给「不想要元素截图、只要一个 XPath」的地方用（比如登录态体检、采集行定位）。
+    需要知道「为什么没抓成」的，用 pick_element_result()。
     """
-    dlg = ElementPickerDialog(url, Path(project_dir), parent)
-    if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
-        return None
-    return dlg.result_data
+    data, _err = pick_element_result(parent, url, project_dir)
+    return data
 
 
 def drop_capture_image(project_dir, data: dict) -> None:
