@@ -41,12 +41,17 @@ _SCALE_CACHE: Dict[str, float] = {}
 AMBIGUOUS_MARGIN = 0.05
 #: 找第二高峰时躲开最高峰的半径（按模板宽高的比例）
 PEAK_SUPPRESS_RATIO = 0.5
-#: 模板灰度标准差低于它 ＝ 几乎是纯色（会提醒一句，仍然继续匹配）
+#: 逐个往下找候选峰时最多看几个位置（跳过纯色区域的假高分）
+MAX_PEAK_TRIES = 4
+#: 模板灰度标准差低于它 ＝ 信息量太少（会改走边缘通道，并在日志里说一句）
 FLAT_STD = 6.0
-#: 自动裁边：一整条（行/列）的标准差 ≤ 它 ＝ 这条是「空边」（多半是背景）
-TRIM_STD = 3.0
-#: 自动裁边：每边最多裁掉多少比例 / 裁完至少留多大
-TRIM_MAX_RATIO = 0.4
+#: 自动裁边：「一整条（行/列）算不算空边」的判据 = 这一条**有没有跳变**。
+#: 为什么不用标准差：浅色模板内部那些「只有两个边框像素」的行，std 才 2.6，
+#: 按标准差会被当成空边一路裁掉、最后只剩一条细缝（实测踩过）。
+#: 看相邻像素跳变就没有这个问题：背景行是平滑的，控件行总在边框处跳一下。
+TRIM_EDGE_TOL = 6
+#: 自动裁边：每个方向最多裁掉多少比例（超过就说明在吃控件本身了）/ 裁完至少留多大
+TRIM_MAX_RATIO = 0.35
 TRIM_KEEP = 8
 #: 边缘通道的阈值可以比灰度低这么多 —— 边缘图里模板的背景部分是 0，
 #: 分数天然比灰度低（实测同一张图：灰度 0.85 / 边缘 0.63），不降就永远轮不到它
@@ -133,7 +138,10 @@ def _auto_trim(gray: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int, int, int]]
     max_v, max_h = int(h * TRIM_MAX_RATIO), int(w * TRIM_MAX_RATIO)
 
     def flat(line: np.ndarray) -> bool:
-        return float(line.std()) <= TRIM_STD
+        """这一条太平滑（背景那种）→ 可以裁；控件行总会在边框处跳一下。"""
+        if line.size < 2:
+            return True
+        return int(np.abs(np.diff(line.astype(np.int16))).max()) <= TRIM_EDGE_TOL
 
     while top + bot < max_v and h - top - bot > TRIM_KEEP and flat(gray[top, :]):
         top += 1
@@ -227,21 +235,57 @@ def _match_one_scale(
     return result, tw, th
 
 
-def _peaks(result: np.ndarray, tw: int, th: int) -> Tuple[float, Tuple[int, int], float]:
-    """(最高峰, 位置, 第二高峰)；第二高峰会躲开最高峰周围一块。
+def _max_outside(result: np.ndarray, masked: List[Tuple[int, int]],
+                 tw: int, th: int) -> Tuple[float, Optional[Tuple[int, int]]]:
+    """结果图里除「已否掉位置周围」之外的最大值 → (分数, 位置)。
 
-    用切片取四周的最大值，避免为「抹掉最高峰」而整图复制一份（整屏时很贵）。
+    只看四周切片的 max，避免为「抹掉某块」而整图复制一份（整屏时很贵）。
     """
-    _, best_val, _, best_loc = cv2.minMaxLoc(result)
-    bx, by = int(best_loc[0]), int(best_loc[1])
+    keep = np.ones(result.shape, dtype=bool)
     mx = max(2, int(tw * PEAK_SUPPRESS_RATIO))
     my = max(2, int(th * PEAK_SUPPRESS_RATIO))
-    x0, x1 = max(0, bx - mx), min(result.shape[1], bx + mx + 1)
-    y0, y1 = max(0, by - my), min(result.shape[0], by + my + 1)
-    parts = [result[:y0, :], result[y1:, :],
-             result[y0:y1, :x0], result[y0:y1, x1:]]
-    second = max((float(p.max()) for p in parts if p.size), default=-1.0)
-    return float(best_val), (bx, by), second
+    for bx, by in masked:
+        x0, x1 = max(0, bx - mx), min(result.shape[1], bx + mx + 1)
+        y0, y1 = max(0, by - my), min(result.shape[0], by + my + 1)
+        keep[y0:y1, x0:x1] = False
+    if not keep.any():
+        return -1.0, None
+    vals = np.where(keep, result, -1.0)
+    idx = int(np.argmax(vals))
+    y, x = np.unravel_index(idx, vals.shape)
+    return float(vals[y, x]), (int(x), int(y))
+
+
+def _peaks(result: np.ndarray, screen: np.ndarray, tw: int, th: int,
+           min_patch_std: float) -> Tuple[float, Tuple[int, int], float]:
+    """(最高分, 位置, 第二高分)，**纯色区域的高分不算数**。
+
+    模板匹配的相关系数在「画面那块几乎是纯色」时会算出 0/0 式的假高分
+    （实测能出 1.000）：假点当了第二高峰，真正的匹配会被误判成「一片都像」而放弃；
+    当了最高峰更糟——直接点错地方。
+
+    判据要**跟模板自己比**，不能用固定值：浅色界面里按钮模板的 std 本来就只有 5 上下，
+    用固定阈值（比如 6）会把正确的命中一起扔掉（这个坑踩过）。所以这里是
+    `max(2.0, 模板 std 的一半)`：全平的区域（std≈0）一定被跳过，正常命中一定放行。
+    """
+    masked: List[Tuple[int, int]] = []
+    first: Optional[Tuple[float, Tuple[int, int]]] = None
+    for _ in range(MAX_PEAK_TRIES + 3):
+        val, loc = _max_outside(result, masked, tw, th)
+        if loc is None:
+            break
+        patch = screen[loc[1]:loc[1] + th, loc[0]:loc[0] + tw]
+        if patch.size and float(patch.std()) < min_patch_std:
+            masked.append(loc)          # 纯色区域：假高分，跳过
+            continue
+        if first is None:
+            first = (val, loc)
+            masked.append(loc)
+            continue
+        return first[0], first[1], val
+    if first is None:
+        return -1.0, (0, 0), -1.0
+    return first[0], first[1], -1.0
 
 
 def _search(
@@ -266,13 +310,17 @@ def _search(
         return None
 
     best: Optional[Tuple[float, int, int, int, int, float, float]] = None
+    # 纯色判据跟模板自己比（见 _peaks 的说明）
+    min_patch_std = max(2.0, 0.5 * float(template.std()))
     # (置信度, x, y, w, h, scale, 第二高峰)
     for scale in scales:
         r = _match_one_scale(screen, template, scale)
         if r is None:
             continue
         result, tw, th = r
-        val, loc, second = _peaks(result, tw, th)
+        val, loc, second = _peaks(result, screen, tw, th, min_patch_std)
+        if loc is None or val < 0:
+            continue
         if best is None or val > best[0]:
             best = (val, int(loc[0]), int(loc[1]), tw, th, scale, second)
 
@@ -334,14 +382,22 @@ def best_match(
     返回 MatchResult（坐标是这张图自己的像素，中心点），没匹配到返回 None。
     """
     gray_screen = _to_gray(screen_bgr)
-    gray_templ, cut = _auto_trim(_to_gray(template_bgr))
-    orig_wh = _to_gray(template_bgr).shape[:2]
+    gray_all = _to_gray(template_bgr)
+    gray_templ, cut = _auto_trim(gray_all)
+    orig_wh = gray_all.shape[:2]
     if cut != (0, 0, 0, 0) and trace is not None:
         trace.append("模板自动去掉了四周的空白边"
                      f"（上{cut[0]} 下{cut[1]} 左{cut[2]} 右{cut[3]} 像素）")
-    if float(gray_templ.std()) < FLAT_STD and trace is not None:
-        trace.append(f"提醒：模板几乎是纯色的（标准差 {gray_templ.std():.1f}），"
-                     "很难可靠匹配 —— 建议框住带纹理/边框的部分")
+    # 信息量太少（纯色块、只有一圈浅边框）→ 直接不匹配，别硬凑：
+    # 这种模板在灰度图里峰值是一大片平台（挑哪儿都行），改用边缘通道又容易在
+    # 别的尺度上撞出「看着很自信、位置却是错的」高分（实测 0.998 但点歪了）。
+    # 桌面场景本来就有「窗口 + 红框中心」兜底，这里老实报错比乱点好。
+    if float(gray_templ.std()) < FLAT_STD:
+        if trace is not None:
+            trace.append(
+                f"模板对比度太低（标准差 {gray_templ.std():.1f}），认不准 —— "
+                "请框住带文字/图标的部分，或者框大一点（带上边框和相邻要素）")
+        return None
 
     cands = scale_candidates(key, scales)
     gray_hit = _search(gray_screen, gray_templ, cands, threshold, "gray", trace)

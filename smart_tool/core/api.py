@@ -84,15 +84,19 @@ LOCATOR_FIELD = f(
     "locator", "str|dict",
     "元素定位。直接写 XPath 字符串，或写对象 "
     "{\"type\":\"xpath\"|\"image\",\"value\":\"...\",\"image\":\"img/兜底图.png\"}；"
-    "XPath 里可以写 {{元素定位变量名}}。桌面场景用【捕获元素…】/【截屏取模板…】时，"
-    "还会自动带上 window（整窗截图）和 offset（红框相对窗口左上角的位置）——"
-    "运行时先认窗口、只在窗口里找控件", True)
+    "XPath 里可以写 {{元素定位变量名}}。桌面场景用【定位匹配…】捕获时，"
+    "还会自动带上 window（窗口图）、window_size（捕获时窗口长宽）、"
+    "offset（控件框在窗口图上的位置）和 feature（深度定位的特征图）——"
+    "运行时先按窗口名找到窗口、只在窗口里找控件", True)
 
-#: 图片匹配的相似度阈值（只对「会用图片匹配」的动作有意义）
+#: 图片匹配 / 桌面定位用得上的字段（只对「会定位」的动作有意义）
 IMAGE_FIELDS = [
     f("image_threshold", "float",
       "图片匹配的相似度阈值 0.5~0.99（0＝用默认 0.80）。浅色 / 低对比界面里"
       "分数天然偏低，可以调到 0.70 左右；调高更严格，宁可报错也不点错地方"),
+    f("win_title", "str",
+      "桌面场景：这一步属于哪个窗口（标题里不会变的一小段，如「记事本」）。"
+      "运行时先按它找到窗口、只在窗口里找控件；用【定位匹配…】捕获时会自动填"),
 ]
 
 #: 条件块里的**动作节点**才用得上：判断方式＋值（写在动作节点自己身上，不在条件节点上）。
@@ -698,9 +702,10 @@ def _step_from_dict(d: Dict[str, Any]) -> Step:
         raise ApiError(f"不认识的 action：{action}。可用动作：{'、'.join(ACTION_SPECS)}")
 
     # 任何动作只要被放进「条件」里，就是那个条件的一个动作节点，可以带自己的判断规则；
-    # image_threshold 是「这一步的图片匹配要像到什么程度」，只对截图定位 / 桌面场景有意义
+    # image_threshold 是「这一步的图片匹配要像到什么程度」；
+    # win_title 在桌面场景表示「这一步属于哪个窗口」（点击/填入也用它找窗口）
     common = {"title", "note", "pos", "id", "action", "cond_op", "cond_value",
-              "image_threshold"}
+              "image_threshold", "win_title"}
     allowed = common | {x["name"] for x in spec["fields"]}
     unknown = [k for k in d if k not in allowed]
     if unknown:
@@ -725,16 +730,19 @@ def _step_from_dict(d: Dict[str, Any]) -> Step:
         if isinstance(loc, str):
             kw["locator"] = Locator(type="xpath", value=loc)
         elif isinstance(loc, dict):
-            offset = loc.get("offset") or []
-            try:
-                offset = [float(v) for v in offset]
-            except (TypeError, ValueError):
-                offset = []
+            def nums(key):
+                raw = loc.get(key) or []
+                try:
+                    return [float(v) for v in raw]
+                except (TypeError, ValueError):
+                    return []
             kw["locator"] = Locator(type=str(loc.get("type") or "xpath"),
                                     value=str(loc.get("value") or ""),
                                     image=str(loc.get("image") or ""),
                                     window=str(loc.get("window") or ""),
-                                    offset=offset)
+                                    window_size=nums("window_size"),
+                                    offset=nums("offset"),
+                                    feature=str(loc.get("feature") or ""))
         else:
             raise ApiError("locator 要么写 XPath 字符串，要么写 {type,value,image}")
     if action == "collect" and d.get("collect_fields"):
@@ -747,6 +755,9 @@ def _step_from_dict(d: Dict[str, Any]) -> Step:
             kw["image_threshold"] = float(d["image_threshold"])
         except (TypeError, ValueError):
             raise ApiError("image_threshold 要填个数字，如 0.7（留空＝用默认 0.80）")
+    if d.get("win_title") and action in ("click", "fill", "select"):
+        # 桌面场景：这几个动作用 win_title 记「属于哪个窗口」
+        kw["win_title"] = str(d["win_title"])
 
     step = Step(id=int(d.get("id") or 0), action=action, **kw)
     step.title = str(d.get("title") or "")
