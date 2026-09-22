@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QFileDialog, QHBoxLayout,
@@ -324,6 +324,16 @@ class AuthDialog(QDialog):
         self._save_config()
 
     def _capture(self):
+        """捕获元素（按钮槽）。
+
+        **先延到下一轮事件循环，再真去抓。** 这个槽是从按钮的 mouseRelease 里发出来的，
+        就在那一瞬间把主窗口和项目管理藏起来，Qt 对鼠标抓取／释放的处理会错乱——
+        回来以后窗口点不动、拖不动、点一下还「咚」（踩过，跟流程编辑里那个
+        「＋ 点击创建新节点」要用 QTimer 延后是同一个道理）。
+        """
+        QTimer.singleShot(0, self._capture_now)
+
+    def _capture_now(self):
         """捕获元素：点一下页面上的元素，XPath 自动填进来。"""
         if self.store is None:
             return
