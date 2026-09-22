@@ -697,13 +697,17 @@ def capture_element(url: str, project_dir) -> Optional[dict]:
         session.start_page(url)
         loop.exec()
     finally:
-        # 不管中间出了什么，主页都必须回来 —— 顺序也是刻意的：
-        # 先把界面还回去，再让线程在后面慢慢关浏览器，用户看到的是「一点就回来了」。
+        # 顺序是刻意的：先把界面还回去，用户不用干等浏览器关。
         try:
             controller.hide()
         finally:
             _restore_windows(hidden, active)
             _shutdown_session(session)
+            # 关完浏览器再确认一次 —— 理由见 _reactivate 的说明
+            _reactivate(hidden, active)
+        # 控制器就此了结（它挂着 _SessionGlue 这个子对象）：显式删掉，
+        # 别指望出了作用域被 GC —— 一个曾经置顶的小窗悬在那儿容易惹事。
+        controller.deleteLater()
 
     _drop_unused_shots(glue.shots, keep_image=(glue.data or {}).get("image"))
     return glue.data
@@ -746,6 +750,24 @@ def _restore_windows(hidden: List[QWidget], active):
             w.show()
         except Exception:
             continue
+    # 再核一遍：藏过、又该回来的窗口必须真的回来。
+    # Qt 对「藏起来过的模态窗口」有边界情况不肯 show；真出现时用户看到的就是
+    # 「界面全点不动、鼠标拖不动、点一下还咚」——这里补一次，别让它悄悄留在那儿。
+    for w in hidden:
+        try:
+            if not w.isVisible():
+                w.setVisible(True)
+        except Exception:
+            continue
+    # 同一个坑的另一面：还挂着应用级模态、却又是看不见的窗口。它会把整个程序挡住，
+    # 所以主动叫回来。看得见的模态是正常的（比如项目管理自己），不去碰。
+    try:
+        modal = QApplication.activeModalWidget()
+        if modal is not None and not modal.isVisible():
+            modal.show()
+            modal.raise_()
+    except Exception:
+        pass
     target = active if active in hidden else (hidden[-1] if hidden else None)
     if target is None:
         return
@@ -754,6 +776,42 @@ def _restore_windows(hidden: List[QWidget], active):
         target.activateWindow()
     except Exception:
         pass
+
+
+def _reactivate(hidden: List[QWidget], active):
+    """关完浏览器之后，再确认一次「界面回来了、而且是可用的」。
+
+    为什么要在关完浏览器之后补这一下：浏览器是**另一个进程**，抓元素的时候它正占着
+    前台，而我们是先还界面、后关浏览器。Windows／Qt 对「谁是当前活动窗口」的记账，
+    在这种跨进程抢前台的情形下容易算乱，最后可能落到
+    「没有活动窗口 + 还挂着应用级模态」——用户看到的就是整个界面点不动、鼠标拖不动、
+    点一下还「咚」（踩过一次）。
+
+    这里做两件事：把该在前的窗口再抬一次；然后检查有没有「看不见的模态」残留，
+    有就把界面解开。正常情况下这里什么都不用做。
+    """
+    target = active if active in hidden else (hidden[-1] if hidden else None)
+    try:
+        if target is not None and target.isVisible():
+            target.raise_()
+            target.activateWindow()
+    except Exception:
+        pass
+    # 兜底：只要没有「看得见的模态」，我们藏过的窗口就不该是禁用或隐藏的
+    try:
+        modal = QApplication.activeModalWidget()
+    except Exception:
+        modal = None
+    if modal is not None and modal.isVisible():
+        return
+    for w in hidden:
+        try:
+            if not w.isEnabled():
+                w.setEnabled(True)
+            if not w.isVisible():
+                w.show()
+        except Exception:
+            continue
 
 
 def _shutdown_session(session: PickerSession):

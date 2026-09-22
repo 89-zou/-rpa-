@@ -17,7 +17,7 @@ from typing import List, Optional
 
 from PIL import Image
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
@@ -1399,7 +1399,17 @@ class StepEditDialog(QDialog):
             self.fallback_edit.setText(rel)
 
     def _capture_element(self, target: str):
-        """捕获元素（按钮槽：整段包住，异常绝不能逃进 Qt 的事件分发）。"""
+        """捕获元素（按钮槽）。
+
+        **先延到下一轮事件循环，再真去抓。** 这个槽是从按钮的 mouseRelease 里发出来的，
+        就在那一瞬间把主窗口和编辑器藏起来，Qt 对鼠标抓取／释放的处理会错乱——
+        回来以后窗口点不动、拖不动、点一下还「咚」（踩过，跟本文件里那个
+        「＋ 点击创建新节点」要用 QTimer 延后是同一个道理）。
+        """
+        QTimer.singleShot(0, lambda: self._capture_element_now(target))
+
+    def _capture_element_now(self, target: str):
+        """捕获元素（整段包住，异常绝不能逃进 Qt 的事件分发）。"""
         try:
             if self.desktop:
                 self._capture_desktop_control(target)
@@ -1459,7 +1469,13 @@ class StepEditDialog(QDialog):
         self._sync_visibility()
 
     def _capture_collect_row(self):
-        """采集节点里点【捕获元素…】：抓页面上「一行」的 XPath 当行定位。"""
+        """采集节点里点【捕获元素…】：抓页面上「一行」的 XPath 当行定位。
+
+        跟 _capture_element 一样先延到下一轮再干（理由见那儿）。
+        """
+        QTimer.singleShot(0, self._capture_collect_row_now)
+
+    def _capture_collect_row_now(self):
         try:
             url = self.url_edit.text().strip() or self._default_url
             if not url:
