@@ -57,6 +57,8 @@ QUIT_WAIT_MS = 3000
 GONE_LINGER_MS = 1200
 # 校验时绿框停留多久（跟 HIGHLIGHT_JS 里的 2500ms 对应，仅用于文案）
 CHECK_HOLD_MS = 2500
+#: 「挪到屏幕外」用的坐标。比任何虚拟桌面都远，Windows 的多个显示器不会铺到这儿。
+OFFSCREEN = -32000
 
 #: 超时没退出来的线程挂在这儿：Qt 的线程对象在还跑着的时候被 GC 掉会直接崩进程
 _ORPHANS: List["PickerSession"] = []
@@ -762,9 +764,9 @@ def _hide_tool_windows(controller):
       关掉了」，把那个对话框当垃圾回收掉。可它是当时的活动窗口，一删就留下
       「没有活动窗口」的残局：Qt 这边查什么都是正常的（没模态、主窗口可见可用），
       但 Windows 那边被销毁的前台窗口一去不回 —— 点主界面就是不理你，还「咚」。
-      所以只能 `showMinimized()`。
+      所以只能**挪到屏幕外**（见下面「另外」那段：最小化会在桌面上留个小标题条）。
 
-    坑二：光最小化还不够。窗口还在，它**仍然是应用级模态** —— Qt 会把所有别的顶层
+    坑二：光挪走还不够。窗口还在，它**仍然是应用级模态** —— Qt 会把所有别的顶层
       窗口禁掉，包括我们自己的控制器，于是控制器上【打断】【校验】【结束】全都点不动，
       点一下「咚」。这件事**不能靠改它的模态来解决**：把 windowModality 设成
       NonModal，那个属性确实变了，但 Qt 的模态栈照样压着它（真机日志里看得清清楚楚：
@@ -772,12 +774,17 @@ def _hide_tool_windows(controller):
       管用的是把**控制器挂到这个模态窗口底下** —— Qt 不会禁用模态窗口的子窗口，
       那是在 PickerController 构造时做的（见那儿的说明）。
 
+    另外，让开的方式是**挪到屏幕外**，不是最小化：最小化之后窗口在桌面上会缩成一个
+    小标题条，用户看着就像凭空多出来一个小框（真机反馈过）。挪走一样是「没隐藏」
+    （exec() 照样不受影响），但屏幕上干干净净，而且用户也点不到它。
+
     为什么按「可见的顶层窗口」收，而不是 parent.window()：从步骤编辑器里点捕获时，
     parent.window() 拿到的是编辑器自己，结果只让开了编辑器、主窗口还杵在浏览器旁边
     （这个坑也踩过）。
 
-    返回 (让开的窗口列表, 原来在最前面的那个)。列表里每项是 `(窗口, 怎么让开的)`，
-    `怎么让开的` 决定放回来时调哪个方法：`"hide"` / `"min"` / `"max"`。
+    返回 (让开的窗口列表, 原来在最前面的那个)。列表里每项是
+    `(窗口, 怎么让开的, 附带数据)`：`"hide"`（普通窗口，数据为 None）或
+    `"off"`（模态对话框，数据是 `(原来的位置, 原来是不是最大化)`）。
     """
     try:
         active = QApplication.activeWindow()
@@ -791,42 +798,54 @@ def _hide_tool_windows(controller):
             continue
         try:
             if w.windowModality() != Qt.WindowModality.NonModal:
-                # 模态对话框：只能最小化，不能 hide（见坑一）。
-                # 模态本身不去动它（见坑二）。
+                # 模态对话框：挪到屏幕外（不能 hide，见坑一；也不最小化，见坑二）
                 was_max = bool(w.windowState() & Qt.WindowState.WindowMaximized)
-                w.showMinimized()
-                away.append((w, "max" if was_max else "min"))
+                if was_max:
+                    w.showNormal()      # 最大化时 move 不生效，先还原
+                away.append((w, "off", (w.pos(), was_max)))
+                w.move(OFFSCREEN, OFFSCREEN)
             else:
                 w.hide()
-                away.append((w, "hide"))
+                away.append((w, "hide", None))
         except Exception:
             continue                    # 已经销毁的窗口，跳过就好
     return away, active
 
 
-def _put_back(w, how: str):
+def _put_back(w, how: str, data=None):
     """按当初让开的方式把窗口放回来。"""
-    if how == "max":
-        w.showMaximized()
-    elif how == "min":
-        w.showNormal()
-    else:
-        w.show()
+    if how == "off":
+        pos, was_max = data if data else (None, False)
+        try:
+            if pos is not None:
+                w.move(pos)
+            if was_max:
+                w.showMaximized()
+            elif not w.isVisible():
+                w.show()
+        except Exception:
+            pass
+        return
+    w.show()
 
 
 def _restore_windows(away: List[tuple], active):
     """把刚才让开的窗口放回来，并把焦点还给原来那一层。"""
-    for w, how in away:
+    for w, how, data in away:
         try:
-            _put_back(w, how)
+            _put_back(w, how, data)
         except Exception:
             continue
-    # 再核一遍：让开过、又该回来的窗口必须真的回来。真丢一个，用户看到的就是
-    # 「界面全点不动、鼠标拖不动、点一下还咚」——这里补一次，别让它悄悄留在那儿。
-    for w, how in away:
+    # 再核一遍：让开过、又该回来的窗口必须真的回来（没回来的补一次；
+    # 挪到屏幕外的还要检查位置有没有真的挪回来）。
+    # 真丢一个，用户看到的就是「界面全点不动、鼠标拖不动、点一下还咚」。
+    for w, how, data in away:
         try:
-            if not w.isVisible():
-                _put_back(w, how)
+            lost = not w.isVisible()
+            if how == "off" and data and data[0] is not None:
+                lost = lost or (w.pos() != data[0])
+            if lost:
+                _put_back(w, how, data)
         except Exception:
             continue
     # 同一个坑的另一面：还挂着应用级模态、却又是看不见的窗口。它会把整个程序挡住，
@@ -838,7 +857,7 @@ def _restore_windows(away: List[tuple], active):
             modal.raise_()
     except Exception:
         pass
-    target = active if any(w is active for w, _ in away) else (
+    target = active if any(w is active for w, _, _ in away) else (
         away[-1][0] if away else None)
     if target is None:
         return
@@ -859,7 +878,7 @@ def _reactivate(away: List[tuple], active):
     这里做两件事：把该在前的窗口再抬一次；然后检查有没有「看不见的模态」残留，
     有就把界面解开。正常情况下这里什么都不用做。
     """
-    target = active if any(w is active for w, _ in away) else (
+    target = active if any(w is active for w, _, _ in away) else (
         away[-1][0] if away else None)
     try:
         if target is not None and target.isVisible():
@@ -874,12 +893,12 @@ def _reactivate(away: List[tuple], active):
         modal = None
     if modal is not None and modal.isVisible():
         return
-    for w, how in away:
+    for w, how, data in away:
         try:
             if not w.isEnabled():
                 w.setEnabled(True)
             if not w.isVisible():
-                _put_back(w, how)
+                _put_back(w, how, data)
         except Exception:
             continue
 
@@ -969,7 +988,10 @@ TRACE_MAX_BYTES = 200_000
 
 
 def _widget_desc(w) -> str:
-    """一行说清一个窗口/控件当前的状态。"""
+    """一行说清一个窗口/控件当前的状态。
+
+    位置和大小也记上：出过「某个窗口变成一个小框」这种事，有坐标一眼就看出来了。
+    """
     if w is None:
         return "None"
     try:
@@ -977,9 +999,14 @@ def _widget_desc(w) -> str:
     except Exception:
         title = ""
     try:
+        pos, size = w.pos(), w.size()
+        geo = f" 位置=({pos.x()},{pos.y()}) 大小={size.width()}x{size.height()}"
+    except Exception:
+        geo = ""
+    try:
         return (f"{type(w).__name__}({title!r} 可见={w.isVisible()}"
                 f" 可用={w.isEnabled()} 模态={w.windowModality().name}"
-                f" 活跃={w.isActiveWindow()})")
+                f" 活跃={w.isActiveWindow()}{geo})")
     except Exception:
         return f"{type(w).__name__}(状态读不出来)"
 
