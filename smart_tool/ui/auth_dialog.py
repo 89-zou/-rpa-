@@ -24,7 +24,9 @@ from PyQt6.QtWidgets import (
 
 from smart_tool.core import auth_store, blocks, step_executor
 from smart_tool.core.project_store import ProjectStore, Step
-from smart_tool.ui.element_capture import drop_capture_image
+from smart_tool.ui.element_capture import (
+    drop_capture_image, save_captured_locator,
+)
 from smart_tool.ui.help_tip import help_row
 from smart_tool.ui.picker_controller import capture_element
 
