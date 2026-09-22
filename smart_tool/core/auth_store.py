@@ -71,6 +71,22 @@ def read_state(path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def is_usable(path) -> bool:
+    """这个登录态文件**能不能真的拿去用**。
+
+    只看 `exists()` 是不够的：一个 0 字节的、写坏的、或者不是 storage_state 格式的
+    文件照样「存在」。这种文件要是直接交给 Playwright 的 `storage_state`，它会抛一句
+    看不懂的解析错，整轮流程都跑不起来。所以用之前先过这一道。
+
+    没有 cookie 也没有 localStorage 的，同样算用不了 —— 它什么也证明不了。
+    """
+    p = Path(path)
+    if not p.exists():
+        return False
+    data = read_state(p)
+    return bool(data.get("cookies") or data.get("origins"))
+
+
 def summarize(path) -> AuthState:
     """一个登录态文件的情况（cookie 数、最早过期时间…）。"""
     path = Path(path)
@@ -131,6 +147,8 @@ def describe(state: AuthState) -> str:
     """一行中文摘要（日志与界面上用）。"""
     if not state.exists:
         return "还没保存过"
+    if not state.cookies and not state.origins:
+        return "文件是空的或格式不对（用不了，删掉重来）"
     bits = [f"保存于 {time.strftime('%m-%d %H:%M', time.localtime(state.saved_at))}"
             if state.saved_at else "保存时间未知",
             f"{state.cookies} 个 cookie"]
