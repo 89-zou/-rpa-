@@ -136,7 +136,10 @@ def main():
     # 用户放弃且位置还没定 → 什么都不启动。
     if not prepare_first_run():
         return
-    paths.ensure_dirs()
+    # 防御性守卫：确保 DATA_DIR 不是 CONFIG_DIR 占位后再建目录
+    # （prepare_first_run 应该已经处理了所有情况，这里只是防止将来改代码时漏网）
+    if paths.data_dir_ready():
+        paths.ensure_dirs()
 
     # 启动海报：先画出来，再去建主窗口（建窗口最慢，海报上会写进度）。
     # 海报是给最终用户看的，写代码时（源码运行）每次挡一下太烦，所以只在 exe 里显示。

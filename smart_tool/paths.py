@@ -147,13 +147,31 @@ def data_dir_valid() -> bool:
     有效＝目录存在 + 里面有本程序的标记文件（.smart_tool_home）。
     这样用户把整个文件夹拷走/删掉/改名后，程序会及时发现并提示重新指定，
     而不是静默回退到 APPDATA 乱建文件夹。
+
+    升级迁移：老版本用户没有 .smart_tool_home，但目录里有 projects/ 或 浏览器/
+    就视为有效，并当场把标记文件补上（只写一次，不影响后续判断）。
     """
     custom = configured_data_dir()
     if not custom:
         return False
     try:
         p = Path(custom).expanduser()
-        return (p.is_dir() and (p / MARKER_FILE).is_file())
+        if not p.is_dir():
+            return False
+        marker = p / MARKER_FILE
+        if marker.is_file():
+            return True
+        # 升级迁移：没有标记文件但有项目目录或浏览器内核目录 → 补上标记
+        has_projects = (p / "projects").is_dir()
+        has_browser = (p / "浏览器").is_dir() or (p / "ms-playwright").is_dir()
+        if has_projects or has_browser:
+            try:
+                marker.write_text("小邹RPA 数据目录（升级自动写入）\n",
+                                  encoding="utf-8")
+            except OSError:
+                pass                      # 写不进就算了，不影响有效性判断
+            return True
+        return False
     except OSError:
         return False
 
