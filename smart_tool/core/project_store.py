@@ -1183,6 +1183,8 @@ def install_demo_project(
 def list_projects() -> List[ProjectStore]:
     """列出所有项目（含 steps.json 的目录）。"""
     paths.ensure_dirs()
+    if not paths.PROJECTS_DIR.is_dir():     # 数据目录还没定（命令行 / api 这条路上）→ 没有项目
+        return []
     result = []
     for p in sorted(paths.PROJECTS_DIR.iterdir()):
         if p.is_dir() and (p / "steps.json").exists():

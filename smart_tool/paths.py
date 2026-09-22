@@ -115,32 +115,6 @@ def configured_data_dir() -> str:
     return str(load_config().get("data_dir") or "").strip()
 
 
-def _resolve_data_dir() -> Path:
-    """启动时定数据目录。
-
-    优先级：
-        1) 配置里记着的目录存在且有效（有标记文件）→ 用它；
-        2) 程序旁边就有 projects/（绿色版）→ 就用程序目录；
-        3) 都没有 → 落到 CONFIG_DIR 占位（但不会自动创建，得等首次运行的窗口来正式定）。
-    """
-    custom = configured_data_dir()
-    if custom:
-        try:
-            p = Path(custom).expanduser()
-            if p.is_dir():                # 只验证存在，不自动创建
-                return p
-        except OSError:
-            pass                    # 配置里的路径有问题就跳过，别让程序起不来
-    if (app_dir() / "projects").is_dir():    # 绿色版：程序旁边就有 projects/
-        return app_dir()
-    return CONFIG_DIR
-
-
-#: 用户数据目录 / 项目目录（启动时定下来；换位置见 set_data_dir）
-DATA_DIR = _resolve_data_dir()
-PROJECTS_DIR = DATA_DIR / "projects"
-
-
 def data_dir_valid() -> bool:
     """配置里的 data_dir 目录还存在且有效吗？
 
@@ -150,6 +124,8 @@ def data_dir_valid() -> bool:
 
     升级迁移：老版本用户没有 .smart_tool_home，但目录里有 projects/ 或 浏览器/
     就视为有效，并当场把标记文件补上（只写一次，不影响后续判断）。
+
+    注意：判断通过时会顺手补写标记文件（迁移用），所以别在只读场景里反复调它。
     """
     custom = configured_data_dir()
     if not custom:
@@ -174,6 +150,30 @@ def data_dir_valid() -> bool:
         return False
     except OSError:
         return False
+
+
+def _resolve_data_dir() -> Path:
+    """启动时定数据目录。
+
+    **口径必须跟 `data_dir_ready()` 一致（都用 data_dir_valid）**，
+    否则会出现「DATA_DIR 指向 A、程序却以为数据目录已经定好」的错位 ——
+    那样就会在一个来路不明的文件夹里建出 projects/，正是要避免的乱建。
+
+    优先级：
+        1) 配置里记着的目录**有效**（存在 + 有标记文件）→ 用它；
+        2) 程序旁边就有 projects/（绿色版）→ 就用程序目录；
+        3) 都没有 → 落到 CONFIG_DIR 占位（但不会自动创建，得等首次运行的窗口来正式定）。
+    """
+    if data_dir_valid():
+        return Path(configured_data_dir()).expanduser()
+    if (app_dir() / "projects").is_dir():    # 绿色版：程序旁边就有 projects/
+        return app_dir()
+    return CONFIG_DIR
+
+
+#: 用户数据目录 / 项目目录（启动时定下来；换位置见 set_data_dir）
+DATA_DIR = _resolve_data_dir()
+PROJECTS_DIR = DATA_DIR / "projects"
 
 
 def data_dir_ready() -> bool:
@@ -223,10 +223,12 @@ def set_data_dir(path) -> Path:
     global DATA_DIR, PROJECTS_DIR
     target = Path(str(path)).expanduser().resolve()
     target.mkdir(parents=True, exist_ok=True)
-    # 写标记文件，让下次启动能认出这是本程序的家
+    # 写标记文件，让下次启动能认出这是本程序的家。
+    # 注意：别在这里调 marker.stat() —— 文件当时还不存在会抛异常，
+    # 整段被 except 吞掉，标记就写不出来了（踩过这个坑）。
     marker = target / MARKER_FILE
     try:
-        marker.write_text(f"小邹RPA 数据目录\ncreated: {marker.stat().st_mtime:.0f}",
+        marker.write_text("小邹RPA 数据目录（这个文件用来识别数据文件夹，别删）\n",
                           encoding="utf-8")
     except OSError:
         pass                              # 写不进就跳过，别因此报死
@@ -252,8 +254,14 @@ def trace_log() -> Path:
 
 
 def ensure_dirs():
-    """确保关键目录存在。"""
-    PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+    """确保关键数据目录存在 —— 只在「数据目录已经定下来」时才动手。
+
+    数据目录还没定的时候 DATA_DIR 只是 %APPDATA% 的**占位**，
+    光调一下这个函数就会在 APPDATA 里建出 projects/ —— 正是要避免的乱建。
+    （命令行 run_cli.py、api.py 这类不经过首次运行窗口的路子都靠这道守卫。）
+    """
+    if data_dir_ready():
+        PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ------------------------------
