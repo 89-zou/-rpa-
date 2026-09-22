@@ -44,8 +44,8 @@ from smart_tool.core.element_picker import (
     ARM_JS, DISARM_JS, HIGHLIGHT_JS, PICKER_JS, TOAST_JS, next_shot_path,
 )
 
-# 小窗尺寸、离屏幕边缘的距离（四个按钮并排，得够宽）
-WIDTH = 540
+# 小窗尺寸、离屏幕边缘的距离
+WIDTH = 460
 MARGIN = 18
 # Playwright 那侧的节奏：多久看一次命令、多久喂一次引擎
 CMD_WAIT_S = 0.08
@@ -100,9 +100,6 @@ QPushButton:hover { background: #4b5563; }
 QPushButton:disabled { background: #2b3442; color: #6b7280; }
 QPushButton#toggle { background: #b45309; }
 QPushButton#toggle:hover { background: #d97706; }
-QPushButton#save { background: #1d4ed8; }
-QPushButton#save:hover { background: #2563eb; }
-QPushButton#save:disabled { background: #2b3442; color: #6b7280; }
 QPushButton#finish { background: #7f1d1d; }
 QPushButton#finish:hover { background: #991b1b; }
 """
@@ -114,8 +111,7 @@ class PickerController(QWidget):
     interrupt_requested = pyqtSignal()      # 【打断】
     resume_requested = pyqtSignal()         # 【恢复】
     verify_requested = pyqtSignal(str)      # 【校验元素】(XPath)
-    save_requested = pyqtSignal()           # 【保存元素】：结束捕获 + 存进元素定位
-    finish_requested = pyqtSignal()         # 【结束】：只结束，不存
+    finish_requested = pyqtSignal()         # 【结束】
 
     def __init__(self):
         super().__init__(None)
@@ -130,7 +126,6 @@ class PickerController(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setStyleSheet(STYLE)
         self._phase = "capturing"
-        self._has_element = False       # 抓到过元素才让点【保存元素】
         self._drag = None
         self._init_ui()
         self.set_phase("capturing")
@@ -196,20 +191,11 @@ class PickerController(QWidget):
             "并告诉你「命中几个」。命中多于 1 个说明写法不够准，改完再校验。")
         self.btn_verify.clicked.connect(self._on_verify)
         row.addWidget(self.btn_verify)
-        self.btn_save = QPushButton("保存元素")
-        self.btn_save.setObjectName("save")
-        self.btn_save.setEnabled(False)
-        self.btn_save.setToolTip(
-            "结束捕获，并把这次抓到的元素存进项目的「元素定位」。\n"
-            "存了以后，任何「定位路径」里写 {{名字}} 就能复用它。\n"
-            "同一个元素（XPath 一样）再存一次＝覆盖原来那条，不会越存越多。")
-        self.btn_save.clicked.connect(self.save_requested.emit)
-        row.addWidget(self.btn_save)
         self.btn_finish = QPushButton("结束")
         self.btn_finish.setObjectName("finish")
         self.btn_finish.setToolTip(
             "结束捕获：关掉浏览器、把主页调回来。\n"
-            "已经抓到的元素会写进当前这一步；要存进「元素定位」请用【保存元素】。")
+            "已经抓到的元素会写进当前这一步。")
         self.btn_finish.clicked.connect(self.finish_requested.emit)
         row.addWidget(self.btn_finish)
         root.addLayout(row)
@@ -228,8 +214,6 @@ class PickerController(QWidget):
         alive = phase != "closing"
         self.btn_toggle.setEnabled(alive)
         self.btn_verify.setEnabled(alive)
-        # 还没抓到元素就没什么可存的
-        self.btn_save.setEnabled(alive and self._has_element)
         self.detail_label.setText(
             "已打断：现在页面随便你操作（翻页、登录、展开菜单都行）。\n"
             "弄完点【恢复】继续抓元素。"
@@ -243,9 +227,6 @@ class PickerController(QWidget):
 
     def set_element(self, data: dict):
         """把刚抓到的元素填进来（XPath 可改，改完点【校验元素】）。"""
-        self._has_element = True
-        if self._phase != "closing":
-            self.btn_save.setEnabled(True)
         self.element_label.setText(f"已捕获：{data.get('desc') or '元素'}")
         self.xpath_edit.setText(data.get("xpath") or "")
         count = data.get("count", -1)
@@ -685,15 +666,13 @@ class _SessionGlue(QObject):
 def capture_element(url: str, project_dir) -> Optional[dict]:
     """跑一次网页元素捕获：让开工具窗口 → 弹控制器 → 结束/浏览器被关就收尾。
 
-    返回值：抓到了就是 `{"xpath", "image", "count", "desc", "want_save"}`，
-    没抓到返回 None。`want_save` 表示用户点的是【保存元素】而不是【结束】——
-    调用方据此决定要不要把它存进项目的「元素定位」。
+    返回值：抓到了就是 `{"xpath", "image", "count", "desc"}`，没抓到返回 None。
     """
     project_dir = Path(project_dir)
     controller = PickerController()
     session = PickerSession(project_dir / "img")
     loop = QEventLoop()
-    state = {"done": False, "want_save": False}
+    state = {"done": False}
 
     def finish_once():
         """结束流程：幂等 —— 重复点【结束】、浏览器又刚好被关，都不该出事。"""
@@ -701,17 +680,6 @@ def capture_element(url: str, project_dir) -> Optional[dict]:
             return
         state["done"] = True
         loop.quit()
-
-    def finish_and_save():
-        """【保存元素】：先记下「要存」，再走同一套结束流程。
-
-        存的动作**不在这里做** —— 要等捕获彻底结束（浏览器关了、控制器收了、
-        主页和编辑框都回来了）之后，由调用方去存。顺序很重要：
-        保存要弹输入框（应用级模态），在界面还没恢复干净的时候弹，很容易
-        把窗口状态搅乱（就是之前「点完确定界面就死了」那条路）。
-        """
-        state["want_save"] = True
-        finish_once()
 
     glue = _SessionGlue(controller, project_dir, finish_once)
     glue.bind(session)
@@ -721,7 +689,6 @@ def capture_element(url: str, project_dir) -> Optional[dict]:
     controller.resume_requested.connect(session.arm)
     controller.verify_requested.connect(session.verify)
     controller.finish_requested.connect(finish_once)
-    controller.save_requested.connect(finish_and_save)
 
     away, active = [], None
     trace_windows("capture_element 进入")
@@ -759,11 +726,8 @@ def capture_element(url: str, project_dir) -> Optional[dict]:
         trace_windows("reactivate 之后")
 
     _drop_unused_shots(glue.shots, keep_image=(glue.data or {}).get("image"))
-    data = glue.data
-    if data is not None:
-        data["want_save"] = bool(state["want_save"])
     trace_windows("capture_element 返回前")
-    return data
+    return glue.data
 
 
 def _hide_tool_windows(controller):
