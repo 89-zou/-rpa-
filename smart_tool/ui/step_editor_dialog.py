@@ -1458,7 +1458,11 @@ class StepEditDialog(QDialog):
                 self.locator_type.setCurrentIndex(
                     max(0, self.locator_type.findData("xpath")))
                 warn = "" if count == 1 else f"（命中 {count} 个，建议核对）"
-                saved = save_captured_locator(self, self.project_dir, data)
+                # 只有点了控制器上的【保存元素】才存进「元素定位」；点【结束】就只是
+                # 填进上面这个字段。存的动作放在这儿（界面已经完全恢复），
+                # 它要弹的输入框才不会把窗口状态搅乱。
+                saved = (save_captured_locator(self, self.project_dir, data)
+                         if data.get("want_save") else "")
                 more = (f"　已存成元素定位 {{{{{saved}}}}}（定位里写它就能复用）"
                         if saved else "")
                 self.capture_hint.setText(f"已捕获：{desc} → {xpath}{warn}{more}")

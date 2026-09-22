@@ -366,7 +366,12 @@ class AuthDialog(QDialog):
             count = data.get("count", 1)
             # 体检只要 XPath，捕获时顺手存下的元素截图这里用不上，删掉别在 img/ 里堆废图
             drop_capture_image(self.store.dir, data)
-            saved = save_captured_locator(self, self.store.dir, data)
+            # 只有点了控制器上的【保存元素】才存进「元素定位」；点【结束】就只是填进
+            # 上面那个字段。存的动作放在这儿 —— 这一步时界面已经完全恢复干净了，
+            # 它要弹的输入框才不会把窗口状态搅乱（之前就是弹框那一下把界面搞死的）。
+            saved = ""
+            if data.get("want_save"):
+                saved = save_captured_locator(self, self.store.dir, data)
             self.state_label.setText(
                 f"已捕获：{data.get('desc') or '元素'} → {xpath}"
                 + ("" if count == 1 else f"（命中 {count} 个，最好换个更准的）")

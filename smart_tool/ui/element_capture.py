@@ -54,8 +54,10 @@ def guess_locator_name(data: dict, taken=None) -> str:
 def save_captured_locator(parent, project_dir, data: dict) -> str:
     """把这次捕获到的 XPath 存进项目的「元素定位」，返回变量名（没存返回 ""）。
 
-    - 同一个 XPath 已经存过 → 不再重复问，直接复用原来那个名字
-    - 名字留空或取消 → 不存（只填在当前这个字段里）
+    覆盖规则（重新抓同一个元素不会越存越多）：
+    - 这个 XPath 已经存过 → 不再问，直接用原来那个名字（等于覆盖原来那条）
+    - 名字和已有条目重名 → 直接覆盖那一条的值
+    - 名字留空或取消 → 不存（只填在调用方那个字段里）
     """
     xpath = (data or {}).get("xpath") or ""
     xpath = xpath.strip()
