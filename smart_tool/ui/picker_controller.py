@@ -769,25 +769,29 @@ def capture_element(url: str, project_dir) -> Optional[dict]:
 def _hide_tool_windows(controller):
     """把工具自己的窗口都让开（主窗口、步骤编辑器…），屏幕上只留控制器。
 
-    让开有两种做法，按窗口是不是「模态对话框」分：
+    **模态对话框**要特殊对待，它同时踩了两个坑：
 
-    · 普通窗口 → `hide()`。干净，任务栏上也不留痕。
-    · **模态对话框 → `showMinimized()`，绝不能用 hide()。**
-      这是踩出来的大坑：`hide()` 一个正在 `exec()` 的对话框，会把它的 `exec()`
+    坑一：不能用 `hide()`。`hide()` 一个正在 `exec()` 的对话框会把它的 `exec()`
       直接结束掉（Qt 就这么设计的）。而捕获偏偏是从这个 `exec()` 里点出来的 ——
-      于是捕获跑完、控制权一回到 `exec()`，它立刻返回；调用方以为「项目管理
-      已经关掉了」，把那个对话框当垃圾回收掉。可它是当时的活动窗口，一删就留下
+      于是捕获跑完、控制权一回到 `exec()`，它立刻返回；调用方以为「项目管理已经
+      关掉了」，把那个对话框当垃圾回收掉。可它是当时的活动窗口，一删就留下
       「没有活动窗口」的残局：Qt 这边查什么都是正常的（没模态、主窗口可见可用），
       但 Windows 那边被销毁的前台窗口一去不回 —— 点主界面就是不理你，还「咚」。
-      **症状看着像卡死，其实主线程一直活得好好的**（定时器照常触发）。
+      所以只能 `showMinimized()`。
+
+    坑二：光最小化还不够。窗口还在，它**仍然是应用级模态** —— Qt 会把所有别的顶层
+      窗口禁掉，包括我们自己的控制器，于是控制器上【打断】【校验】【保存】【结束】
+      全都点不动，点一下「咚」。所以最小化的同时要**把模态摘掉**，让这段时间里
+      整个程序是非模态的；等放回来的时候再把原来的模态装回去
+      （项目管理该是模态的还是模态，主窗口该被挡还是被挡）。
 
     为什么按「可见的顶层窗口」收，而不是 parent.window()：从步骤编辑器里点捕获时，
     parent.window() 拿到的是编辑器自己，结果只让开了编辑器、主窗口还杵在浏览器旁边
     （这个坑也踩过）。
 
-    返回 (让开的窗口列表, 原来在最前面的那个)。列表里每项是 `(窗口, 怎么让开的)`，
-    `怎么让开的` 用来决定放回来时该调哪个方法：`"hide"` / `"min"` / `"max"`。
-    记住「原来最前面的是谁」是为了结束后把焦点还到用户离开时的那一层。
+    返回 (让开的窗口列表, 原来在最前面的那个)。列表里每项是
+    `(窗口, 怎么让开的, 原来的模态)`；`怎么让开的` 决定放回来时调哪个方法
+    （`"hide"` / `"min"` / `"max"`），`原来的模态` 决定要不要把模态装回去。
     """
     try:
         active = QApplication.activeWindow()
@@ -800,41 +804,53 @@ def _hide_tool_windows(controller):
         if w.windowType() in SKIP_WINDOW_TYPES:
             continue
         try:
-            if w.windowModality() != Qt.WindowModality.NonModal:
+            modality = w.windowModality()
+            if modality != Qt.WindowModality.NonModal:
                 was_max = bool(w.windowState() & Qt.WindowState.WindowMaximized)
+                # 先摘模态（不然控制器会被它禁掉），再最小化（不能 hide，见上面）
+                w.setWindowModality(Qt.WindowModality.NonModal)
                 w.showMinimized()
-                away.append((w, "max" if was_max else "min"))
+                away.append((w, "max" if was_max else "min", modality))
             else:
                 w.hide()
-                away.append((w, "hide"))
+                away.append((w, "hide", modality))
         except Exception:
             continue                    # 已经销毁的窗口，跳过就好
     return away, active
 
 
-def _put_back(w, how: str):
-    """按当初让开的方式把窗口放回来。"""
+def _put_back(w, how: str, modality=None):
+    """按当初让开的方式把窗口放回来，并把模态装回去。"""
     if how == "max":
         w.showMaximized()
     elif how == "min":
         w.showNormal()
     else:
         w.show()
+    if modality is not None:
+        try:
+            w.setWindowModality(modality)
+        except Exception:
+            pass
 
 
 def _restore_windows(away: List[tuple], active):
-    """把刚才让开的窗口放回来，并把焦点还给原来那一层。"""
-    for w, how in away:
+    """把刚才让开的窗口放回来，并把焦点还给原来那一层。
+
+    注意：这里会把模态**装回去**。装回去的一瞬间，Qt 就会按模态把别的窗口重新禁掉 ——
+    这是对的行为（项目管理本来就是模态的，主窗口本来就该被它挡着）。
+    """
+    for w, how, modality in away:
         try:
-            _put_back(w, how)
+            _put_back(w, how, modality)
         except Exception:
             continue
     # 再核一遍：让开过、又该回来的窗口必须真的回来。真丢一个，用户看到的就是
     # 「界面全点不动、鼠标拖不动、点一下还咚」——这里补一次，别让它悄悄留在那儿。
-    for w, how in away:
+    for w, how, modality in away:
         try:
             if not w.isVisible():
-                _put_back(w, how)
+                _put_back(w, how, modality)
         except Exception:
             continue
     # 同一个坑的另一面：还挂着应用级模态、却又是看不见的窗口。它会把整个程序挡住，
@@ -846,7 +862,7 @@ def _restore_windows(away: List[tuple], active):
             modal.raise_()
     except Exception:
         pass
-    target = active if any(w is active for w, _ in away) else (
+    target = active if any(w is active for w, _, _ in away) else (
         away[-1][0] if away else None)
     if target is None:
         return
@@ -867,7 +883,7 @@ def _reactivate(away: List[tuple], active):
     这里做两件事：把该在前的窗口再抬一次；然后检查有没有「看不见的模态」残留，
     有就把界面解开。正常情况下这里什么都不用做。
     """
-    target = active if any(w is active for w, _ in away) else (
+    target = active if any(w is active for w, _, _ in away) else (
         away[-1][0] if away else None)
     try:
         if target is not None and target.isVisible():
@@ -882,12 +898,12 @@ def _reactivate(away: List[tuple], active):
         modal = None
     if modal is not None and modal.isVisible():
         return
-    for w, how in away:
+    for w, how, modality in away:
         try:
             if not w.isEnabled():
                 w.setEnabled(True)
             if not w.isVisible():
-                _put_back(w, how)
+                _put_back(w, how, modality)
         except Exception:
             continue
 
