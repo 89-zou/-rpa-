@@ -73,9 +73,16 @@ COMMON_FIELDS = [
 
 #: 步骤后等待（大多数动作都有）
 WAIT_FIELDS = [
-    f("wait_after", "str", "这一步做完后再等什么", choices=[
-        "element_present", "page_load", "url_changed", "network_idle", "manual"]),
-    f("wait_target", "str", "等待目标：等元素时填 XPath，等 URL 时填网址片段"),
+    f("wait_after", "str",
+      "这一步做完后再等什么。网页场景：element_present（等元素出现，最常用）/ "
+      "page_load（等网页跳转或加载完）/ url_changed（等网址变化）/ "
+      "network_idle（等网络空闲）/ manual（不自动等，直接下一步）。"
+      "桌面场景只有三个：element_present（等这张图出现）/ image_gone（等这张图消失，"
+      "转圈、加载提示这类）/ manual", choices=[
+          "element_present", "page_load", "url_changed", "network_idle",
+          "image_gone", "manual"]),
+    f("wait_target", "str", "等待目标：网页等元素填 XPath、等网址填一段网址片段；"
+      "桌面等图片填项目 img/ 里的图片名"),
     f("wait_seconds", "float", "另外固定再等几秒", default=0),
 ]
 
@@ -204,13 +211,18 @@ ACTION_SPECS: Dict[str, Dict[str, Any]] = {
     "read_data": {
         "label": "读取数据", "scenes": [SCENE_WEB, SCENE_DESKTOP],
         "desc": "读本机文件/文件夹，产出一个列表变量（配「循环」逐项处理）。"
-                f"文件类可用字段：{'、'.join(k for k, _ in FILE_FIELDS)}。",
+                f"文件类（txt / folder）能拿到的字段：{'、'.join(k for k, _ in FILE_FIELDS)}。",
         "fields": [
             f("output_var", "str", "产出变量名，如 素材列表", True),
-            f("data_cfg", "dict", "{\"type\":\"folder|txt|excel|json\",\"path\":\"...\","
-              "\"pattern\":\"*.txt\",\"recursive\":false,\"encoding\":\"auto\","
+            f("data_cfg", "dict",
+              "{\"type\":\"folder|txt|excel|json\",\"path\":\"绝对路径\","
+              "\"pattern\":\"*.txt\",\"recursive\":true,\"encoding\":\"auto\","
               "\"sheet\":\"\",\"has_header\":true,"
-              "\"field_map\":[{\"field\":\"content\",\"var\":\"内容\"}]}", True),
+              "\"field_map\":[{\"field\":\"content\",\"var\":\"内容\"}]}。"
+              "path 可含 {{变量}}；recursive / pattern 只对 folder 有效；"
+              "field_map＝「要产出哪些变量」的清单（field 见上面那串字段名、"
+              "var 是变量名，可自己起名）：写了它就只产出清单里这些，"
+              "留空＝产出全部原始字段", True),
         ],
     },
     "script": {
@@ -292,10 +304,11 @@ ACTION_SPECS: Dict[str, Dict[str, Any]] = {
     },
     "pause_for_human": {
         "label": "暂停等人工", "scenes": [SCENE_WEB, SCENE_DESKTOP],
-        "desc": "停下来等人工处理（验证码/人机验证），满足恢复条件或人工点「继续」后继续。",
+        "desc": "停下来等人工处理（验证码/人机验证），满足恢复条件或人工点「继续」后继续。"
+                "桌面场景只能靠人工点「继续」（没有网址/元素可判断）。",
         "fields": [
             f("prompt", "str", "提示语（显示在运行小窗上）"),
-            f("resume_condition", "str", "恢复条件", default="manual",
+            f("resume_condition", "str", "恢复条件（网页场景用）", default="manual",
               choices=["manual", "url_changed", "element_present", "url_and_element"]),
             f("resume_url", "str", "URL 变化条件：网址里要包含的片段（支持 * 通配）"),
             f("resume_element", "str", "元素出现条件：等哪个 XPath 出现"),
@@ -328,12 +341,24 @@ def _all_fields(action: str, spec: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     cond_op / cond_value 是「条件块里的动作节点」才用得上，但任何动作都可能被放进
     条件里当动作节点，所以除了条件节点自己（它的字段里已经列了），其余都带上。
+
+    动作自己列过的字段优先（比如组合的 title 是必填，就别被公共的 title 顶掉），
+    同名的不重复出现。
     """
-    fields = list(spec["fields"]) + COMMON_FIELDS
+    fields = list(spec["fields"])
+    seen = {x["name"] for x in fields}
+
+    def add(items: List[Dict[str, Any]]):
+        for item in items:
+            if item["name"] not in seen:
+                seen.add(item["name"])
+                fields.append(item)
+
+    add(COMMON_FIELDS)
     if action != "condition_start":
-        fields += RULE_FIELDS
+        add(RULE_FIELDS)
     if action in ("click", "fill", "select", "captcha"):
-        fields += IMAGE_FIELDS      # 这几个动作都会用到图片匹配
+        add(IMAGE_FIELDS)      # 这几个动作都会用到图片匹配
     return fields
 
 
@@ -499,6 +524,18 @@ def set_scene(project: str, scene: str) -> Dict[str, Any]:
     store = _store(project)
     store.save(store.load_steps(), scene=scene)
     return {"scene": store.load_scene()}
+
+
+def set_real_mouse(project: str, on: bool = True) -> Dict[str, Any]:
+    """网页项目：真实鼠标（用系统级鼠标点击代替浏览器合成事件，个别站点需要）。
+
+    开了以后跑的时候浏览器窗口要保持可见、在最前面（程序会提醒），
+    而且需要 pyautogui（没装会自动退回普通点击，日志里会写）。
+    桌面场景不用它 —— 桌面本来就是系统级鼠标键盘（那边用 set_human_mouse）。
+    """
+    store = _store(project)
+    store.save_real_mouse(bool(on))
+    return {"real_mouse": store.load_real_mouse()}
 
 
 def set_human_mouse(project: str, human: bool = True,
@@ -1182,14 +1219,20 @@ def run_project(project: str, headless: bool = True,
             except Exception:
                 pass
 
+    scene = store.load_scene()
+    mouse = store.load_human_mouse()
     executor = StepExecutor(
         steps=steps,
         variables=store.load_all_variables(),
         headless=bool(headless),
         project_dir=store.dir,
         log=_log,
-        scene=store.load_scene(),
+        scene=scene,
         auth=store.load_auth(),
+        # 项目上存的两个鼠标开关要带上，否则跑起来跟界面/命令行不一致
+        real_mouse=store.load_real_mouse(),
+        human_mouse=(scene == "desktop" and bool(mouse["human"])),
+        mouse_speed=float(mouse["speed"]),
     )
     try:
         executor.run()
@@ -1231,6 +1274,17 @@ def export_records(project: str, fmt: str = "xlsx", path: str = "") -> Dict[str,
     return {"path": str(target), "rows": rows, "fmt": fmt}
 
 
+def clear_records(project: str) -> Dict[str, Any]:
+    """清空采集记录（删掉 data/records.jsonl）。
+
+    跟界面【采集数据…】里的「清空记录」是同一件事：
+    data/files/ 里下载下来的图片、附件不会被删。谨慎用。
+    """
+    store = _store(project)
+    datastore.clear(store.dir)
+    return {"cleared": True, "total": 0}
+
+
 def list_images(project: str) -> List[Dict[str, Any]]:
     """列出图片库（项目 img/ 里的图片）。"""
     store = _store(project)
@@ -1258,6 +1312,29 @@ def import_image(project: str, source: str, name: str = "") -> Dict[str, Any]:
     return {"name": target.name, "path": str(target)}
 
 
+def delete_image(project: str, name: str) -> Dict[str, Any]:
+    """删掉图片库里的一张图（name 写文件名，如 按钮.png；用 list_images 看有哪些）。
+
+    返回值里 used_by 是正在用它的步骤 —— 删了那些步骤运行时会报
+    「截图文件不存在」（跟界面【项目管理…】里删图的提醒是同一套判断）。
+    """
+    store = _store(project)
+    target = store.img_dir / Path(str(name or "").strip()).name
+    if not target.is_file():
+        raise ApiError(f"图片库里没有「{name}」。用 list_images() 看看有哪些。")
+    key = f"img/{target.name}".lower()
+    used: List[str] = []
+    for s in store.load_steps():
+        loc = s.locator
+        if loc is None:
+            continue
+        paths = [loc.value if loc.type == "image" else "", loc.image]
+        if any(str(p or "").replace("\\", "/").strip().lower() == key for p in paths):
+            used.append(f"第 {s.id} 步 {s.title or s.action}")
+    target.unlink()
+    return {"deleted": target.name, "used_by": used}
+
+
 # ============================================================
 # 七、JSON 入口（给 LLM 的 function calling 用）
 # ============================================================
@@ -1271,14 +1348,15 @@ def _register(*funcs: Callable):
 
 _register(
     list_projects_info, create_project, delete_project, rename_project, get_project,
-    set_scene, set_human_mouse,
+    set_scene, set_real_mouse, set_human_mouse,
     get_variables, set_variables, delete_variable,
     get_locators, set_locators, get_auth, set_auth, clear_auth,
     list_functions, set_function, delete_function,
     list_steps, add_steps, update_step, delete_steps, move_step,
     add_loop, add_condition, add_group, clear_steps, available_variables_of,
     validate_project, run_project,
-    list_records, export_records, list_images, import_image,
+    list_records, export_records, clear_records, list_images, import_image,
+    delete_image,
     list_actions, describe_action, free_code_guide,
 )
 
