@@ -44,8 +44,8 @@ from smart_tool.core.element_picker import (
     ARM_JS, DISARM_JS, HIGHLIGHT_JS, PICKER_JS, TOAST_JS, next_shot_path,
 )
 
-# 小窗尺寸、离屏幕边缘的距离
-WIDTH = 460
+# 小窗尺寸、离屏幕边缘的距离（四个按钮并排，得够宽）
+WIDTH = 540
 MARGIN = 18
 # Playwright 那侧的节奏：多久看一次命令、多久喂一次引擎
 CMD_WAIT_S = 0.08
@@ -100,6 +100,9 @@ QPushButton:hover { background: #4b5563; }
 QPushButton:disabled { background: #2b3442; color: #6b7280; }
 QPushButton#toggle { background: #b45309; }
 QPushButton#toggle:hover { background: #d97706; }
+QPushButton#save { background: #1d4ed8; }
+QPushButton#save:hover { background: #2563eb; }
+QPushButton#save:disabled { background: #2b3442; color: #6b7280; }
 QPushButton#finish { background: #7f1d1d; }
 QPushButton#finish:hover { background: #991b1b; }
 """
@@ -111,7 +114,8 @@ class PickerController(QWidget):
     interrupt_requested = pyqtSignal()      # 【打断】
     resume_requested = pyqtSignal()         # 【恢复】
     verify_requested = pyqtSignal(str)      # 【校验元素】(XPath)
-    finish_requested = pyqtSignal()         # 【结束】
+    save_requested = pyqtSignal()           # 【保存元素】：结束捕获 + 存进元素定位
+    finish_requested = pyqtSignal()         # 【结束】：只结束，不存
 
     def __init__(self):
         super().__init__(None)
@@ -126,6 +130,7 @@ class PickerController(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setStyleSheet(STYLE)
         self._phase = "capturing"
+        self._has_element = False       # 抓到过元素才让点【保存元素】
         self._drag = None
         self._init_ui()
         self.set_phase("capturing")
@@ -191,11 +196,20 @@ class PickerController(QWidget):
             "并告诉你「命中几个」。命中多于 1 个说明写法不够准，改完再校验。")
         self.btn_verify.clicked.connect(self._on_verify)
         row.addWidget(self.btn_verify)
+        self.btn_save = QPushButton("保存元素")
+        self.btn_save.setObjectName("save")
+        self.btn_save.setEnabled(False)
+        self.btn_save.setToolTip(
+            "结束捕获，并把这次抓到的元素存进项目的「元素定位」。\n"
+            "存了以后，任何「定位路径」里写 {{名字}} 就能复用它。\n"
+            "同一个元素（XPath 一样）再存一次＝覆盖原来那条，不会越存越多。")
+        self.btn_save.clicked.connect(self.save_requested.emit)
+        row.addWidget(self.btn_save)
         self.btn_finish = QPushButton("结束")
         self.btn_finish.setObjectName("finish")
         self.btn_finish.setToolTip(
             "结束捕获：关掉浏览器、把主页调回来。\n"
-            "已经抓到的元素会写进当前这一步。")
+            "已经抓到的元素会写进当前这一步；要存进「元素定位」请用【保存元素】。")
         self.btn_finish.clicked.connect(self.finish_requested.emit)
         row.addWidget(self.btn_finish)
         root.addLayout(row)
@@ -211,8 +225,11 @@ class PickerController(QWidget):
         self.title_label.setText(PHASE_TITLE.get(phase, phase))
         paused = phase == "paused"
         self.btn_toggle.setText("恢复" if paused else "打断")
-        self.btn_toggle.setEnabled(phase != "closing")
-        self.btn_verify.setEnabled(phase != "closing")
+        alive = phase != "closing"
+        self.btn_toggle.setEnabled(alive)
+        self.btn_verify.setEnabled(alive)
+        # 还没抓到元素就没什么可存的
+        self.btn_save.setEnabled(alive and self._has_element)
         self.detail_label.setText(
             "已打断：现在页面随便你操作（翻页、登录、展开菜单都行）。\n"
             "弄完点【恢复】继续抓元素。"
@@ -226,6 +243,9 @@ class PickerController(QWidget):
 
     def set_element(self, data: dict):
         """把刚抓到的元素填进来（XPath 可改，改完点【校验元素】）。"""
+        self._has_element = True
+        if self._phase != "closing":
+            self.btn_save.setEnabled(True)
         self.element_label.setText(f"已捕获：{data.get('desc') or '元素'}")
         self.xpath_edit.setText(data.get("xpath") or "")
         count = data.get("count", -1)
@@ -663,15 +683,17 @@ class _SessionGlue(QObject):
 
 
 def capture_element(url: str, project_dir) -> Optional[dict]:
-    """跑一次网页元素捕获：藏好工具窗口 → 弹控制器 → 结束/浏览器被关就收尾。
+    """跑一次网页元素捕获：让开工具窗口 → 弹控制器 → 结束/浏览器被关就收尾。
 
-    返回值跟老版本一致：`{"xpath", "image", "count", "desc"}`；没抓到返回 None。
+    返回值：抓到了就是 `{"xpath", "image", "count", "desc", "want_save"}`，
+    没抓到返回 None。`want_save` 表示用户点的是【保存元素】而不是【结束】——
+    调用方据此决定要不要把它存进项目的「元素定位」。
     """
     project_dir = Path(project_dir)
     controller = PickerController()
     session = PickerSession(project_dir / "img")
     loop = QEventLoop()
-    state = {"done": False}
+    state = {"done": False, "want_save": False}
 
     def finish_once():
         """结束流程：幂等 —— 重复点【结束】、浏览器又刚好被关，都不该出事。"""
@@ -679,6 +701,17 @@ def capture_element(url: str, project_dir) -> Optional[dict]:
             return
         state["done"] = True
         loop.quit()
+
+    def finish_and_save():
+        """【保存元素】：先记下「要存」，再走同一套结束流程。
+
+        存的动作**不在这里做** —— 要等捕获彻底结束（浏览器关了、控制器收了、
+        主页和编辑框都回来了）之后，由调用方去存。顺序很重要：
+        保存要弹输入框（应用级模态），在界面还没恢复干净的时候弹，很容易
+        把窗口状态搅乱（就是之前「点完确定界面就死了」那条路）。
+        """
+        state["want_save"] = True
+        finish_once()
 
     glue = _SessionGlue(controller, project_dir, finish_once)
     glue.bind(session)
@@ -688,12 +721,13 @@ def capture_element(url: str, project_dir) -> Optional[dict]:
     controller.resume_requested.connect(session.arm)
     controller.verify_requested.connect(session.verify)
     controller.finish_requested.connect(finish_once)
+    controller.save_requested.connect(finish_and_save)
 
-    hidden, active = [], None
+    away, active = [], None
     trace_windows("capture_element 进入")
     try:
-        hidden, active = _hide_tool_windows(controller)
-        trace_windows(f"藏完工具窗口（{len(hidden)} 个）")
+        away, active = _hide_tool_windows(controller)
+        trace_windows(f"让开工具窗口（{len(away)} 个）")
         controller.move_to_corner()
         controller.show()
         controller.raise_()
@@ -701,70 +735,106 @@ def capture_element(url: str, project_dir) -> Optional[dict]:
         session.start_page(url)
         loop.exec()
     finally:
-        # 顺序是刻意的：先把界面还回去，用户不用干等浏览器关。
+        # 结束的顺序是定死的，也是刻意的：
+        #   ① 先关浏览器 —— 它是另一个进程，还占着前台；先把它送走，
+        #      后面恢复窗口时才不会有别的进程跟着抢前台。
+        #   ② 再关控制器 —— 一个永远置顶的小窗，得赶在主页回来之前收掉。
+        #   ③ 最后才把主页／编辑框放回来，并确认焦点落在对的那一层。
+        try:
+            controller.set_phase("closing")
+            controller.set_hint("正在关闭浏览器…", ok=True)
+        except Exception:
+            pass
+        _shutdown_session(session)
+        trace_windows("关完浏览器")
         try:
             controller.hide()
         finally:
-            _restore_windows(hidden, active)
-            trace_windows("放回工具窗口")
-            _shutdown_session(session)
-            trace_windows("关完浏览器")
-            # 关完浏览器再确认一次 —— 理由见 _reactivate 的说明
-            _reactivate(hidden, active)
-            trace_windows("reactivate 之后")
-        # 控制器就此了结（它挂着 _SessionGlue 这个子对象）：显式删掉，
-        # 别指望出了作用域被 GC —— 一个曾经置顶的小窗悬在那儿容易惹事。
-        controller.deleteLater()
+            controller.deleteLater()
+        trace_windows("关完控制器")
+        _restore_windows(away, active)
+        trace_windows("放回工具窗口")
+        # 关完浏览器再确认一次 —— 理由见 _reactivate 的说明
+        _reactivate(away, active)
+        trace_windows("reactivate 之后")
 
     _drop_unused_shots(glue.shots, keep_image=(glue.data or {}).get("image"))
+    data = glue.data
+    if data is not None:
+        data["want_save"] = bool(state["want_save"])
     trace_windows("capture_element 返回前")
-    return glue.data
+    return data
 
 
 def _hide_tool_windows(controller):
-    """把工具自己的窗口都收起来（主窗口、步骤编辑器…），屏幕上只留控制器。
+    """把工具自己的窗口都让开（主窗口、步骤编辑器…），屏幕上只留控制器。
+
+    让开有两种做法，按窗口是不是「模态对话框」分：
+
+    · 普通窗口 → `hide()`。干净，任务栏上也不留痕。
+    · **模态对话框 → `showMinimized()`，绝不能用 hide()。**
+      这是踩出来的大坑：`hide()` 一个正在 `exec()` 的对话框，会把它的 `exec()`
+      直接结束掉（Qt 就这么设计的）。而捕获偏偏是从这个 `exec()` 里点出来的 ——
+      于是捕获跑完、控制权一回到 `exec()`，它立刻返回；调用方以为「项目管理
+      已经关掉了」，把那个对话框当垃圾回收掉。可它是当时的活动窗口，一删就留下
+      「没有活动窗口」的残局：Qt 这边查什么都是正常的（没模态、主窗口可见可用），
+      但 Windows 那边被销毁的前台窗口一去不回 —— 点主界面就是不理你，还「咚」。
+      **症状看着像卡死，其实主线程一直活得好好的**（定时器照常触发）。
 
     为什么按「可见的顶层窗口」收，而不是 parent.window()：从步骤编辑器里点捕获时，
-    parent.window() 拿到的是编辑器自己，结果只藏了编辑器、主窗口还杵在浏览器旁边
-    （这个坑踩过）。
+    parent.window() 拿到的是编辑器自己，结果只让开了编辑器、主窗口还杵在浏览器旁边
+    （这个坑也踩过）。
 
-    返回 (藏起来的窗口, 原来在最前面的那个)。记住「原来最前面的是谁」是为了
-    结束后把焦点还到用户离开时的那一层——不然编辑器可能被丢在主窗口后面。
+    返回 (让开的窗口列表, 原来在最前面的那个)。列表里每项是 `(窗口, 怎么让开的)`，
+    `怎么让开的` 用来决定放回来时该调哪个方法：`"hide"` / `"min"` / `"max"`。
+    记住「原来最前面的是谁」是为了结束后把焦点还到用户离开时的那一层。
     """
     try:
         active = QApplication.activeWindow()
     except Exception:
         active = None
-    hidden: List[QWidget] = []
+    away: List[tuple] = []
     for w in QApplication.topLevelWidgets():
         if w is controller or not w.isWindow() or not w.isVisible():
             continue
         if w.windowType() in SKIP_WINDOW_TYPES:
             continue
-        # try 只包住 hide()：判断条件留在外面，写错了要当场炸，
-        # 不能被这里吞掉（见上面 SKIP_WINDOW_TYPES 的说明）
         try:
-            w.hide()
+            if w.windowModality() != Qt.WindowModality.NonModal:
+                was_max = bool(w.windowState() & Qt.WindowState.WindowMaximized)
+                w.showMinimized()
+                away.append((w, "max" if was_max else "min"))
+            else:
+                w.hide()
+                away.append((w, "hide"))
         except Exception:
             continue                    # 已经销毁的窗口，跳过就好
-        hidden.append(w)
-    return hidden, active
+    return away, active
 
 
-def _restore_windows(hidden: List[QWidget], active):
-    """把刚才藏起来的窗口放回去，并把焦点还给原来那一层。"""
-    for w in hidden:
+def _put_back(w, how: str):
+    """按当初让开的方式把窗口放回来。"""
+    if how == "max":
+        w.showMaximized()
+    elif how == "min":
+        w.showNormal()
+    else:
+        w.show()
+
+
+def _restore_windows(away: List[tuple], active):
+    """把刚才让开的窗口放回来，并把焦点还给原来那一层。"""
+    for w, how in away:
         try:
-            w.show()
+            _put_back(w, how)
         except Exception:
             continue
-    # 再核一遍：藏过、又该回来的窗口必须真的回来。
-    # Qt 对「藏起来过的模态窗口」有边界情况不肯 show；真出现时用户看到的就是
+    # 再核一遍：让开过、又该回来的窗口必须真的回来。真丢一个，用户看到的就是
     # 「界面全点不动、鼠标拖不动、点一下还咚」——这里补一次，别让它悄悄留在那儿。
-    for w in hidden:
+    for w, how in away:
         try:
             if not w.isVisible():
-                w.setVisible(True)
+                _put_back(w, how)
         except Exception:
             continue
     # 同一个坑的另一面：还挂着应用级模态、却又是看不见的窗口。它会把整个程序挡住，
@@ -776,7 +846,8 @@ def _restore_windows(hidden: List[QWidget], active):
             modal.raise_()
     except Exception:
         pass
-    target = active if active in hidden else (hidden[-1] if hidden else None)
+    target = active if any(w is active for w, _ in away) else (
+        away[-1][0] if away else None)
     if target is None:
         return
     try:
@@ -786,38 +857,37 @@ def _restore_windows(hidden: List[QWidget], active):
         pass
 
 
-def _reactivate(hidden: List[QWidget], active):
+def _reactivate(away: List[tuple], active):
     """关完浏览器之后，再确认一次「界面回来了、而且是可用的」。
 
     为什么要在关完浏览器之后补这一下：浏览器是**另一个进程**，抓元素的时候它正占着
     前台，而我们是先还界面、后关浏览器。Windows／Qt 对「谁是当前活动窗口」的记账，
-    在这种跨进程抢前台的情形下容易算乱，最后可能落到
-    「没有活动窗口 + 还挂着应用级模态」——用户看到的就是整个界面点不动、鼠标拖不动、
-    点一下还「咚」（踩过一次）。
+    在这种跨进程抢前台的情形下容易算乱（踩过）。
 
     这里做两件事：把该在前的窗口再抬一次；然后检查有没有「看不见的模态」残留，
     有就把界面解开。正常情况下这里什么都不用做。
     """
-    target = active if active in hidden else (hidden[-1] if hidden else None)
+    target = active if any(w is active for w, _ in away) else (
+        away[-1][0] if away else None)
     try:
         if target is not None and target.isVisible():
             target.raise_()
             target.activateWindow()
     except Exception:
         pass
-    # 兜底：只要没有「看得见的模态」，我们藏过的窗口就不该是禁用或隐藏的
+    # 兜底：只要没有「看得见的模态」，我们让开过的窗口就不该是禁用或隐藏的
     try:
         modal = QApplication.activeModalWidget()
     except Exception:
         modal = None
     if modal is not None and modal.isVisible():
         return
-    for w in hidden:
+    for w, how in away:
         try:
             if not w.isEnabled():
                 w.setEnabled(True)
             if not w.isVisible():
-                w.show()
+                _put_back(w, how)
         except Exception:
             continue
 
