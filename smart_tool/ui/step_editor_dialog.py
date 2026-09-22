@@ -33,10 +33,11 @@ from smart_tool.ui.captcha_panel import CaptchaPanel
 from smart_tool.ui.code_editor import CodeEditor
 from smart_tool.ui.collect_panel import CollectPanel
 from smart_tool.ui.desktop_picker import DesktopPickerDialog
-from smart_tool.ui.element_picker_dialog import (
-    drop_capture_image, pick_element, save_captured_locator,
+from smart_tool.ui.element_capture import (
+    drop_capture_image, save_captured_locator,
 )
 from smart_tool.ui.help_tip import HelpButton, help_row
+from smart_tool.ui.picker_controller import capture_element
 from smart_tool.ui.read_data_panel import ReadDataPanel
 from smart_tool.ui.window_match_dialog import WindowMatchDialog
 
@@ -1411,7 +1412,7 @@ class StepEditDialog(QDialog):
     def _capture_web_element(self, target: str):
         """网页场景：打开浏览器点元素 → 拿到 XPath + 元素图（截图进兜底栏）。"""
         url = self.url_edit.text().strip() or self._default_url
-        data = pick_element(self, url, self.project_dir)
+        data = capture_element(url, self.project_dir)
         if not data:
             return
         xpath = (data.get("xpath") or "").strip()
@@ -1468,7 +1469,7 @@ class StepEditDialog(QDialog):
                     "捕获器不知道该打开哪个页面。",
                 )
                 return
-            data = pick_element(self, url, self.project_dir)
+            data = capture_element(url, self.project_dir)
             if not data:
                 return
             xpath = (data.get("xpath") or "").strip()

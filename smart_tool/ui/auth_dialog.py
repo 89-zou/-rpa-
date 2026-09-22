@@ -24,8 +24,9 @@ from PyQt6.QtWidgets import (
 
 from smart_tool.core import auth_store, blocks, step_executor
 from smart_tool.core.project_store import ProjectStore, Step
-from smart_tool.ui.element_picker_dialog import drop_capture_image, pick_element
+from smart_tool.ui.element_capture import drop_capture_image
 from smart_tool.ui.help_tip import help_row
+from smart_tool.ui.picker_controller import capture_element
 
 NO_AUTH_TEXT = "（不使用登录态）"
 XPATH_PLACEHOLDER = "（下拉＝本项目已用过的定位）"
@@ -333,7 +334,7 @@ class AuthDialog(QDialog):
             )
             return
         try:
-            data = pick_element(self, url, self.store.dir)
+            data = capture_element(url, self.store.dir)
         except Exception as e:
             QMessageBox.critical(self, "捕获失败", f"{type(e).__name__}: {e}")
             return
