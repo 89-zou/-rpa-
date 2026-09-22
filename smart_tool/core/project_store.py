@@ -4,7 +4,7 @@
 steps.json 结构：
 {
   "steps": [ {id, action, url?, locator?, value?, wait_after?, wait_target?, prompt?, note?}, ... ],
-  "variables": {"账号": "hcw", ...}      # 只有「自定义变量」在这里
+  "variables": {"账号": "user", ...}      # 只有「自定义变量」在这里
 }
 
 变量从哪来：节点自己产出。「读取数据」（read_data）节点读文件/文件夹，
