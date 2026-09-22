@@ -113,8 +113,18 @@ class PickerController(QWidget):
     verify_requested = pyqtSignal(str)      # 【校验元素】(XPath)
     finish_requested = pyqtSignal()         # 【结束】
 
-    def __init__(self):
-        super().__init__(None)
+    def __init__(self, parent=None):
+        """parent 通常传「当下那个模态窗口」。
+
+        为什么要挂到它底下：**Qt 不会禁用「模态窗口的子窗口」**。捕获往往是从一个
+        模态对话框（项目管理 / 步骤编辑器）里点出来的，而我们这个控制器是另一个
+        顶层小窗 —— 只要那个模态窗口还在，Qt 就会把控制器一起禁掉，于是控制器上
+        【打断】【校验】【结束】全都点不动，点一下还「咚」。挂在它底下就不受这份管。
+
+        （试过、没用的路子：把模态窗口的 windowModality 设成 NonModal。
+        实测那个属性变了，但 Qt 的模态栈照样压着它，控制器还是禁着。）
+        """
+        super().__init__(parent)
         self.setWindowTitle("元素捕获")
         # 置顶 + 无边框 + Tool：跟运行小窗一样，不占任务栏、不挡视线。
         # 注意**不加** WindowDoesNotAcceptFocus —— 这里有个 XPath 输入框要打字。
@@ -669,7 +679,13 @@ def capture_element(url: str, project_dir) -> Optional[dict]:
     返回值：抓到了就是 `{"xpath", "image", "count", "desc"}`，没抓到返回 None。
     """
     project_dir = Path(project_dir)
-    controller = PickerController()
+    # 控制器挂到「当下那个模态窗口」底下：Qt 不会禁用模态窗口的子窗口，
+    # 不挂的话它会被模态对话框一起禁掉（控制器上什么都点不动、点一下咚）。
+    try:
+        host = QApplication.activeModalWidget()
+    except Exception:
+        host = None
+    controller = PickerController(host)
     session = PickerSession(project_dir / "img")
     loop = QEventLoop()
     state = {"done": False}
@@ -691,13 +707,18 @@ def capture_element(url: str, project_dir) -> Optional[dict]:
     controller.finish_requested.connect(finish_once)
 
     away, active = [], None
-    trace_windows("capture_element 进入")
+    trace_windows(f"capture_element 进入（模态宿主={type(host).__name__ if host else None}）")
     try:
         away, active = _hide_tool_windows(controller)
         trace_windows(f"让开工具窗口（{len(away)} 个）")
         controller.move_to_corner()
         controller.show()
         controller.raise_()
+        # 万一还是被谁禁着（模态窗口没认我们这门亲戚），当场解开：
+        # 一个禁着的窗口反正也点不动，强制启用只可能更好。
+        if not controller.isEnabled():
+            controller.setEnabled(True)
+        trace_windows("控制器已显示")
         session.start()
         session.start_page(url)
         loop.exec()
@@ -744,18 +765,19 @@ def _hide_tool_windows(controller):
       所以只能 `showMinimized()`。
 
     坑二：光最小化还不够。窗口还在，它**仍然是应用级模态** —— Qt 会把所有别的顶层
-      窗口禁掉，包括我们自己的控制器，于是控制器上【打断】【校验】【保存】【结束】
-      全都点不动，点一下「咚」。所以最小化的同时要**把模态摘掉**，让这段时间里
-      整个程序是非模态的；等放回来的时候再把原来的模态装回去
-      （项目管理该是模态的还是模态，主窗口该被挡还是被挡）。
+      窗口禁掉，包括我们自己的控制器，于是控制器上【打断】【校验】【结束】全都点不动，
+      点一下「咚」。这件事**不能靠改它的模态来解决**：把 windowModality 设成
+      NonModal，那个属性确实变了，但 Qt 的模态栈照样压着它（真机日志里看得清清楚楚：
+      「模态=NonModal」而「模态栈顶=它」），控制器还是禁着。
+      管用的是把**控制器挂到这个模态窗口底下** —— Qt 不会禁用模态窗口的子窗口，
+      那是在 PickerController 构造时做的（见那儿的说明）。
 
     为什么按「可见的顶层窗口」收，而不是 parent.window()：从步骤编辑器里点捕获时，
     parent.window() 拿到的是编辑器自己，结果只让开了编辑器、主窗口还杵在浏览器旁边
     （这个坑也踩过）。
 
-    返回 (让开的窗口列表, 原来在最前面的那个)。列表里每项是
-    `(窗口, 怎么让开的, 原来的模态)`；`怎么让开的` 决定放回来时调哪个方法
-    （`"hide"` / `"min"` / `"max"`），`原来的模态` 决定要不要把模态装回去。
+    返回 (让开的窗口列表, 原来在最前面的那个)。列表里每项是 `(窗口, 怎么让开的)`，
+    `怎么让开的` 决定放回来时调哪个方法：`"hide"` / `"min"` / `"max"`。
     """
     try:
         active = QApplication.activeWindow()
@@ -768,53 +790,43 @@ def _hide_tool_windows(controller):
         if w.windowType() in SKIP_WINDOW_TYPES:
             continue
         try:
-            modality = w.windowModality()
-            if modality != Qt.WindowModality.NonModal:
+            if w.windowModality() != Qt.WindowModality.NonModal:
+                # 模态对话框：只能最小化，不能 hide（见坑一）。
+                # 模态本身不去动它（见坑二）。
                 was_max = bool(w.windowState() & Qt.WindowState.WindowMaximized)
-                # 先摘模态（不然控制器会被它禁掉），再最小化（不能 hide，见上面）
-                w.setWindowModality(Qt.WindowModality.NonModal)
                 w.showMinimized()
-                away.append((w, "max" if was_max else "min", modality))
+                away.append((w, "max" if was_max else "min"))
             else:
                 w.hide()
-                away.append((w, "hide", modality))
+                away.append((w, "hide"))
         except Exception:
             continue                    # 已经销毁的窗口，跳过就好
     return away, active
 
 
-def _put_back(w, how: str, modality=None):
-    """按当初让开的方式把窗口放回来，并把模态装回去。"""
+def _put_back(w, how: str):
+    """按当初让开的方式把窗口放回来。"""
     if how == "max":
         w.showMaximized()
     elif how == "min":
         w.showNormal()
     else:
         w.show()
-    if modality is not None:
-        try:
-            w.setWindowModality(modality)
-        except Exception:
-            pass
 
 
 def _restore_windows(away: List[tuple], active):
-    """把刚才让开的窗口放回来，并把焦点还给原来那一层。
-
-    注意：这里会把模态**装回去**。装回去的一瞬间，Qt 就会按模态把别的窗口重新禁掉 ——
-    这是对的行为（项目管理本来就是模态的，主窗口本来就该被它挡着）。
-    """
-    for w, how, modality in away:
+    """把刚才让开的窗口放回来，并把焦点还给原来那一层。"""
+    for w, how in away:
         try:
-            _put_back(w, how, modality)
+            _put_back(w, how)
         except Exception:
             continue
     # 再核一遍：让开过、又该回来的窗口必须真的回来。真丢一个，用户看到的就是
     # 「界面全点不动、鼠标拖不动、点一下还咚」——这里补一次，别让它悄悄留在那儿。
-    for w, how, modality in away:
+    for w, how in away:
         try:
             if not w.isVisible():
-                _put_back(w, how, modality)
+                _put_back(w, how)
         except Exception:
             continue
     # 同一个坑的另一面：还挂着应用级模态、却又是看不见的窗口。它会把整个程序挡住，
@@ -826,7 +838,7 @@ def _restore_windows(away: List[tuple], active):
             modal.raise_()
     except Exception:
         pass
-    target = active if any(w is active for w, _, _ in away) else (
+    target = active if any(w is active for w, _ in away) else (
         away[-1][0] if away else None)
     if target is None:
         return
@@ -847,7 +859,7 @@ def _reactivate(away: List[tuple], active):
     这里做两件事：把该在前的窗口再抬一次；然后检查有没有「看不见的模态」残留，
     有就把界面解开。正常情况下这里什么都不用做。
     """
-    target = active if any(w is active for w, _, _ in away) else (
+    target = active if any(w is active for w, _ in away) else (
         away[-1][0] if away else None)
     try:
         if target is not None and target.isVisible():
@@ -862,12 +874,12 @@ def _reactivate(away: List[tuple], active):
         modal = None
     if modal is not None and modal.isVisible():
         return
-    for w, how, modality in away:
+    for w, how in away:
         try:
             if not w.isEnabled():
                 w.setEnabled(True)
             if not w.isVisible():
-                _put_back(w, how, modality)
+                _put_back(w, how)
         except Exception:
             continue
 
