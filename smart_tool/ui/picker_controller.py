@@ -35,10 +35,11 @@ from typing import List, Optional
 from PyQt6.QtCore import Qt, QEventLoop, QObject, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QVBoxLayout, QWidget,
 )
 
+from smart_tool import paths
 from smart_tool.core.element_picker import (
     ARM_JS, DISARM_JS, HIGHLIGHT_JS, PICKER_JS, TOAST_JS, next_shot_path,
 )
@@ -655,6 +656,7 @@ class _SessionGlue(QObject):
 
         留一小段时间让用户看清原因：小窗一闪而过的话，人不知道怎么就结束了。
         """
+        trace_windows(f"浏览器没了：{reason}")
         self.controller.set_phase("closing")
         self.controller.set_hint(reason, ok=False)
         QTimer.singleShot(GONE_LINGER_MS, self._finish)
@@ -688,8 +690,10 @@ def capture_element(url: str, project_dir) -> Optional[dict]:
     controller.finish_requested.connect(finish_once)
 
     hidden, active = [], None
+    trace_windows("capture_element 进入")
     try:
         hidden, active = _hide_tool_windows(controller)
+        trace_windows(f"藏完工具窗口（{len(hidden)} 个）")
         controller.move_to_corner()
         controller.show()
         controller.raise_()
@@ -702,14 +706,18 @@ def capture_element(url: str, project_dir) -> Optional[dict]:
             controller.hide()
         finally:
             _restore_windows(hidden, active)
+            trace_windows("放回工具窗口")
             _shutdown_session(session)
+            trace_windows("关完浏览器")
             # 关完浏览器再确认一次 —— 理由见 _reactivate 的说明
             _reactivate(hidden, active)
+            trace_windows("reactivate 之后")
         # 控制器就此了结（它挂着 _SessionGlue 这个子对象）：显式删掉，
         # 别指望出了作用域被 GC —— 一个曾经置顶的小窗悬在那儿容易惹事。
         controller.deleteLater()
 
     _drop_unused_shots(glue.shots, keep_image=(glue.data or {}).get("image"))
+    trace_windows("capture_element 返回前")
     return glue.data
 
 
@@ -886,3 +894,107 @@ def _first_line(exc, limit: int = 120) -> str:
     """异常信息只留第一行（Playwright 的报错经常是几十行的调用栈）。"""
     text = str(exc).strip().splitlines()
     return (text[0] if text else exc.__class__.__name__)[:limit]
+
+
+# ------------------------------
+# 现场跟踪：专门用来抓「抓完元素之后界面点不动」这个毛病
+# ------------------------------
+# 为什么要有这一块：这种毛病只在真实 Windows 上出现（离屏测试连窗口的
+# 启用/禁用都不模拟，怎么搭都复现不出来）。所以别猜了，把现场记下来：
+# 谁可见、谁被禁用、模态栈顶上是谁、焦点在谁身上。
+# 排查完之后这一整块可以删掉（日志本身是用户数据目录里的 picker_trace.log）。
+TRACE_MAX_BYTES = 200_000
+
+
+def _widget_desc(w) -> str:
+    """一行说清一个窗口/控件当前的状态。"""
+    if w is None:
+        return "None"
+    try:
+        title = w.windowTitle()
+    except Exception:
+        title = ""
+    try:
+        return (f"{type(w).__name__}({title!r} 可见={w.isVisible()}"
+                f" 可用={w.isEnabled()} 模态={w.windowModality().name}"
+                f" 活跃={w.isActiveWindow()})")
+    except Exception:
+        return f"{type(w).__name__}(状态读不出来)"
+
+
+def trace_windows(tag: str):
+    """把当前所有窗口的状态记进 picker_trace.log（用户数据目录里）。
+
+    记日志本身绝不能把程序带崩，所以整段都兜住异常。
+    """
+    try:
+        path = paths.trace_log()
+        if path.is_file() and path.stat().st_size > TRACE_MAX_BYTES:
+            path.write_text("", encoding="utf-8")
+        # tag 一律压成一行（有些原因说明是带换行的，不然日志会散掉）
+        lines = [f"[{datetime.now():%H:%M:%S}] " + " ".join(str(tag).split())[:200]]
+        lines.append("    模态栈顶=" + _widget_desc(QApplication.activeModalWidget())
+                     + "  活动窗口=" + _widget_desc(QApplication.activeWindow())
+                     + "  焦点=" + _widget_desc(QApplication.focusWidget()))
+        for w in QApplication.topLevelWidgets():
+            lines.append("    顶层 " + _widget_desc(w))
+        for w in QApplication.allWidgets():
+            try:
+                if (isinstance(w, QDialog)
+                        and w.windowModality() != Qt.WindowModality.NonModal):
+                    lines.append("    模态 " + _widget_desc(w))
+            except Exception:
+                continue
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+
+
+def trace_later(tag: str, delays_ms=(300, 1500, 4000)):
+    """过一会儿再记一次现场 —— 这一步是**决定性的**。
+
+    如果界面真的卡死（主线程被堵住），这些定时器根本不会触发：日志里看不到
+    这几行，就说明问题不在「窗口状态/模态」，而是主线程被卡在某个地方。
+    反过来，如果几行都记上了、而界面依然是死的，那就是窗口启用/模态的问题。
+    """
+    for delay in delays_ms:
+        QTimer.singleShot(delay, lambda d=delay: trace_windows(f"{tag} +{d}ms"))
+
+
+def release_stuck_modal():
+    """兜底：如果还压着一个「看不见的模态」，把界面救回来。
+
+    这是给「抓完元素界面点不动、拖不动、点一下还咚」留的最后一道闸 ——
+    那种症状就是 Windows 对被禁用窗口的反应，而被禁用的原因是「有个应用级模态
+    压着」，偏偏那个模态窗口你看不见。
+
+    **要在保存框之类的模态都关完之后再叫**：早叫没用，那会儿挡人的东西还没出现。
+    正常情况下这里什么都不做（有看得见的模态是正常的）。
+    """
+    try:
+        modal = QApplication.activeModalWidget()
+    except Exception:
+        return
+    if modal is None or modal.isVisible():
+        return
+    trace_windows(f"发现隐形模态（{type(modal).__name__}），解开它")
+    try:
+        modal.setWindowModality(Qt.WindowModality.NonModal)
+        modal.hide()
+    except Exception:
+        pass
+    for w in QApplication.topLevelWidgets():
+        try:
+            if w is modal or not w.isWindow():
+                continue
+            if w.windowType() not in (Qt.WindowType.Window, Qt.WindowType.Dialog):
+                continue
+            if not w.isEnabled():
+                w.setEnabled(True)
+            if not w.isVisible():
+                w.show()
+        except Exception:
+            continue
+    trace_windows("解开之后")
+

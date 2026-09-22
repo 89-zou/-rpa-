@@ -37,7 +37,9 @@ from smart_tool.ui.element_capture import (
     drop_capture_image, save_captured_locator,
 )
 from smart_tool.ui.help_tip import HelpButton, help_row
-from smart_tool.ui.picker_controller import capture_element
+from smart_tool.ui.picker_controller import (
+    capture_element, release_stuck_modal, trace_later, trace_windows,
+)
 from smart_tool.ui.read_data_panel import ReadDataPanel
 from smart_tool.ui.window_match_dialog import WindowMatchDialog
 
@@ -1410,6 +1412,7 @@ class StepEditDialog(QDialog):
 
     def _capture_element_now(self, target: str):
         """捕获元素（整段包住，异常绝不能逃进 Qt 的事件分发）。"""
+        trace_windows(f"步骤编辑器捕获：开始（{target}）")
         try:
             if self.desktop:
                 self._capture_desktop_control(target)
@@ -1418,6 +1421,11 @@ class StepEditDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "捕获失败",
                                  f"{type(e).__name__}: {e}")
+        finally:
+            # 收尾三件事都在追「抓完元素界面点不动」那件事，见 auth_dialog 的说明
+            trace_windows(f"步骤编辑器捕获：结束（{target}）")
+            release_stuck_modal()
+            trace_later(f"步骤编辑器捕获结束（{target}）")
 
     def _capture_web_element(self, target: str):
         """网页场景：打开浏览器点元素 → 拿到 XPath + 元素图（截图进兜底栏）。"""

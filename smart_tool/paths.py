@@ -181,6 +181,15 @@ def crash_log() -> Path:
     return DATA_DIR / "crash.log"
 
 
+def trace_log() -> Path:
+    """窗口状态跟踪日志（排查「抓完元素界面点不动」用的），也放用户数据目录。
+
+    跟 crash.log 分开：crash.log 只记崩了的异常，这个记的是「没崩但界面废了」
+    的现场（谁可见、谁被禁用、模态栈顶上是谁）。
+    """
+    return DATA_DIR / "picker_trace.log"
+
+
 def ensure_dirs():
     """确保关键目录存在。"""
     PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
