@@ -827,7 +827,16 @@ class StepExecutor:
         if found:
             self.log("  登录态体检通过：已经是登录状态（登录那几步会自动跳过）。")
             return
-        self.log(f"  页面上没有「{xpath}」（登录后才有的元素）→ 判定登录态已失效。")
+        try:
+            where = self._page.url or "（读不到网址）"
+        except Exception:
+            where = "（读不到网址）"
+        self.log(f"  页面上没有「{xpath}」（登录后才有的元素）→ 判定登录态已失效。\n"
+                 f"   当前停在：{where}\n"
+                 "   如果这个页面本身就是登录页，说明登录态没被认下来 —— 检查第一个"
+                 "「打开网页」的网址是不是会强制退出登录（比如 WordPress 的 "
+                 "reauth=1 会清掉登录 cookie），或者干脆把它改成你要操作的那个"
+                 "后台页面。")
         self._auth_expired = True
         raise AuthExpired()
 
