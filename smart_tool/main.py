@@ -68,14 +68,18 @@ def install_crash_handler():
 
 
 def prepare_first_run() -> bool:
-    """首次运行：确认「数据位置」和「浏览器内核」都齐了。返回 False＝退出程序。
+    """首次运行 / 环境检查：确认「数据位置」和「浏览器内核」都齐了。返回 False＝退出程序。
 
-    判断依据（都不用问用户）：
-    · 程序旁边就有 `projects/`（绿色版），或者以前选过位置 → 位置算定好了；
-    · `<数据目录>/浏览器/` 里有 chromium → 内核算装好了。
+    三种状态：
+        (a) 完全没配置过 → 弹 FirstRunDialog 让用户选位置；
+        (b) 配过但目录失效（被删了/搬走了，.smart_tool_home 标记文件找不到）
+            → 弹 FirstRunDialog 的"重新指定"模式，警告上次的目录丢了；
+        (c) 配置有效 → 只检查内核。
 
-    两样都齐就什么都不弹，直接进主界面；缺哪样弹窗口补哪样。
+    用户点了【取消】：位置还没定时直接退出（没地方存数据没法用）；
+    位置已经定过、只是缺内核时照常进主界面（以后跑流程前再装一次）。
     """
+    has_config = bool(paths.configured_data_dir())
     need_path = not paths.data_dir_ready()
     need_kernel = not browser_setup.is_installed()
     if not need_path and not need_kernel:
@@ -83,7 +87,10 @@ def prepare_first_run() -> bool:
 
     from smart_tool.ui.first_run_dialog import FirstRunDialog
 
-    dlg = FirstRunDialog(need_path=need_path, need_kernel=need_kernel)
+    # 有配置值但 data_dir_ready 还是 False → 说明配置失效了
+    reconfigure = has_config and need_path
+    dlg = FirstRunDialog(need_path=need_path, need_kernel=need_kernel,
+                         reconfigure=reconfigure)
     if dlg.exec() == QDialog.DialogCode.Accepted:
         return True
     # 取消：位置都没定就没法用（没地方放项目），只能退出；

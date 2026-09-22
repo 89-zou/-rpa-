@@ -2,15 +2,17 @@
 """首次运行的设置窗口：选一个存放位置，顺手把示例项目和浏览器内核准备好。
 
 什么时候弹（见 main.prepare_first_run）：
-· 程序旁边已经有 `projects/`，或者上次选过位置 → 不弹；
-· 缺浏览器内核 → 弹，但只勾「下载内核」那一步（位置已经是已知的）；
-· 连位置都还没定（真正第一次用）→ 弹，让用户选。
+· 完全没配置过 → 弹，让用户选位置（首次使用）；
+· 配过但目录失效（被删了/搬走了，.smart_tool_home 标记文件找不到）
+  → 弹，标题改成「数据文件夹丢失」，提示用户重新指定；
+· 位置已经有了、只是缺浏览器内核 → 弹，但只勾「下载内核」那一步；
+· 位置和内核都齐 → 不弹。
 
 用户点【取消】：位置还没定时直接退出（没地方存数据没法用）；位置已经有了、
 只是没装内核时照常进主界面（大不了先写流程，跑的时候会提示装内核）。
 
 做三件事：
-1. 把选定的目录写进配置（`paths.set_data_dir`，当场生效）；
+1. 把选定的目录写进配置（`paths.set_data_dir`，当场生效），同时写 .smart_tool_home 标记；
 2. 在里面建 `projects/`，把内置示例项目复制进去；
 3. 把 Chromium 下载到 `<那个目录>/浏览器/`（已经有了就跳过）。
 """
@@ -35,27 +37,45 @@ class FirstRunDialog(QDialog):
     """「第一次使用，先准备一下」窗口。"""
 
     def __init__(self, parent=None, need_path: bool = True,
-                 need_kernel: bool = True):
+                 need_kernel: bool = True, reconfigure: bool = False):
         super().__init__(parent)
-        self.setWindowTitle("第一次使用 ｜ 小邹RPA")
         self.setMinimumWidth(560)
         self._busy = False
         self._need_path = need_path
         self._need_kernel = need_kernel
+        self._reconfigure = reconfigure
 
-        root = QVBoxLayout(self)
-        tip = QLabel(
-            "先选一个存放数据的位置：<b>项目、账号密码、采集结果、浏览器内核</b>"
-            "都会放在这个文件夹里。<br>"
-            "想做成绿色版（整个文件夹拷走就能换电脑用），就选程序所在目录。"
-        )
+        # ---- 标题和顶部说明 ----
+        if reconfigure:
+            self.setWindowTitle("数据文件夹丢失 ｜ 小邹RPA")
+            # 读出上次配置的目录（大概率已经不存在了）
+            old_path = paths.configured_data_dir()
+            old_hint = f"<br>上次用的目录是：<code>{old_path}</code><br>" if old_path else ""
+            tip = QLabel(
+                f"<b>之前指定的数据文件夹找不到了。</b>{old_hint}"
+                "可能是被删了、被移动了，或者整个文件夹被拷走了。<br>"
+                "请重新选一个位置：<b>项目、账号密码、采集结果、浏览器内核</b>"
+                "都会放在这个文件夹里。<br>"
+                "想做成绿色版（整个文件夹拷走就能换电脑用），就选程序所在目录。"
+            )
+        else:
+            self.setWindowTitle("第一次使用 ｜ 小邹RPA")
+            tip = QLabel(
+                "先选一个存放数据的位置：<b>项目、账号密码、采集结果、浏览器内核</b>"
+                "都会放在这个文件夹里。<br>"
+                "想做成绿色版（整个文件夹拷走就能换电脑用），就选程序所在目录。"
+            )
         tip.setWordWrap(True)
+        root = QVBoxLayout(self)
         root.addWidget(tip)
 
         row = QWidget()
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
-        self.path_edit = QLineEdit(str(paths.suggested_data_dir()))
+        # reconfigure 模式下，把之前的路径预填进去让用户参考
+        prev_path = paths.configured_data_dir() if reconfigure else ""
+        default_path = prev_path if prev_path else str(paths.suggested_data_dir())
+        self.path_edit = QLineEdit(default_path)
         self.path_edit.textChanged.connect(self._refresh_state)
         row_layout.addWidget(self.path_edit, 1)
         self.btn_browse = QPushButton("浏览…")

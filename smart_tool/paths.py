@@ -12,12 +12,16 @@
 
 数据目录按这个顺序定（绿色版优先，尽量不往 C 盘塞东西）：
 
-    1) 设置里选过 → 用选的那个；
+    1) 配置里记着的 `data_dir` 目录存在且带 `.smart_tool_home` 标记文件 → 用它；
     2) 程序旁边就有 `projects/` → 就用程序目录（整个文件夹拷走即搬家）；
-    3) 都没有 → 先落在 `%APPDATA%\\小邹RPA`，并提示用户选一个正式位置。
+    3) 都没有 → 落到 `%APPDATA%\\小邹RPA` **占位**，但不会自动创建任何东西。
 
 前两条都在启动时判定一次；第 3 种情况由首次运行的设置窗口负责 ——
-用户选好路径后会写进配置（`%APPDATA%\\小邹RPA\\config.json`）并当场生效。
+用户选好路径后会写进配置（`%APPDATA%\\小邹RPA\\config.json`）并当场生效，
+同时在目标目录里写 `.smart_tool_home` 标记文件。下次启动如果找不到标记文件，
+说明目录被删了/搬走了，会再次弹出设置窗口让用户重新指定。
+
+**绝不静默在 APPDATA 里自动创建 projects/、浏览器/ 等数据文件夹**。
 """
 import json
 import os
@@ -33,6 +37,11 @@ DEMO_PROJECT_NAME = "采集示例-登录与采集"
 #: 配置目录（用户级，永远可写）
 CONFIG_DIR = Path(os.environ.get("APPDATA") or Path.home()) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"
+
+#: 用户数据目录的标记文件（set_data_dir 时写入，用来验证目录是否真的是本程序的家）
+#: 为什么要它：光检查 projects/ 或 浏览器/ 太脆弱，任意文件夹碰巧有这些子目录就会被认对；
+#: 这个文件由本程序写入，独一无二。
+MARKER_FILE = ".smart_tool_home"
 
 
 def _bundle_dir() -> Path:
@@ -107,14 +116,21 @@ def configured_data_dir() -> str:
 
 
 def _resolve_data_dir() -> Path:
+    """启动时定数据目录。
+
+    优先级：
+        1) 配置里记着的目录存在且有效（有标记文件）→ 用它；
+        2) 程序旁边就有 projects/（绿色版）→ 就用程序目录；
+        3) 都没有 → 落到 CONFIG_DIR 占位（但不会自动创建，得等首次运行的窗口来正式定）。
+    """
     custom = configured_data_dir()
     if custom:
         try:
             p = Path(custom).expanduser()
-            p.mkdir(parents=True, exist_ok=True)
-            return p
+            if p.is_dir():                # 只验证存在，不自动创建
+                return p
         except OSError:
-            pass                    # 指定的目录不可用就退回默认，别让程序起不来
+            pass                    # 配置里的路径有问题就跳过，别让程序起不来
     if (app_dir() / "projects").is_dir():    # 绿色版：程序旁边就有 projects/
         return app_dir()
     return CONFIG_DIR
@@ -125,12 +141,31 @@ DATA_DIR = _resolve_data_dir()
 PROJECTS_DIR = DATA_DIR / "projects"
 
 
+def data_dir_valid() -> bool:
+    """配置里的 data_dir 目录还存在且有效吗？
+
+    有效＝目录存在 + 里面有本程序的标记文件（.smart_tool_home）。
+    这样用户把整个文件夹拷走/删掉/改名后，程序会及时发现并提示重新指定，
+    而不是静默回退到 APPDATA 乱建文件夹。
+    """
+    custom = configured_data_dir()
+    if not custom:
+        return False
+    try:
+        p = Path(custom).expanduser()
+        return (p.is_dir() and (p / MARKER_FILE).is_file())
+    except OSError:
+        return False
+
+
 def data_dir_ready() -> bool:
-    """数据目录是不是已经定下来了（配置里选过，或程序旁边本来就有 projects/）。
+    """数据目录是不是已经定下来了（配置有效，或程序旁边本来就有 projects/）。
 
     没定下来＝第一次使用，启动时要让用户选一个位置。
+    配置里有 data_dir 但目录失效（被删了/搬走了）也会返回 False，
+    让用户重新指定，而不是偷偷在 APPDATA 里建东西。
     """
-    if configured_data_dir():
+    if data_dir_valid():
         return True
     return (app_dir() / "projects").is_dir()
 
@@ -165,10 +200,18 @@ def set_data_dir(path) -> Path:
     """把「用户数据目录」定下来：写进配置，并**当场生效**（改内存里的模块变量）。
 
     启动早期（建主界面之前）调用最省事，不用重启程序。
+    会在目录里写一个标记文件（.smart_tool_home），下次启动用它验证目录没丢。
     """
     global DATA_DIR, PROJECTS_DIR
     target = Path(str(path)).expanduser().resolve()
     target.mkdir(parents=True, exist_ok=True)
+    # 写标记文件，让下次启动能认出这是本程序的家
+    marker = target / MARKER_FILE
+    try:
+        marker.write_text(f"小邹RPA 数据目录\ncreated: {marker.stat().st_mtime:.0f}",
+                          encoding="utf-8")
+    except OSError:
+        pass                              # 写不进就跳过，别因此报死
     save_config(data_dir=str(target))
     DATA_DIR = target
     PROJECTS_DIR = DATA_DIR / "projects"
