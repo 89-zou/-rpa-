@@ -5,6 +5,16 @@
 它会在你划过元素时画出橙框、并实时显示「这个选择器命中几个」；点一下就把结果
 通过 `window.__trae_pick` 回传给 Python。
 
+「打断 / 恢复」靠一个开关：脚本里的监听只装一次，之后由 `window.__traePickerOn`
+决定它们干不干活。捕获中＝true（划过画框、点击吃掉并捕获）；打断＝false
+（监听还在但直接放行，用户能正常翻页、登录、展开菜单）。这样打断不用拆监听、
+恢复不用重装，来回切不会漏事件。
+
+配套的三个小脚本：
+- `ARM_JS` / `DISARM_JS`：就是把这个开关拨过去（外加收起浮层）
+- `HIGHLIGHT_JS`：元素校验用——把元素滚到可见处、画个绿框，并返回命中几个
+- `TOAST_JS`：把一句话贴在页面顶端（校验结果、出错提示都走它）
+
 XPath 生成策略（从稳到糙，逐级退让）：
 1. 元素自己的 id 唯一        → //*[@id="xxx"]
 2. 最近的「带 id 的祖先」做锚点 → //*[@id="anc"]/div[2]/span[1]
@@ -204,7 +214,7 @@ PICKER_JS = r"""
       toast.textContent = '✓ 已捕获第 ' + window.__traePickTotal + ' 个：' + labelOf(el)
         + '\nXPath：' + (cand.path || '（生成失败）') + '　命中 ' + hits + ' 个'
         + (hits === 1 ? '' : '（不唯一，建议重抓一个更准的）')
-        + '\n回到「元素捕获」窗口点【完成】即可写进步骤';
+        + '\n点控制器上的【结束】即可写进步骤；想先自己操作页面就点【打断】';
       toast.style.display = 'block';
       if (window.__traeOkTimer) { clearTimeout(window.__traeOkTimer); }
       window.__traeOkTimer = setTimeout(function () {
@@ -216,6 +226,7 @@ PICKER_JS = r"""
 
   function disarm() {
     window.__traePickerReady = false;
+    window.__traePickerOn = false;          // 拨到「打断」：监听还在，但一律放行
     if (window.__traeMountTimer) { clearInterval(window.__traeMountTimer); }
     removeEventListener('mousemove', onMove, true);
     removeEventListener('click', onClick, true);
@@ -226,6 +237,8 @@ PICKER_JS = r"""
   var lastEl = null, lastAt = 0;
 
   function onMove(e) {
+    // 打断状态：什么都不做，让鼠标事件正常传给页面
+    if (!window.__traePickerOn) { return; }
     var el = e.target;
     if (!el || el.nodeType !== 1 || el === box || el === tip) { return; }
     var now = Date.now();
@@ -236,6 +249,8 @@ PICKER_JS = r"""
   }
 
   function onClick(e) {
+    // 打断状态：不吞事件，用户就是在正常操作网页
+    if (!window.__traePickerOn) { return; }
     var el = e.target;
     if (!el || el.nodeType !== 1) { return; }
     e.preventDefault();
@@ -266,6 +281,87 @@ PICKER_JS = r"""
   addEventListener('click', onClick, true);
   addEventListener('keydown', onKey, true);
 })();
+"""
+
+
+#: 【恢复】把开关拨回「捕获中」——划过画框、点击吃掉并捕获
+ARM_JS = r"""
+  () => { window.__traePickerOn = true; return true; }
+"""
+
+#: 【打断】把开关拨到「放行」，顺手收起橙框与提示条
+#: （故意不动 ok / toast 两个浮层：校验结果可能还挂在页面上）
+DISARM_JS = r"""
+  () => {
+    try {
+      window.__traePickerOn = false;
+      var b = window.__traeLayer_box, t = window.__traeLayer_tip;
+      if (b) { b.style.display = 'none'; }
+      if (t) { t.style.display = 'none'; }
+      return true;
+    } catch (e) { return false; }
+  }
+"""
+
+#: 【校验元素】把元素滚到可见处 + 画绿框，并回传「命中几个」。
+#: 返回值：>0 命中个数；0 = 页面上找不到；-1 = XPath 写错了。
+#: 命中几个跟「能不能用」是两件事：命中多个说明这个写法不够准，得改。
+HIGHLIGHT_JS = r"""
+  (xpath) => {
+    try {
+      var r = document.evaluate(xpath, document, null,
+        XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+      var n = r.snapshotLength;
+      if (n < 1) { return 0; }
+      var el = r.snapshotItem(0);
+      if (el.scrollIntoView) { el.scrollIntoView({block: 'center'}); }
+      var ok = window.__traeLayer_ok;
+      if (ok) {
+        var b = el.getBoundingClientRect();
+        ok.style.left = b.left + 'px';
+        ok.style.top = b.top + 'px';
+        ok.style.width = b.width + 'px';
+        ok.style.height = b.height + 'px';
+        ok.style.display = 'block';
+        if (window.__traeCheckTimer) { clearTimeout(window.__traeCheckTimer); }
+        window.__traeCheckTimer = setTimeout(function () {
+          ok.style.display = 'none';
+        }, 2500);
+      }
+      return n;
+    } catch (e) { return -1; }
+  }
+"""
+
+#: 把一句话贴在页面顶端（校验结果、出错提示走它）。
+#: 刻意做成自给自足：浮层不在就自己建一个 —— 反馈画在页面上，
+#: 用户才不会盯着控制器那一行小字猜页面里到底发生了什么。
+TOAST_JS = r"""
+  (payload) => {
+    try {
+      var t = window.__traeLayer_toast;
+      if (!t) {
+        t = document.createElement('div');
+        t.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;'
+          + 'left:50%;top:14px;transform:translateX(-50%);max-width:86vw;'
+          + 'color:#fff;font:13px/1.7 "Microsoft YaHei",sans-serif;'
+          + 'padding:9px 16px;border-radius:8px;white-space:pre-wrap;text-align:center;'
+          + 'box-shadow:0 6px 20px rgba(0,0,0,.4)';
+        window.__traeLayer_toast = t;
+      }
+      if (!document.documentElement.contains(t)) {
+        document.documentElement.appendChild(t);
+      }
+      t.textContent = payload.text || '';
+      t.style.background = payload.ok ? '#15803d' : '#b45309';
+      t.style.display = 'block';
+      if (window.__traeToastTimer) { clearTimeout(window.__traeToastTimer); }
+      window.__traeToastTimer = setTimeout(function () {
+        t.style.display = 'none';
+      }, 3500);
+      return true;
+    } catch (e) { return false; }
+  }
 """
 
 
