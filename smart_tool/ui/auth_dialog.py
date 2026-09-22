@@ -28,7 +28,9 @@ from smart_tool.ui.element_capture import (
     drop_capture_image, save_captured_locator,
 )
 from smart_tool.ui.help_tip import help_row
-from smart_tool.ui.picker_controller import capture_element
+from smart_tool.ui.picker_controller import (
+    capture_element, release_stuck_modal, trace_later, trace_windows,
+)
 
 NO_AUTH_TEXT = "（不使用登录态）"
 XPATH_PLACEHOLDER = "（下拉＝本项目已用过的定位）"
@@ -337,37 +339,46 @@ class AuthDialog(QDialog):
         """捕获元素：点一下页面上的元素，XPath 自动填进来。"""
         if self.store is None:
             return
-        url = self._default_url()
-        if not url:
-            QMessageBox.information(
-                self, "先加一个「打开网页」",
-                "这个项目里还没有「打开网页」节点，捕获器不知道该打开哪个网址。\n"
-                "可以在【流程编辑…】里加一步「打开网页」，或者直接手工填 XPath。",
-            )
-            return
+        trace_windows("登录态捕获：开始")
         try:
-            data = capture_element(url, self.store.dir)
-        except Exception as e:
-            QMessageBox.critical(self, "捕获失败", f"{type(e).__name__}: {e}")
-            return
-        if not data:
-            return
-        xpath = (data.get("xpath") or "").strip()
-        if not xpath:
-            QMessageBox.information(self, "没抓到 XPath", "换个元素再点一下试试。")
-            return
-        self.check_edit.setEditText(xpath)
-        self._save_config()
-        count = data.get("count", 1)
-        # 体检只要 XPath，捕获时顺手存下的元素截图这里用不上，删掉别在 img/ 里堆废图
-        drop_capture_image(self.store.dir, data)
-        saved = save_captured_locator(self, self.store.dir, data)
-        self.state_label.setText(
-            f"已捕获：{data.get('desc') or '元素'} → {xpath}"
-            + ("" if count == 1 else f"（命中 {count} 个，最好换个更准的）")
-            + (f"；已存成元素定位 {{{{{saved}}}}}" if saved else "")
-        )
-        self.state_label.setStyleSheet("color:#0f766e;")
+            url = self._default_url()
+            if not url:
+                QMessageBox.information(
+                    self, "先加一个「打开网页」",
+                    "这个项目里还没有「打开网页」节点，捕获器不知道该打开哪个网址。\n"
+                    "可以在【流程编辑…】里加一步「打开网页」，或者直接手工填 XPath。",
+                )
+                return
+            try:
+                data = capture_element(url, self.store.dir)
+            except Exception as e:
+                QMessageBox.critical(self, "捕获失败", f"{type(e).__name__}: {e}")
+                return
+            trace_windows("capture_element 回来了")
+            if not data:
+                return
+            xpath = (data.get("xpath") or "").strip()
+            if not xpath:
+                QMessageBox.information(self, "没抓到 XPath", "换个元素再点一下试试。")
+                return
+            self.check_edit.setEditText(xpath)
+            self._save_config()
+            count = data.get("count", 1)
+            # 体检只要 XPath，捕获时顺手存下的元素截图这里用不上，删掉别在 img/ 里堆废图
+            drop_capture_image(self.store.dir, data)
+            saved = save_captured_locator(self, self.store.dir, data)
+            self.state_label.setText(
+                f"已捕获：{data.get('desc') or '元素'} → {xpath}"
+                + ("" if count == 1 else f"（命中 {count} 个，最好换个更准的）")
+                + (f"；已存成元素定位 {{{{{saved}}}}}" if saved else "")
+            )
+            self.state_label.setStyleSheet("color:#0f766e;")
+        finally:
+            # 收尾三件事都在追「抓完元素界面点不动」那件事，一个都不能省：
+            #   记一次现场 → 万一留下隐形模态立刻解开 → 之后再查三次
+            trace_windows("登录态捕获：结束")
+            release_stuck_modal()
+            trace_later("登录态捕获结束")
 
     def _default_url(self) -> str:
         """捕获器默认打开的网址：项目里第一个「打开网页」。"""

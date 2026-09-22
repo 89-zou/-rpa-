@@ -13,6 +13,7 @@ from pathlib import Path
 from PyQt6.QtWidgets import QInputDialog
 
 from smart_tool.core.project_store import ProjectStore
+from smart_tool.ui.picker_controller import release_stuck_modal, trace_windows
 
 
 def drop_capture_image(project_dir, data: dict) -> None:
@@ -65,6 +66,7 @@ def save_captured_locator(parent, project_dir, data: dict) -> str:
     for name, value in locators.items():
         if value.strip() == xpath:
             return name
+    trace_windows("保存框弹出前")
     name, ok = QInputDialog.getText(
         parent, "存成「元素定位」",
         "要不要把这次抓到的元素存下来？\n"
@@ -74,6 +76,9 @@ def save_captured_locator(parent, project_dir, data: dict) -> str:
         f"XPath：{xpath[:150]}",
         text=guess_locator_name(data, locators),
     )
+    trace_windows("保存框关掉后")
+    # 这一刻正是用户报「界面点不动」的地方：查一遍有没有留下隐形模态
+    release_stuck_modal()
     name = (name or "").strip()
     if not ok or not name:
         return ""
