@@ -744,16 +744,29 @@ class StepExecutor:
                 "   紧急情况把鼠标猛地甩到屏幕左上角可急停；"
                 "用不了时会自动退回普通点击。"
             )
-        use_auth = bool(self._auth_path) and self._auth_path.exists()
+        # 用之前要过 is_usable：只看 exists() 的话，一个 0 字节或写坏的文件也会被
+        # 当成「有登录态」，交给 Playwright 的 storage_state 会抛解析错、整轮跑不起来。
+        use_auth = bool(self._auth_path) and auth_store.is_usable(self._auth_path)
         if use_auth:
             self.log(f"使用登录态「{self._auth_name}」"
                      f"（{auth_store.describe_path(self._auth_path)}）")
             if not self._auth_check_locator:
                 self.log("   注意：没配「登录后才有的元素」，没法自动发现登录态失效。"
                          "建议去【项目管理…】→【登录态】里填一个（比如后台菜单的 XPath）。")
+        elif self._auth_path and self._auth_path.exists():
+            self.log(f"登录态「{self._auth_name}」的文件用不了（空的或格式不对）："
+                     f"{self._auth_path.name}\n"
+                     "   这次会走完整流程，跑完会重新写一份；也可以去"
+                     "【项目管理…】→【登录态】把它删掉重来。")
         elif self._auth_path:
             self.log(f"登录态「{self._auth_name}」还没保存过："
                      "这次会走完整流程，跑完自动存一份，以后直接登录。")
+        else:
+            # 名字是空的时候什么都不提示，用户会一直纳闷「为什么总要重登」——
+            # 这里必须说清楚（设名字是唯一入口，而它藏在可编辑的下拉框里）。
+            self.log("没选登录态：这次会走完整登录流程（标了「登录用」的组合也不会被跳过）。\n"
+                     "   想复用登录态：【项目管理…】→【登录态】→ 在「运行时使用」里"
+                     "敲一个名字（比如 默认登录）→ 回车；跑一遍流程就会自动存下来。")
         try:
             self._run_browser(nodes, use_auth=use_auth)
         except AuthExpired:
