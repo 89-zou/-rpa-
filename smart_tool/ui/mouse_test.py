@@ -3,24 +3,80 @@
 
 · 网页场景：另开一个浏览器窗口，打开项目里第一个「打开网页」的地址 →
   等起点元素出现 → 按住拖过去。浏览器**留给你自己看**（关掉那个窗口就结束）。
-· 桌面场景：先把编辑器收起来，倒数 3 秒，再从模板图（没配图＝当前鼠标位置）
+· 桌面场景：先把编辑器让到屏幕外，倒数 3 秒，再从模板图（没配图＝当前鼠标位置）
   真拖一次 —— 拖的就是你屏幕上正开着的那个程序。
 
 拖动本身要花几百毫秒到几秒，还可能要在屏幕上找图（最长几秒），所以整套都放在
 后台线程里跑，结果用信号回到主线程弹窗 —— 不然界面会卡死。
+
+两条血泪规矩（踩过，别改回去）：
+1. **不能用 hide() 让开编辑器**：它是个正在 exec() 的模态对话框，hide() 会让
+   exec() 立刻返回 —— 调用方以为用户取消了、把编辑器销毁，随后我们再碰它就是
+   访问已销毁的窗口，PyQt6 直接 abort（0xC0000409 闪退）。
+   正确做法是**挪到屏幕外**（picker_controller 的「坑一」记着同一件事）。
+2. **线程不给编辑器当 Qt 子对象**：子对象会跟着编辑器一起销毁，销毁一个还在跑的
+   QThread 同样是直接 abort。所以线程的 parent 传 None，另用模块级集合拿住强引用。
 """
 import time
 from pathlib import Path
 from typing import Callable, Optional, Sequence, Tuple
 
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 from smart_tool.core import desktop
+from smart_tool.ui.picker_controller import OFFSCREEN
 
 #: 试拖时在屏幕上找图最多等几秒（正式运行是 desktop.DEFAULT_WAIT_S＝10 秒）
 TRY_WAIT_S = 6.0
 #: 网页起点元素最多等几秒（页面刚打开，慢站点留点余量）
 TRY_ELEMENT_TIMEOUT_MS = 20000
+
+#: 正在跑的试拖线程。线程的 Qt parent 是 None（见文件头的「规矩 2」），
+#: 所以必须在这儿拿住强引用，否则 Python 一 GC 就是个「销毁运行中的线程」→ 闪退。
+_RUNNING: set = set()
+
+
+def _keep_alive(thread) -> None:
+    _RUNNING.add(thread)
+    thread.finished.connect(lambda: _RUNNING.discard(thread))
+
+
+def _alive(widget) -> bool:
+    """这个窗口对象还在吗（编辑器可能已经被调用方销毁了）。"""
+    try:
+        from PyQt6 import sip
+        return widget is not None and not sip.isdeleted(widget)
+    except Exception:
+        return widget is not None
+
+
+def _push_aside(widget):
+    """把编辑器挪到屏幕外，返回原来的位置（挪回来时用）。
+
+    不能 hide：正在 exec() 的对话框一 hide，exec() 就结束了（见文件头规矩 1）。
+    """
+    try:
+        was_max = bool(widget.windowState() & Qt.WindowState.WindowMaximized)
+        pos = widget.pos()
+        if was_max:
+            widget.showNormal()         # 最大化时 move 不生效，先还原
+        widget.move(OFFSCREEN, OFFSCREEN)
+        return (pos, was_max)
+    except Exception:
+        return None
+
+
+def _put_back(widget, state):
+    """把挪走的编辑器放回原处。"""
+    if not state:
+        return
+    pos, was_max = state
+    try:
+        widget.move(pos)
+        if was_max:
+            widget.showMaximized()
+    except Exception:
+        pass
 
 
 def _clamp(x: float, y: float, w: float, h: float) -> Tuple[float, float]:
@@ -245,10 +301,14 @@ def try_drag_desktop(parent, project_dir: Path, image: str, win_title: str = "",
                      threshold: float = 0.0, angle: float = 0.0,
                      percent: int = 50, duration: float = 0.5
                      ) -> DesktopDragTry:
-    """藏起编辑器 → 真拖一次 → 回来报结果（弹窗）。返回线程，关窗时要 stop 它。"""
+    """把编辑器让到屏幕外 → 真拖一次 → 挪回来报结果。
+
+    线程的 parent 传 None、由 _RUNNING 拿住引用：编辑器要是被调用方销毁了，
+    线程也不能跟着陪葬（见文件头的两条规矩）。返回线程，关窗时要 stop 它。
+    """
     from PyQt6.QtWidgets import QMessageBox
     QMessageBox.information(parent, "试拖一下", (
-        "点【OK】后会把编辑器收起来，倒数 3 秒再开始真拖一次。\n\n"
+        "点【OK】后会把编辑器让到屏幕外，倒数 3 秒再开始真拖一次。\n\n"
         "先把手从鼠标上拿开，并让要拖的那个窗口显示在最前面\n"
         "（这一步拖的是你屏幕上的真实程序）。"
     ))
@@ -256,18 +316,19 @@ def try_drag_desktop(parent, project_dir: Path, image: str, win_title: str = "",
                             window=window, offset=offset,
                             window_size=window_size, feature=feature,
                             threshold=threshold, angle=angle, percent=percent,
-                            duration=duration, parent=parent)
+                            duration=duration)
+    _keep_alive(thread)
+    state = {"pos": _push_aside(parent)}
 
     def _on_done(ok: bool, text: str):
-        if getattr(parent, "_closing", False):
-            return                  # 编辑器已经关掉了，别再把弹窗叫出来
-        parent.show()               # 拖之前把它藏起来了，现在放回来
+        if not _alive(parent) or not parent.isVisible():
+            return                  # 编辑器已经被关掉/销毁了，别再把弹窗叫出来
+        _put_back(parent, state["pos"])
         (QMessageBox.information if ok else QMessageBox.warning)(
             parent, "试拖结果", text)
 
     thread.done.connect(_on_done)
     thread.start()
-    parent.hide()                   # 别让编辑器挡住（也可能挡住鼠标要拖的位置）
     return thread
 
 
@@ -275,17 +336,21 @@ def try_drag_web(parent, project_dir: Path, url: str, xpath: str,
                  loc_type: str = "xpath", angle: float = 0.0,
                  percent: int = 50, duration: float = 0.5,
                  on_log: Optional[Callable[[str], None]] = None) -> WebDragTry:
-    """开浏览器真拖一次；结果弹窗报回来，浏览器留着给用户看。"""
+    """开浏览器真拖一次；结果弹窗报回来，浏览器留着给用户看。
+
+    网页这条不用让开编辑器（浏览器窗口自己会到最前面），但线程同样不给编辑器
+    当子对象 —— 编辑器被销毁时线程还得活着把浏览器关掉。
+    """
     from PyQt6.QtWidgets import QMessageBox
     thread = WebDragTry(url, xpath, project_dir, loc_type=loc_type,
-                        angle=angle, percent=percent, duration=duration,
-                        parent=parent)
+                        angle=angle, percent=percent, duration=duration)
+    _keep_alive(thread)
     if on_log is not None:
         thread.log.connect(on_log)
 
     def _on_done(ok: bool, text: str):
-        if getattr(parent, "_closing", False):
-            return                  # 编辑器已经关掉了，别再把弹窗叫出来
+        if not _alive(parent) or not parent.isVisible():
+            return                  # 编辑器已经被关掉/销毁了，别再把弹窗叫出来
         (QMessageBox.information if ok else QMessageBox.warning)(
             parent, "试拖结果", text)
 

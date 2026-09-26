@@ -447,7 +447,6 @@ class StepEditDialog(QDialog):
         self._actions = DESKTOP_ACTIONS if self.desktop else WEB_ACTIONS
         # 【试拖一下】的后台线程（网页那次会一直开着浏览器，直到窗口关掉）
         self._drag_try = None
-        self._closing = False
         self.setWindowTitle(("编辑步骤" if self._editing else "新建步骤")
                             + ("（桌面应用）" if self.desktop else ""))
         self.setMinimumWidth(760)
@@ -1366,7 +1365,6 @@ class StepEditDialog(QDialog):
 
     def done(self, result: int):
         """窗口关掉时，把「试拖」的后台线程收掉（它会关掉自己开的浏览器）。"""
-        self._closing = True
         if self._drag_try is not None and self._drag_try.isRunning():
             self._drag_try.stop()
             self._drag_try.wait(4000)
