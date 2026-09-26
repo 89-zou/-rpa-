@@ -92,6 +92,9 @@ MOUSEEVENTF_LEFTUP = 0x0004
 #: 滚轮事件；dwData 里放滚动量，一格＝120（Windows 的标准刻度）
 MOUSEEVENTF_WHEEL = 0x0800
 WHEEL_DELTA = 120
+#: 一次最多滚几格：桌面填的是「格」，但网页那边填的是「像素」——
+#: 手滑把 500 填进桌面项目里，就是滚 500 格（十来秒），这儿兜一下
+MAX_SCROLL_CLICKS = 50
 
 
 class _POINT(ctypes.Structure):
@@ -1067,6 +1070,7 @@ def scroll(clicks: int, x: Optional[float] = None, y: Optional[float] = None):
     窗口的，光标不在目标窗口上就是白滚（哪怕这个窗口在前台）。
     """
     n = int(clicks or 0)
+    n = max(-MAX_SCROLL_CLICKS, min(MAX_SCROLL_CLICKS, n))
     if not n:
         return
     if x is not None and y is not None:

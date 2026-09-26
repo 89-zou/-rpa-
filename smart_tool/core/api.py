@@ -166,6 +166,43 @@ ACTION_SPECS: Dict[str, Dict[str, Any]] = {
                 "也可以写它显示的文字。",
         "fields": [LOCATOR_FIELD, f("value", "str", "选哪一项", True)] + WAIT_FIELDS,
     },
+    "drag": {
+        "label": "鼠标拖拽", "scenes": [SCENE_WEB, SCENE_DESKTOP],
+        "desc": "按住起点 → 朝一个方向拖一段 → 松开：拖滑块、进度条、列表项、"
+                "地图、文件都用它。方向是圆盘角度（0°＝右、90°＝下、顺时针），"
+                "距离是「屏幕（桌面）/ 浏览器视口（网页）较短边」的百分比，"
+                "终点会自动钳在屏幕 / 视口里。拖动走拟人轨迹（缓入缓出＋轻微弧度），"
+                "滑块验证码那种会检查按住期间采样点的场景也不容易被认出来。",
+        "fields": [dict(LOCATOR_FIELD, required=False,
+                        desc=LOCATOR_FIELD["desc"] +
+                        "。【鼠标拖拽】的起点就是它：网页必填（不填体检会报"
+                        "「没填起点」）；桌面留空＝从当前鼠标位置开始拖"),
+                   f("drag_angle", "float",
+                     "方向角度（度）：0＝右、90＝下、180＝左、270＝上，顺时针；"
+                     "45＝右下、315＝右上", default=0),
+                   f("drag_percent", "int",
+                     "拖多远：屏幕 / 视口较短边的百分之几（1~100）", default=50),
+                   f("drag_duration", "float", "拖过去用几秒（慢一点更像人）",
+                     default=0.5)] + WAIT_FIELDS,
+    },
+    "wheel": {
+        "label": "鼠标滚轮", "scenes": [SCENE_WEB, SCENE_DESKTOP],
+        "desc": "把滚轮往上 / 往下滚一段：懒加载的列表（滚一屏才出一批）、"
+                "把挡路的固定表头滚开、无限滚动翻页。网页按像素算，"
+                "并且会先把鼠标挪到页面中间再滚（不挪可能滚的是某个内嵌滚动区）；"
+                "桌面按格算（1 格 ≈ 3 行），会先把光标挪到定位图 / 窗口上再滚"
+                "（滚轮消息发给光标底下的窗口）。",
+        "fields": [dict(LOCATOR_FIELD, required=False,
+                        desc="选填：滚之前光标先挪到哪儿（桌面场景填 img/ 里的"
+                             "模板图名，或描述「窗口标题」）。网页场景用不到"
+                             "（运行时统一挪到页面中间再滚）"),
+                   f("wheel_direction", "str", "滚的方向", default="down",
+                     choices=["down", "up"]),
+                   f("wheel_amount", "int",
+                     "滚多少：网页＝像素（默认 500，一「格」≈100 像素）；"
+                     "桌面＝格数（默认 3，一次最多 50 格）", default=500)]
+                  + WAIT_FIELDS,
+    },
     "collect": {
         "label": "采集数据", "scenes": [SCENE_WEB],
         "desc": "把页面上的东西采下来：结果追加到 data/records.jsonl，"
@@ -357,7 +394,7 @@ def _all_fields(action: str, spec: Dict[str, Any]) -> List[Dict[str, Any]]:
     add(COMMON_FIELDS)
     if action != "condition_start":
         add(RULE_FIELDS)
-    if action in ("click", "fill", "select", "captcha"):
+    if action in ("click", "fill", "select", "captcha", "drag", "wheel"):
         add(IMAGE_FIELDS)      # 这几个动作都会用到图片匹配
     return fields
 
@@ -713,6 +750,15 @@ def _summary(step: Step) -> str:
         return f"暂停等人工（{step.resume_condition}）：{step.prompt}"
     if a == "win_activate":
         return f"激活窗口 {step.win_title}"
+    if a == "drag":
+        from smart_tool.core.desktop import angle_text
+        where = (step.locator.value if step.locator and step.locator.value
+                 else "当前鼠标位置")
+        return (f"拖拽：{where} 朝 {angle_text(step.drag_angle)} "
+                f"拖 {int(step.drag_percent or 0)}%")
+    if a == "wheel":
+        up = (step.wheel_direction or "down") == "up"
+        return f"滚轮：{'向上' if up else '向下'}滚 {int(step.wheel_amount or 0)}"
     if a == "hotkey":
         return f"按键 {step.keys}"
     if a == "delay":
@@ -853,7 +899,8 @@ def _step_from_dict(d: Dict[str, Any]) -> Step:
             kw["image_threshold"] = float(d["image_threshold"])
         except (TypeError, ValueError):
             raise ApiError("image_threshold 要填个数字，如 0.7（留空＝用默认 0.80）")
-    if d.get("win_title") and action in ("click", "fill", "select", "captcha"):
+    if d.get("win_title") and action in ("click", "fill", "select", "captcha",
+                                         "drag", "wheel"):
         # 桌面场景：这几个动作用 win_title 记「属于哪个窗口」
         kw["win_title"] = str(d["win_title"])
 

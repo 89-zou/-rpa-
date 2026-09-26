@@ -27,16 +27,18 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from smart_tool.core import blocks, free_code, project_store
+from smart_tool.core import blocks, desktop, free_code, project_store
 from smart_tool.core.project_store import Locator, Step
 from smart_tool.ui.captcha_panel import CaptchaPanel
 from smart_tool.ui.code_editor import CodeEditor
 from smart_tool.ui.collect_panel import CollectPanel
 from smart_tool.ui.desktop_picker import DesktopPickerDialog
+from smart_tool.ui.drag_dial import DragDial
 from smart_tool.ui.element_capture import (
     drop_capture_image, save_captured_locator,
 )
 from smart_tool.ui.help_tip import HelpButton, help_row
+from smart_tool.ui import mouse_test
 from smart_tool.ui.picker_controller import (
     capture_element, release_stuck_modal, trace_later, trace_windows,
 )
@@ -45,13 +47,15 @@ from smart_tool.ui.window_match_dialog import WindowMatchDialog
 
 # 网页场景能用的动作
 WEB_ACTIONS = [
-    "navigate", "read_data", "collect", "captcha", "click", "fill", "select",
+    "navigate", "read_data", "collect", "captcha", "click", "drag", "wheel",
+    "fill", "select",
     "note", "pause_for_human", "loop_start", "loop_end", "condition_start",
     "condition_end", "script", "call",
 ]
 # 桌面场景能用的动作（没有浏览器，也就没有 XPath / 下拉选择）
 DESKTOP_ACTIONS = [
-    "win_activate", "captcha", "click", "fill", "hotkey", "delay", "read_data",
+    "win_activate", "captcha", "click", "drag", "wheel", "fill", "hotkey",
+    "delay", "read_data",
     "note", "pause_for_human", "loop_start", "loop_end", "condition_start",
     "condition_end", "script", "call",
 ]
@@ -64,6 +68,8 @@ ACTION_LABELS = {
     "captcha": "验证码 captcha（滑块拼图 / 文字点选 / 计算题，自动识别并操作）",
     "note": "提示 / 日志 note（画布上写一句说明；运行时把内容打进日志，可含 {{变量}}）",
     "click": "点击 click",
+    "drag": "鼠标拖拽 drag（从起点按住，朝圆盘方向拖过去再松开）",
+    "wheel": "鼠标滚轮 wheel（向上 / 向下滚动）",
     "fill": "填入 fill",
     "select": "下拉选择 select",
     "pause_for_human": "暂停等人工 pause_for_human",
@@ -81,6 +87,8 @@ ACTION_LABELS = {
 DESKTOP_LABEL_SUFFIX = {
     "click": "点击 click（在屏幕上找这张图并点它，可双击）",
     "fill": "输入文字 fill（先点一下输入位置，再打进去；中文走剪贴板）",
+    "drag": "鼠标拖拽 drag（从模板图按住，朝圆盘方向拖过去再松开）",
+    "wheel": "鼠标滚轮 wheel（向上 / 向下滚几格）",
 }
 # 条件判断方式
 COND_MODES = [
@@ -290,6 +298,46 @@ LOCATOR_HELP = (
     "【兜底截图】下面那一栏是给 XPath 失效时兜底用的，选填。"
 )
 
+DRAG_HELP = (
+    "「鼠标拖拽」＝ 按住起点 → 拖过去 → 松开：拖滑块、拖进度条、拖列表项、\n"
+    "拖地图、拖文件……都用它。\n"
+    "\n"
+    "【起点】就是下面那一行定位：\n"
+    "· 网页：填 XPath 或截图（必填）；点【捕获元素…】框那个元素就行；\n"
+    "· 桌面：选一张模板图（选填 —— 留空＝从**当前鼠标位置**开始拖，\n"
+    "  常用来接在上一步「点击」的后面）。\n"
+    "\n"
+    "【方向】在圆盘上点一下：0°＝向右、90°＝向下、180°＝向左、270°＝向上，\n"
+    "顺时针；按住圆盘转着调也行，旁边的角度框能直接填数字。\n"
+    "\n"
+    "【距离】屏幕（桌面）/ 浏览器视口（网页）**较短边**的百分之几：\n"
+    "横屏上 50% ≈ 拖过半个屏幕高。终点会自动钳在屏幕 / 视口里\n"
+    "（拖出边界的话，后半程的鼠标事件就跑到别的窗口去了）。\n"
+    "\n"
+    "【用时】拖过去花几秒：慢一点更像人，0.5 秒左右够用；\n"
+    "滑块验证码那种要看按住期间采样点的，拖慢一点（1 秒以上）更稳。\n"
+    "\n"
+    "【试拖一下】会当场真拖一次：网页另开一个浏览器窗口打开项目里的网址；\n"
+    "桌面前先把编辑器收起来、倒数 3 秒。人手的轨迹跟运行时一模一样，\n"
+    "所以试拖能成，正式跑就没问题。"
+)
+
+WHEEL_HELP = (
+    "「鼠标滚轮」＝ 把滚轮往上 / 往下滚一段。\n"
+    "\n"
+    "【滚多少】\n"
+    "· 网页：按**像素**算，一「格」≈ 100 像素，默认 500（＝5 格）；\n"
+    "· 桌面：按**格**算，1 格 ≈ 3 行，默认 3 格。\n"
+    "\n"
+    "【滚哪里】滚轮消息发给「光标底下」的那个窗口 / 区域，所以运行时\n"
+    "会先把鼠标挪过去再滚：网页挪到页面中间（不挪的话可能滚的是某个\n"
+    "内嵌滚动区，甚至是个 iframe）；桌面优先用定位图 / 窗口名找到的位置。\n"
+    "\n"
+    "【什么时候用】懒加载的列表（滚一屏才出一批）、把挡路的固定表头 /\n"
+    "侧边栏滚开、无限滚动翻页。要让页面稳定下来再点，\n"
+    "在后面接一个「等待」（网页选「等待元素出现」，桌面选「等待图片出现」）。"
+)
+
 FALLBACK_HELP = (
     "选填。配了它以后：XPath 等不到元素 / 点不动时，会自动改用这张图做模板匹配，\n"
     "命中后按坐标点击或填入（日志里会写明这次走了兜底）。\n"
@@ -397,6 +445,9 @@ class StepEditDialog(QDialog):
         self._feature_path = ""
         self._window_title = ""
         self._actions = DESKTOP_ACTIONS if self.desktop else WEB_ACTIONS
+        # 【试拖一下】的后台线程（网页那次会一直开着浏览器，直到窗口关掉）
+        self._drag_try = None
+        self._closing = False
         self.setWindowTitle(("编辑步骤" if self._editing else "新建步骤")
                             + ("（桌面应用）" if self.desktop else ""))
         self.setMinimumWidth(760)
@@ -546,6 +597,99 @@ class StepEditDialog(QDialog):
         self.click_times_combo.addItem("单击", 1)
         self.click_times_combo.addItem("双击", 2)
         form.addRow("点击方式：", self.click_times_combo)
+
+        # --- drag 组：拖拽（圆盘定方向 + 百分比定距离 + 当场试拖）---
+        self.dial = DragDial()
+        self.dial.angleChanged.connect(self._on_dial_changed)
+        self.dial_angle_spin = QSpinBox()
+        self.dial_angle_spin.setRange(0, 359)
+        self.dial_angle_spin.setSuffix(" °")
+        self.dial_angle_spin.setToolTip(
+            "跟圆盘同一个值：0°＝向右、90°＝向下、180°＝向左、270°＝向上，顺时针。")
+        self.dial_angle_spin.valueChanged.connect(self._on_angle_spin_changed)
+
+        self.drag_percent_spin = QSpinBox()
+        self.drag_percent_spin.setRange(1, 100)
+        self.drag_percent_spin.setValue(50)
+        self.drag_percent_spin.setSuffix(" %")
+        self.drag_percent_spin.setToolTip(
+            "拖多远：屏幕（桌面）/ 浏览器视口（网页）**较短边**的百分之几。\n"
+            "横屏上 50% ≈ 拖过半个屏幕高。终点会自动钳在屏幕 / 视口里。")
+        self.drag_percent_spin.valueChanged.connect(self._sync_drag_summary)
+
+        self.drag_duration_spin = QDoubleSpinBox()
+        self.drag_duration_spin.setRange(0.1, 10.0)
+        self.drag_duration_spin.setDecimals(1)
+        self.drag_duration_spin.setSingleStep(0.1)
+        self.drag_duration_spin.setValue(0.5)
+        self.drag_duration_spin.setSuffix(" 秒")
+        self.drag_duration_spin.setToolTip(
+            "拖过去用几秒。慢一点更像人：0.5 秒左右够用，\n"
+            "滑块验证码那种要看按住期间采样点的，拖慢一点（1 秒以上）更稳。")
+
+        self.drag_summary = QLabel("")
+        self.drag_summary.setWordWrap(True)
+        self.drag_summary.setStyleSheet("color: #0f766e;")
+
+        self.btn_try_drag = QPushButton("试拖一下")
+        self.btn_try_drag.setToolTip(
+            "当场真拖一次，看看方向和距离对不对（不保存也能试）。\n"
+            "网页：另开一个浏览器窗口打开项目里的网址；\n"
+            "桌面：把编辑器收起来、倒数 3 秒，拖你屏幕上的真实程序。")
+        self.btn_try_drag.clicked.connect(self._try_drag)
+
+        self.drag_box = QWidget()
+        drag_layout = QHBoxLayout(self.drag_box)
+        drag_layout.setContentsMargins(0, 0, 0, 0)
+        drag_layout.addWidget(self.dial, 0, Qt.AlignmentFlag.AlignTop)
+        drag_right = QVBoxLayout()
+        drag_right.setSpacing(6)
+        for text, widget in (("角度：", self.dial_angle_spin),
+                             ("距离：", self.drag_percent_spin),
+                             ("用时：", self.drag_duration_spin)):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(text))
+            row.addWidget(widget)
+            row.addStretch()
+            drag_right.addLayout(row)
+        drag_right.addWidget(self.drag_summary)
+        drag_right.addWidget(self.btn_try_drag)
+        drag_right.addStretch()
+        drag_layout.addLayout(drag_right, 1)
+        form.addRow("拖拽：", self.drag_box)
+
+        self.drag_hint = help_row(
+            "按住起点 → 朝圆盘方向拖 → 松开。圆盘上点一下定方向。",
+            "鼠标拖拽", DRAG_HELP)
+        form.addRow("", self.drag_hint)
+
+        self.drag_status = QLabel("")
+        self.drag_status.setWordWrap(True)
+        self.drag_status.setStyleSheet("color: #64748b;")
+        form.addRow("", self.drag_status)
+
+        # --- wheel 组：滚轮方向 + 幅度 ---
+        self.wheel_dir_combo = QComboBox()
+        self.wheel_dir_combo.addItem("向下滚（看下面的内容）", "down")
+        self.wheel_dir_combo.addItem("向上滚（回到上面）", "up")
+        self.wheel_amount_spin = QSpinBox()
+        self.wheel_amount_spin.setRange(1, 100000)
+        self.wheel_amount_spin.setValue(3 if self.desktop else 500)
+        self.wheel_amount_spin.setToolTip(
+            "滚多少：网页＝像素（一「格」≈ 100 像素）；\n"
+            "桌面＝格数（1 格 ≈ 3 行）。")
+        self.wheel_row = QWidget()
+        wheel_layout = QHBoxLayout(self.wheel_row)
+        wheel_layout.setContentsMargins(0, 0, 0, 0)
+        wheel_layout.addWidget(self.wheel_dir_combo)
+        wheel_layout.addWidget(self.wheel_amount_spin)
+        wheel_layout.addStretch()
+        form.addRow("滚轮：", self.wheel_row)
+
+        self.wheel_hint = help_row(
+            "上滚 / 下滚；滚多少：网页＝像素，桌面＝格数。",
+            "鼠标滚轮", WHEEL_HELP)
+        form.addRow("", self.wheel_hint)
 
         # --- 定位组（click/fill/select）---
         self.locator_type = QComboBox()
@@ -944,6 +1088,8 @@ class StepEditDialog(QDialog):
         self._image_widgets = [self.image_hint, self.preview]
         self._value_widgets = [value_row, self.value_hint]
         self._wait_widgets = [self.wait_combo, self.wait_seconds]
+        self._drag_widgets = [self.drag_box, self.drag_hint, self.drag_status]
+        self._wheel_widgets = [self.wheel_row, self.wheel_hint]
         self._pause_widgets = [self.prompt_edit, self.resume_combo,
                                self.resume_timeout]
         self._loop_widgets = [
@@ -986,9 +1132,15 @@ class StepEditDialog(QDialog):
         is_collect = action == "collect"
         is_captcha = action == "captcha"
         is_locate = action in ("click", "fill", "select")
+        is_drag = action == "drag"
+        is_wheel = action == "wheel"
         # 主定位那一行（「定位路径」/「图片模板」）对验证码节点也是必填的 ——
-        # 对验证码来说它填的是「验证码图在哪」，所以用 show_loc 统一控制
-        show_loc = is_locate or is_captcha
+        # 对验证码来说它填的是「验证码图在哪」，所以用 show_loc 统一控制。
+        # 拖拽的起点也走这一行；滚轮只有桌面场景需要（光标先挪到哪张图上）
+        show_loc = (is_locate or is_captcha or is_drag
+                    or (is_wheel and self.desktop))
+        # 「步骤后等待」拖拽 / 滚轮也留着：滚完等懒加载、拖完等动画，都很常见
+        show_wait = show_loc or is_wheel
         is_fill = action in ("fill", "select")
         # 桌面场景只有「图片模板」一种定位方式：定位方式那个下拉在这儿没有意义
         # （选了也不作数，保存时一律按截图存），下面会把它整行收起来
@@ -1026,10 +1178,16 @@ class StepEditDialog(QDialog):
         self._show(self.locator_type, show_loc and not self.desktop)
         # 桌面场景的窗口名统一走「定位匹配」记的 _window_title（跟点击/填入一样），
         # 那行输入框只给「激活窗口」用，所以这里不再给验证码多开一个
-        self._show(self.win_title_edit, is_win)
+        self._show(self.win_title_edit, is_win or (self.desktop and is_wheel))
         self._show(self.keys_edit, is_keys)
         self._show(self.click_times_combo,
                    self.desktop and action == "click")
+        for w in self._drag_widgets:
+            self._show(w, is_drag)
+        for w in self._wheel_widgets:
+            self._show(w, is_wheel)
+        if is_wheel:
+            self.wheel_amount_spin.setSuffix(" 格" if self.desktop else " 像素")
         self.btn_pick_image.setVisible(is_image)
         self.btn_capture.setVisible(
             show_loc and (self.desktop or loc_kind == "xpath"))
@@ -1051,8 +1209,8 @@ class StepEditDialog(QDialog):
         for w in self._value_widgets:
             self._show(w, is_fill)
         for w in self._wait_widgets:
-            self._show(w, show_loc)
-        self._show(self.wait_target_row, show_loc and need_target)
+            self._show(w, show_wait)
+        self._show(self.wait_target_row, show_wait and need_target)
         self.btn_wait_shot.setVisible(self.desktop and show_loc)
         for w in self._pause_widgets:
             self._show(w, is_pause)
@@ -1106,11 +1264,17 @@ class StepEditDialog(QDialog):
         if label is not None:
             if is_captcha:
                 label.setText("验证码图：")
+            elif is_drag:
+                label.setText("起点：")
+            elif is_wheel:
+                label.setText("滚动位置：")
             else:
                 label.setText("图片模板：" if self.desktop else "定位路径：")
         sec_label = self._form.labelForField(self.wait_seconds)
         if sec_label is not None:
             sec_label.setText("等待秒数：" if is_delay else "额外等待：")
+        if is_drag:
+            self._sync_drag_summary()
         self.adjustSize()
 
     def _on_action_changed(self):
@@ -1128,6 +1292,85 @@ class StepEditDialog(QDialog):
     def _on_resume_changed(self):
         """恢复 URL / 恢复元素按恢复条件分别出现。"""
         self._sync_visibility()
+
+    # ------------------------------
+    # 拖拽：圆盘定方向 + 试拖一下
+    # ------------------------------
+    def _on_dial_changed(self, angle: float):
+        """圆盘转了 → 同步旁边那个角度框（blockSignals 免得来回触发）。"""
+        self.dial_angle_spin.blockSignals(True)
+        self.dial_angle_spin.setValue(int(round(angle)) % 360)
+        self.dial_angle_spin.blockSignals(False)
+        self._sync_drag_summary()
+
+    def _on_angle_spin_changed(self, value: int):
+        """角度框改了 → 圆盘跟着转。"""
+        self.dial.set_angle(float(value))
+        self._sync_drag_summary()
+
+    def _sync_drag_summary(self):
+        """圆盘下面那句话：朝哪个方向、拖多远。"""
+        edge = "屏幕" if self.desktop else "浏览器视口"
+        self.drag_summary.setText(
+            f"朝「{desktop.angle_text(self.dial.angle())}」拖 "
+            f"{self.drag_percent_spin.value()}%（{edge}较短边的百分比）"
+        )
+
+    def _try_drag(self):
+        """【试拖一下】：当场真拖一次，看方向和距离对不对（不用先保存）。"""
+        if self._current_action() != "drag":
+            return
+        if self._drag_try is not None and self._drag_try.isRunning():
+            QMessageBox.information(self, "还在拖", "上一次试拖还没结束，稍等一下再点。")
+            return
+        value = self.locator_value.text().strip()
+        angle = float(self.dial.angle())
+        percent = int(self.drag_percent_spin.value())
+        duration = float(self.drag_duration_spin.value())
+        if self.desktop:
+            if value and not _is_project_image(value):
+                QMessageBox.warning(
+                    self, "起点不对",
+                    "桌面场景的起点要用【定位匹配…】或【选择图片…】选一张模板图，\n"
+                    "而且图片必须在项目的 img/ 目录里。\n"
+                    "（起点留空也可以：那就从「当前鼠标位置」开始拖）")
+                return
+            self.drag_status.setText("正在准备（编辑器会收起来，倒数 3 秒）…")
+            self._drag_try = mouse_test.try_drag_desktop(
+                self, self.project_dir, value,
+                win_title=self._window_title, window=self._window_path,
+                offset=self._window_offset, window_size=self._window_size,
+                feature=self._feature_path,
+                threshold=float(self.threshold_spin.value() or 0),
+                angle=angle, percent=percent, duration=duration)
+            return
+        # 网页：另开一个浏览器窗口，打开项目里第一个「打开网页」的地址
+        if not self._default_url:
+            QMessageBox.warning(
+                self, "没有网址",
+                "项目里还没有「打开网页」节点，试拖不知道该打开哪个页面。\n"
+                "先在流程开头放一个「打开网页」填上网址（或者直接运行一次看看）。")
+            return
+        if not value:
+            QMessageBox.warning(
+                self, "还没定起点",
+                "「鼠标拖拽」的起点是必填的：点【捕获元素…】框住要拖的那个元素\n"
+                "（滑块手柄、进度条、地图、卡片……）。")
+            return
+        self.drag_status.setText("正在开浏览器…")
+        self._drag_try = mouse_test.try_drag_web(
+            self, self.project_dir, self._default_url, value,
+            loc_type=self.locator_type.currentData() or "xpath",
+            angle=angle, percent=percent, duration=duration,
+            on_log=self.drag_status.setText)
+
+    def done(self, result: int):
+        """窗口关掉时，把「试拖」的后台线程收掉（它会关掉自己开的浏览器）。"""
+        self._closing = True
+        if self._drag_try is not None and self._drag_try.isRunning():
+            self._drag_try.stop()
+            self._drag_try.wait(4000)
+        super().done(result)
 
     # ------------------------------
     # 变量下拉
@@ -1639,7 +1882,8 @@ class StepEditDialog(QDialog):
                 img_path = self.project_dir / s.locator.value
                 if img_path.exists():
                     self._show_preview(img_path)
-        if self.desktop and s.action in ("click", "fill", "select", "captcha"):
+        if self.desktop and s.action in ("click", "fill", "select", "captcha",
+                                        "drag", "wheel"):
             self._window_title = str(getattr(s, "win_title", "") or "")
             if self._window_path:
                 self.capture_hint.setText(
@@ -1701,6 +1945,21 @@ class StepEditDialog(QDialog):
         self.click_times_combo.setCurrentIndex(max(
             0, self.click_times_combo.findData(int(s.click_times or 1))))
 
+        # 拖拽：方向（圆盘）＋ 距离 ＋ 用时
+        self.dial.set_angle(float(getattr(s, "drag_angle", 0) or 0))
+        self.dial_angle_spin.blockSignals(True)
+        self.dial_angle_spin.setValue(int(self.dial.angle()) % 360)
+        self.dial_angle_spin.blockSignals(False)
+        self.drag_percent_spin.setValue(int(getattr(s, "drag_percent", 50) or 50))
+        self.drag_duration_spin.setValue(
+            float(getattr(s, "drag_duration", 0.5) or 0.5))
+        self._sync_drag_summary()
+        # 滚轮：方向 ＋ 幅度
+        self.wheel_dir_combo.setCurrentIndex(max(
+            0, self.wheel_dir_combo.findData(s.wheel_direction or "down")))
+        self.wheel_amount_spin.setValue(int(s.wheel_amount or 0) or
+                                        (3 if self.desktop else 500))
+
         mode_idx = self.cond_mode_combo.findData(s.cond_mode or "rule")
         self.cond_mode_combo.setCurrentIndex(max(0, mode_idx))
         self.cond_expr_edit.setText(s.cond_expr or "")
@@ -1760,6 +2019,28 @@ class StepEditDialog(QDialog):
                 errors.append(
                     "「激活窗口」要填窗口标题里的一小段（如 记事本、Excel）"
                 )
+        elif action == "drag":
+            value = self.locator_value.text().strip()
+            if self.desktop:
+                if value and not _is_project_image(value):
+                    errors.append(
+                        "桌面场景的「鼠标拖拽」起点要用【定位匹配…】选一张模板图"
+                        "（图片要在项目 img/ 目录里；留空＝从当前鼠标位置开始拖）")
+            elif not value:
+                errors.append(
+                    "「鼠标拖拽」必须填起点：在「起点」那一行点【捕获元素…】"
+                    "框住要拖的元素（滑块手柄、进度条、地图……）")
+            elif (self.locator_type.currentData() == "xpath"
+                    and not _looks_like_xpath(value)):
+                errors.append(
+                    "「鼠标拖拽」的起点只能填 XPath（说明文字请写到【备注】里）")
+        elif action == "wheel":
+            value = self.locator_value.text().strip()
+            if self.desktop and value and not _is_project_image(value):
+                errors.append(
+                    "桌面场景的「鼠标滚轮」滚动位置要用【定位匹配…】或"
+                    "【选择图片…】选图（图片要在项目 img/ 目录里；"
+                    "留空＝在光标当前位置滚）")
         elif action == "hotkey":
             if not self.keys_edit.text().strip():
                 errors.append("「按键」要填按什么键，如 enter、ctrl+s、alt+f4")
@@ -1969,6 +2250,39 @@ class StepEditDialog(QDialog):
             step.wait_seconds = float(self.wait_seconds.value())
         elif action == "win_activate":
             step.win_title = self.win_title_edit.text().strip()
+        elif action in ("drag", "wheel"):
+            # 起点 / 滚动位置：网页的滚轮用不上这一行（运行时按页面中间滚），
+            # 所以那一行没显示时就不去读它，免得存进上一次动作留下的文字
+            shown = self.desktop or action == "drag"
+            image = self.locator_value.text().strip() if shown else ""
+            if image:
+                step.locator = Locator(
+                    type="image" if self.desktop
+                    else self.locator_type.currentData(),
+                    value=image,
+                    window=self._window_path if self.desktop else "",
+                    window_size=list(self._window_size) if self.desktop else [],
+                    offset=list(self._window_offset) if self.desktop else [],
+                    feature=self._feature_path if self.desktop else "",
+                )
+                step.image_threshold = float(self.threshold_spin.value() or 0)
+            if self.desktop:
+                if action == "wheel":
+                    # 滚轮的窗口名可以在「窗口标题」那行手填，没填就用定位记下的
+                    step.win_title = (self.win_title_edit.text().strip()
+                                      or self._window_title)
+                else:
+                    step.win_title = self._window_title
+            if action == "drag":
+                step.drag_angle = float(self.dial.angle())
+                step.drag_percent = int(self.drag_percent_spin.value())
+                step.drag_duration = float(self.drag_duration_spin.value())
+            else:
+                step.wheel_direction = self.wheel_dir_combo.currentData() or "down"
+                step.wheel_amount = int(self.wheel_amount_spin.value())
+            step.wait_after = self.wait_combo.currentData()
+            step.wait_target = self.wait_target.text().strip()
+            step.wait_seconds = float(self.wait_seconds.value())
         elif action == "hotkey":
             step.keys = self.keys_edit.text().strip()
         elif action == "delay":

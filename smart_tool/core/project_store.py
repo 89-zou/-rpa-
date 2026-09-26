@@ -286,7 +286,8 @@ class Step:
             if self.captcha_prompt:
                 d["captcha_prompt"] = self.captcha_prompt
         if self.win_title and self.action in ("win_activate", "click", "fill",
-                                              "select", "captcha"):
+                                              "select", "captcha", "drag",
+                                              "wheel"):
             # 桌面场景：点击 / 填入 也用 win_title 记「这一步属于哪个窗口」
             # （运行时先按窗口名找窗口），不只是「激活窗口」那一步
             d["win_title"] = self.win_title

@@ -85,6 +85,8 @@ ACTION_META = {
     "navigate": ("打开网页", "#2f6fed"),
     "read_data": ("读取数据", "#0f766e"),
     "click": ("点击", "#e8890c"),
+    "drag": ("鼠标拖拽", "#c2410c"),
+    "wheel": ("鼠标滚轮", "#0e7490"),
     "fill": ("填入", "#1a9d6b"),
     "select": ("下拉选择", "#1192a8"),
     "pause_for_human": ("暂停等人工", "#d1495b"),
@@ -217,6 +219,18 @@ def _step_summary_body(s: Step) -> List[str]:
     if s.action == "win_activate":
         return [f"窗口：{s.win_title[:50]}" if s.win_title
                 else "（未填窗口标题）"]
+    if s.action == "drag":
+        from smart_tool.core.desktop import angle_text
+        lines = [f"朝 {angle_text(s.drag_angle)} 拖 "
+                 f"{int(s.drag_percent or 0)}%（较短边的百分比）"]
+        if s.locator and s.locator.value:
+            lines.append(f"起点：{s.locator.value[:50]}")
+        else:
+            lines.append("起点：当前鼠标位置")
+        return lines[:3]
+    if s.action == "wheel":
+        up = (s.wheel_direction or "down") == "up"
+        return [f"{'向上' if up else '向下'}滚 {int(s.wheel_amount or 0)}"]
     if s.action == "hotkey":
         return [f"按键：{s.keys}" if s.keys else "（未填按键）"]
     if s.action == "delay":
