@@ -624,6 +624,56 @@ def wait_gone(template_path: Path, wait_s: float = DEFAULT_WAIT_S,
 # ------------------------------
 # 窗口：只截这个窗口（不截全屏）+ 按窗口名定位
 # ------------------------------
+def _fix_pygetwindow_handles() -> None:
+    """给 pygetwindow 用到的 Win32 API 补上 argtypes —— 不然 64 位句柄会炸。
+
+    pygetwindow 0.0.9 调 `GetWindowRect(self._hWnd, ...)` 这类 API 时没声明
+    argtypes，ctypes 就按默认的 C int（32 位）去转句柄；只要桌面上有一个
+    句柄超过 2^31-1 的窗口（64 位系统上常见：UWP、浏览器沙箱窗口等），
+    整个「列窗口 / 找窗口 / 截窗口」都会报
+
+        ctypes.ArgumentError: argument 1: OverflowError: int too long to convert
+
+    ——用户看到的就是「截取窗口失败」那个弹窗。这里把参数类型改成 c_void_p
+    （句柄类型），多大的句柄都能收下。ctypes 的 windll 是全局缓存的同一份
+    函数对象，这里改完 pygetwindow 那边立刻生效。
+
+    出错也不管：以后 pygetwindow 换实现（或哪天自己补了 argtypes）都不该
+    连累程序启动。
+    """
+    try:
+        from ctypes import wintypes
+
+        u = ctypes.windll.user32
+        # 参数表按 Win32 原型写；句柄一律 c_void_p（能收下 64 位句柄）。
+        # 传指针的参数也用 c_void_p：byref(某个自己定义的结构体) 只认这种写法，
+        # 写成 POINTER(RECT) 的话 pygetwindow 自己那份 RECT 就对不上了。
+        specs = {
+            "GetWindowRect": [ctypes.c_void_p, ctypes.c_void_p],
+            "GetWindowTextLengthW": [ctypes.c_void_p],
+            "GetWindowTextW": [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int],
+            "IsIconic": [ctypes.c_void_p],
+            "IsWindowVisible": [ctypes.c_void_p],
+            "IsZoomed": [ctypes.c_void_p],
+            "PostMessageA": [ctypes.c_void_p, ctypes.c_uint,
+                             ctypes.c_size_t, ctypes.c_ssize_t],
+            "SetForegroundWindow": [ctypes.c_void_p],
+            "SetWindowPos": [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+                             ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                             ctypes.c_uint],
+            "ShowWindow": [ctypes.c_void_p, ctypes.c_int],
+        }
+        for name, types in specs.items():
+            fn = getattr(u, name, None)
+            if fn is not None:
+                fn.argtypes = types
+    except Exception:
+        pass
+
+
+_fix_pygetwindow_handles()
+
+
 def guess_window_keyword(title: str) -> str:
     """从窗口标题里猜一个「不会老是变」的关键字（运行时靠它找窗口）。
 
