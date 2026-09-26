@@ -1113,9 +1113,10 @@ def validate_project(project: str) -> Dict[str, Any]:
     if structure:
         problems.append(structure)
     variables = check_variables(steps, store.load_all_variables(),
-                                library_written_vars(store.dir))
+                                library_written_vars(store.dir),
+                                scene=store.load_scene())
     problems.extend(variables)
-    conn = _connect_roundtrip(steps)
+    conn = _connect_roundtrip(steps, store.load_scene())
     problems.extend(conn)
     lib = {x["name"]: x for x in store.load_functions()}
     code: List[str] = []
@@ -1136,7 +1137,7 @@ def validate_project(project: str) -> Dict[str, Any]:
             "problems": problems}
 
 
-def _connect_roundtrip(steps: List[Step]) -> List[str]:
+def _connect_roundtrip(steps: List[Step], scene: str = "") -> List[str]:
     """检查每一步的字段能不能真正用起来（定位缺失、网址为空等）。"""
     out = []
     for i, s in enumerate(steps):
@@ -1144,12 +1145,22 @@ def _connect_roundtrip(steps: List[Step]) -> List[str]:
         if a == "navigate" and not (s.url or "").strip():
             out.append(f"第 {i} 步（打开网页）没填网址")
         if a in ("click", "fill", "select"):
+            label = ACTION_SPECS[a]["label"] if a in ACTION_SPECS else a
             if not s.locator or not (s.locator.value or "").strip():
-                out.append(f"第 {i} 步（{ACTION_SPECS[a]['label']}）没填定位")
+                out.append(f"第 {i} 步（{label}）没填定位")
             if a == "fill" and not (s.value or "").strip():
                 out.append(f"第 {i} 步（填入）没填内容")
             if a == "select" and not (s.value or "").strip():
                 out.append(f"第 {i} 步（下拉选择）没填选哪一项")
+        if a == "drag":
+            has_start = bool(s.locator and (s.locator.value or s.locator.image))
+            if not has_start and scene != "desktop":
+                out.append(f"第 {i} 步（鼠标拖拽）没填起点"
+                           "（网页场景必填；桌面场景留空＝从当前鼠标位置拖）")
+            if int(s.drag_percent or 0) <= 0:
+                out.append(f"第 {i} 步（鼠标拖拽）拖拽距离是 0%")
+        if a == "wheel" and int(s.wheel_amount or 0) <= 0:
+            out.append(f"第 {i} 步（鼠标滚轮）没填滚动量")
         if a == "collect":
             if not (s.output_var or "").strip():
                 out.append(f"第 {i} 步（采集数据）没填产出变量名")

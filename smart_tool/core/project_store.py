@@ -159,6 +159,18 @@ class Step:
     # 浅色 / 低对比界面里匹配分数天然偏低，可以调低一点；调高则更严、宁可不点。
     # 对这一步里的所有图片匹配都生效（定位、等待图片出现/消失）。
     image_threshold: float = 0.0
+    # ---- drag 专用：鼠标拖拽（按下 → 拖动 → 松开）----
+    # 起点就是主 locator：网页必填（从元素中心起拖）；桌面留空＝从当前鼠标位置拖。
+    # 方向用「圆盘」定：drag_angle 是角度（度），0＝右、90＝下、顺时针增长。
+    drag_angle: float = 0.0
+    # 拖多远：屏幕（桌面）/ 浏览器视口（网页）**较短边**的百分之几，1~100
+    drag_percent: int = 50
+    # 拖过去用几秒（慢一点才像人；0.5 秒左右够用）
+    drag_duration: float = 0.5
+    # ---- wheel 专用：鼠标滚轮 ----
+    wheel_direction: str = "down"          # down＝下滚 / up＝上滚
+    # 滚多少：网页＝像素（一格约 100 像素）；桌面＝格数（1 格约 3 行）
+    wheel_amount: int = 500
     # ---- captcha 专用：验证码节点（滑块 / 文字点选 / 计算题）----
     # captcha_kind：slider＝滑块拼图 / click_text＝文字点选 / math＝计算题
     # 「验证码图片」直接用主 locator 存（这样元素捕获/定位匹配那套按钮直接能用）；
@@ -282,6 +294,13 @@ class Step:
             d["keys"] = self.keys
         if self.action == "click" and int(self.click_times or 1) != 1:
             d["click_times"] = int(self.click_times)
+        if self.action == "drag":
+            d["drag_angle"] = float(self.drag_angle or 0)
+            d["drag_percent"] = int(self.drag_percent or 50)
+            d["drag_duration"] = float(self.drag_duration or 0.5)
+        if self.action == "wheel":
+            d["wheel_direction"] = self.wheel_direction or "down"
+            d["wheel_amount"] = int(self.wheel_amount or 0)
         if self.image_threshold:
             d["image_threshold"] = float(self.image_threshold)
         if self.pos is not None:
@@ -347,6 +366,11 @@ class Step:
             keys=d.get("keys", ""),
             click_times=int(d.get("click_times", 1) or 1),
             image_threshold=float(d.get("image_threshold", 0) or 0),
+            drag_angle=float(d.get("drag_angle", 0) or 0),
+            drag_percent=int(d.get("drag_percent", 50) or 50),
+            drag_duration=float(d.get("drag_duration", 0.5) or 0.5),
+            wheel_direction=d.get("wheel_direction") or "down",
+            wheel_amount=int(d.get("wheel_amount", 500) or 0),
             captcha_kind=d.get("captcha_kind") or "slider",
             captcha_slider=locator_from_dict(d.get("captcha_slider")),
             captcha_tip=locator_from_dict(d.get("captcha_tip")),

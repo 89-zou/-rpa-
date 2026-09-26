@@ -7,6 +7,7 @@ import ast
 import base64
 import fnmatch
 import json
+import math
 import re
 import shutil
 import threading
@@ -425,7 +426,8 @@ def loop_fields(steps: List[Step], start: Step) -> List[str]:
 
 def check_variables(steps: List[Step],
                     project_variables: Optional[dict] = None,
-                    extra_names: Optional[Sequence[str]] = None) -> List[str]:
+                    extra_names: Optional[Sequence[str]] = None,
+                    scene: str = "") -> List[str]:
     """运行前检查变量是否有来源，返回问题清单（空 = 没问题）。
 
     变量的来源：
@@ -435,7 +437,7 @@ def check_variables(steps: List[Step],
     4. 循环体内自动有的 {{loop.item}} / {{loop.item.字段}} / {{loop.index}}。
 
     重点盯「跑起来才发现是空的」：循环外引用了 loop.*、字段名写错、
-    变量根本没来源。
+    变量根本没来源。scene 传项目场景（web / desktop），为空时跳过场景相关的检查。
     """
     proj_vars = set(project_variables or ())
     produced = produced_variables(steps, extra_names)
@@ -530,6 +532,14 @@ def check_variables(steps: List[Step],
             elif not (s.loop_expr or "").strip():
                 add(s.id, "「循环」节点还没填循环内容（双击节点填写：数字＝跑几次，"
                           "或 {{变量}}＝按它的长度跑）")
+        if s.action == "drag" and scene == "web":
+            # 桌面场景允许留空（＝从当前鼠标位置起拖），网页不行：总得知道从哪按下
+            if not (s.locator and (s.locator.value or s.locator.image)):
+                add(s.id, "「鼠标拖拽」还没定起点（双击这一步，在「起点」那一行点"
+                          "【定位匹配…】框一个元素）")
+        if s.action == "wheel" and int(s.wheel_amount or 0) <= 0:
+            add(s.id, "「鼠标滚轮」的滚动量是 0，滚不动"
+                      "（双击这一步填个正数：网页＝像素，桌面＝格数）")
         rule = cond_children.get(idx)
         if rule and rule[3] != "expr":
             _cond, order, total, _mode = rule
@@ -1285,6 +1295,18 @@ class StepExecutor:
             elif step.action == "select":
                 self._require_web(step, "下拉选择")
                 self._select(step)
+            elif step.action == "drag":
+                if self.desktop:
+                    self._desktop_drag(step)
+                else:
+                    self._require_web(step, "鼠标拖拽")
+                    self._web_drag(step)
+            elif step.action == "wheel":
+                if self.desktop:
+                    self._desktop_wheel(step)
+                else:
+                    self._require_web(step, "鼠标滚轮")
+                    self._web_wheel(step)
             elif step.action == "pause_for_human":
                 self._pause_for_human(step)
             elif step.action == "script":
@@ -1778,6 +1800,57 @@ class StepExecutor:
         self.log(f"  按键：{keys}")
         desktop.hotkey(keys)
 
+    def _desktop_drag(self, step: Step):
+        """桌面拖拽：从模板图中心按住，朝圆盘方向拖过去再松开。
+
+        起点图留空＝从**当前鼠标位置**开始拖（拖完上一步点过的地方之类）；
+        距离＝整个桌面较短边的百分之几。
+        """
+        self._require_desktop(step, "鼠标拖拽")
+        image = (step.locator.value if step.locator else "").strip()
+        if image:
+            m = self._desktop_locate(image, step)
+            x0, y0 = m.x, m.y
+            self.log(f"  起点＝图上 ({x0:.0f},{y0:.0f})"
+                     f"（置信度 {m.confidence:.2f}"
+                     + (f"，{m.how}" if m.how else "") + "）")
+        else:
+            x0, y0 = desktop.cursor_pos()
+            self.log(f"  没配起点图 → 从当前鼠标位置 ({x0:.0f},{y0:.0f}) 开始拖")
+        sw, sh = desktop.screen_size()
+        dx, dy = desktop.drag_delta(step.drag_angle, step.drag_percent,
+                                    min(sw, sh))
+        desktop.drag(x0, y0, x0 + dx, y0 + dy,
+                     duration=float(step.drag_duration or 0.5), log=self.log)
+
+    def _desktop_wheel(self, step: Step):
+        """桌面滚轮：先认窗口，把光标挪进去，再滚。
+
+        Windows 的滚轮消息发给**光标底下**那个窗口，光标不在目标上就是白滚。
+        所以顺序是：有起点图就用它的位置；否则按「窗口」名取窗口中心。
+        都没有才在当前光标处直接滚。
+        """
+        self._require_desktop(step, "鼠标滚轮")
+        n = abs(int(step.wheel_amount or 0))
+        if not n:
+            self.log("  滚动量是 0，跳过")
+            return
+        up = (step.wheel_direction or "down") == "up"
+        image = (step.locator.value if step.locator else "").strip()
+        x = y = None
+        if image:
+            m = self._desktop_locate(image, step)
+            x, y = m.x, m.y
+            self.log(f"  光标先挪到 ({x:.0f},{y:.0f})"
+                     f"（置信度 {m.confidence:.2f}）")
+        else:
+            keyword = self._resolve_value(step.win_title).strip()
+            rect = desktop.window_rect_by_title(keyword) if keyword else None
+            if rect:
+                x, y = (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2
+                self.log(f"  光标先挪到窗口「{keyword}」中间 ({x:.0f},{y:.0f})")
+        desktop.scroll(n if up else -n, x, y)
+
     def _delay(self, step: Step):
         """纯等待（等窗口画出来、等保存完）。"""
         secs = float(step.wait_seconds or 0)
@@ -2095,6 +2168,75 @@ class StepExecutor:
                 f"   当前页面：{self._current_url() or '（正在跳转中）'}\n"
                 "   多半是上一步之后没跳到你以为的页面，或这个 XPath 属于另一个页面。"
             ) from e
+
+    def _view_size(self) -> Tuple[float, float]:
+        """视口大小（CSS 像素）—— 拖拽距离、滚轮落点都按它算。"""
+        try:
+            w, h = self._page.evaluate("() => [window.innerWidth, window.innerHeight]")
+            if float(w) > 0 and float(h) > 0:
+                return float(w), float(h)
+        except Exception:
+            pass
+        size = self._page.viewport_size or {}
+        return float(size.get("width") or 1280), float(size.get("height") or 720)
+
+    def _web_drag(self, step: Step):
+        """网页拖拽：从起点元素中心按住，朝圆盘方向拖过去再松开。
+
+        位移＝视口较短边 × 百分比；终点会钳在视口里 —— 拖出窗口边界的话，
+        鼠标事件就跑到别的窗口去了，页面收不到后半程。
+        """
+        loc = step.locator
+        if not loc or not (loc.value or loc.image):
+            raise ValueError(
+                "「鼠标拖拽」得先定个起点。\n"
+                "   双击这一步，在「起点」那一行点【定位匹配…】框一个元素"
+                "（滑块手柄、进度条、地图、卡片……都行）。"
+            )
+        if loc.type == "image":
+            m = self._locate_by_image(loc)
+            x0, y0 = m.x, m.y
+        else:
+            el = self._resolve_xpath(loc)
+            try:
+                el.wait_for(state="visible", timeout=CLICK_TIMEOUT_MS)
+            except Exception as e:
+                raise TimeoutError(
+                    f"等不到拖拽起点（{CLICK_TIMEOUT_MS // 1000}s）：{loc.value}\n"
+                    f"   当前页面：{self._current_url() or '（正在跳转中）'}"
+                ) from e
+            try:
+                el.scroll_into_view_if_needed(timeout=FOCUS_CLICK_TIMEOUT_MS)
+            except Exception:
+                pass                # 滚不动就算了，box 拿得到就能拖
+            box = el.bounding_box()
+            if not box:
+                raise ValueError("起点元素没有可见位置，算不出从哪里开始拖")
+            x0, y0 = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+        vw, vh = self._view_size()
+        dx, dy = desktop.drag_delta(step.drag_angle, step.drag_percent,
+                                    min(vw, vh))
+        x1 = min(max(x0 + dx, 4.0), vw - 4.0)
+        y1 = min(max(y0 + dy, 4.0), vh - 4.0)
+        self.log(f"  从 ({x0:.0f},{y0:.0f}) 拖到 ({x1:.0f},{y1:.0f})"
+                 f"（方向 {desktop.angle_text(step.drag_angle)}，"
+                 f"{int(step.drag_percent or 0)}% ≈ "
+                 f"{math.hypot(x1 - x0, y1 - y0):.0f} 像素）")
+        self._mouse_drag(x0, y0, x1, y1,
+                         duration=float(step.drag_duration or 0.5))
+
+    def _web_wheel(self, step: Step):
+        """网页滚轮：把鼠标挪到页面中间再滚。
+
+        滚轮事件是发给「光标底下」的位置的：光标还停在上一步点过的元素上时，
+        滚的可能是它内部的滚动区（甚至是个 iframe），不是你想滚的页面。
+        """
+        amount = abs(int(step.wheel_amount or 0)) or 500
+        up = (step.wheel_direction or "down") == "up"
+        vw, vh = self._view_size()
+        self._page.mouse.move(vw / 2, vh / 2)
+        self._page.mouse.wheel(0, -amount if up else amount)
+        self.log(f"  页面{'上' if up else '下'}滚 {amount} 像素")
 
     # ------------------------------
     # 验证码（滑块 / 文字点选 / 计算题）

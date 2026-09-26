@@ -545,6 +545,7 @@ class WebAutomationTab(QWidget):
             project_variables=(self._current_store.load_all_variables()
                                if self._current_store else {}),
             extra_names=self._library_vars(),
+            scene=self._scene,
         )
         if not problems:
             return True

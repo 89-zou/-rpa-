@@ -89,6 +89,9 @@ FAILSAFE_BOX = 2
 #: 按下 / 松开左键要发的系统事件（pyautogui 在 Windows 上发的也是这两个）
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+#: 滚轮事件；dwData 里放滚动量，一格＝120（Windows 的标准刻度）
+MOUSEEVENTF_WHEEL = 0x0800
+WHEEL_DELTA = 120
 
 
 class _POINT(ctypes.Structure):
@@ -195,6 +198,31 @@ def screen_origin() -> Tuple[int, int]:
     u = ctypes.windll.user32
     return (int(u.GetSystemMetrics(76)),      # SM_XVIRTUALSCREEN
             int(u.GetSystemMetrics(77)))      # SM_YVIRTUALSCREEN
+
+
+def screen_size() -> Tuple[int, int]:
+    """整块桌面（多屏＝虚拟桌面）的宽高，物理像素。
+
+    拖拽距离按它的**较短边**算百分比：横屏上「拖 50%」＝拖过半个屏幕高度，
+    比按宽度算更符合直觉（也不会一拖就滑出屏幕）。
+    """
+    if sys.platform == "win32":
+        u = _user32()
+        w = int(u.GetSystemMetrics(78))       # SM_CXVIRTUALSCREEN
+        h = int(u.GetSystemMetrics(79))       # SM_CYVIRTUALSCREEN
+        if w > 0 and h > 0:
+            return w, h
+    try:
+        import pyautogui
+        w, h = pyautogui.size()
+        return int(w), int(h)
+    except Exception as e:
+        raise DesktopError(f"拿不到屏幕尺寸：{e}\n{missing_hint()}") from e
+
+
+def cursor_pos() -> Tuple[float, float]:
+    """光标现在在哪（物理像素）—— 拖拽/滚动不带起点图时从这里起手。"""
+    return _cursor_pos()
 
 
 def grab_screen():
@@ -827,6 +855,25 @@ def human_trace(sx: float, sy: float, x: float, y: float,
     return pts
 
 
+def drag_delta(angle: float, percent: int, short_edge: float) -> Tuple[float, float]:
+    """拖拽位移量：圆盘角度 + 较短边百分比 → (dx, dy)。
+
+    角度按屏幕坐标（y 向下）算：0°＝向右、90°＝向下、180°＝向左、270°＝向上，
+    顺时针增长 —— 跟编辑器圆盘上指针指的方向一致。
+    """
+    rad = math.radians(float(angle or 0))
+    pct = min(100.0, max(1.0, float(percent or 0)))
+    dist = float(short_edge) * pct / 100.0
+    return math.cos(rad) * dist, math.sin(rad) * dist
+
+
+def angle_text(angle: float) -> str:
+    """角度 → 人话（「右下 45°」）—— 编辑器圆盘和运行日志都用它。"""
+    a = float(angle or 0) % 360
+    names = ("右", "右下", "下", "左下", "左", "左上", "上", "右上")
+    return f"{names[int((a + 22.5) % 360 // 45)]} {a:.0f}°"
+
+
 def _step_through(points: List[Tuple[float, float]], duration: float):
     """按 points 一点点挪光标，整体耗时约 duration 秒。
 
@@ -1008,6 +1055,28 @@ def hotkey(keys: str):
     note(f"桌面：按键 {keys}")
     mapped = [KEY_ALIASES.get(p, p.lower()) for p in parts]
     _gui().hotkey(*mapped)
+
+
+def scroll(clicks: int, x: Optional[float] = None, y: Optional[float] = None):
+    """鼠标滚轮：clicks>0 向上滚、<0 向下滚；单位是「格」（1 格约 3 行）。
+
+    走系统事件而不是 pyautogui.scroll：pyautogui 每调一次都要 sleep 一个 PAUSE
+    （默认 0.1 秒），滚几下就明显卡顿，而它内部发的也是同一个事件。
+
+    给了 (x, y) 就先把光标移过去：Windows 的滚轮消息是发给**光标底下**那个
+    窗口的，光标不在目标窗口上就是白滚（哪怕这个窗口在前台）。
+    """
+    n = int(clicks or 0)
+    if not n:
+        return
+    if x is not None and y is not None:
+        move(float(x), float(y))
+    note(f"桌面：滚轮 {abs(n)} 格（{'上' if n > 0 else '下'}滚）")
+    # 一格一格发：一次给个大 delta 有些程序会跳过头，分开也更像真的在滚
+    step = WHEEL_DELTA if n > 0 else -WHEEL_DELTA
+    for _ in range(abs(n)):
+        _user32().mouse_event(MOUSEEVENTF_WHEEL, 0, 0, step, 0)
+        time.sleep(0.02)
 
 
 # ------------------------------
