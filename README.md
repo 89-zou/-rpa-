@@ -23,12 +23,13 @@
 
 ## 功能
 
-**节点（18 种）**
+**节点（19 种）**
 
 | 分组 | 节点 |
 |---|---|
 | 网页 | 打开网页、点击、填入、下拉选择、暂停等人工（可设自动恢复信号） |
 | 桌面 | 激活窗口、按键（快捷键）、等待 |
+| 鼠标（网页 / 桌面都能用） | 鼠标拖拽（**圆盘定方向**＋1~100% 距离，按下→拟人轨迹拖动→松开；编辑器里能【试拖一下】当场验一次）、鼠标滚轮（上滚 / 下滚，网页按像素、桌面按格） |
 | 数据 | 读取数据（txt / csv / xlsx / xls / json / 文件夹，字段可自定义挑）、采集数据（页面上抓字段存结果） |
 | 验证码 | 验证码（滑块拼图 / 文字点选 / 计算题，自动识别并操作；认不出来自动换一张重试） |
 | 结构 | 循环、条件 if/else（多分支）、组合（把一串步骤收成一个，画面清爽） |
@@ -57,7 +58,7 @@
 
 **给 AI 用**
 
-- `smart_tool/core/api.py` 把 37 个能力包成工具（读能力清单、增删改节点、校验、跑流程、导数据……），JSON 调用，AI 可以照着描述直接编排项目
+- `smart_tool/core/api.py` 把 40 个能力包成工具（读能力清单、增删改节点、校验、跑流程、导数据……），JSON 调用，AI 可以照着描述直接编排项目
 
 ## 快速开始
 
@@ -127,7 +128,7 @@ smart_tool/
 │  │  ├─ step_executor.py      执行引擎（Playwright / 桌面 / 数据 / 代码）
 │  │  ├─ data_sources.py       读 txt / csv / excel / json / 文件夹
 │  │  ├─ free_code.py          自由代码节点：语法解析、Python / JS 代码生成
-│  │  ├─ api.py                给 AI / 自动化调用的工具层（37 个工具 + 命令行）
+│  │  ├─ api.py                给 AI / 自动化调用的工具层（40 个工具 + 命令行）
 │  │  ├─ image_locator.py      截图定位（OpenCV 模板匹配 + 多尺度）
 │  │  ├─ desktop*.py           桌面场景（截图、鼠标键盘、UI Automation）
 │  │  ├─ auth_store.py         登录态保存与复用
@@ -193,7 +194,9 @@ powershell -ExecutionPolicy Bypass -File packaging\build.ps1
 
 **Highlights**
 
-- **17 node types**: open page, click, fill, select, pause-for-human, activate window, hotkey, delay,
+- **19 node types**: open page, click, fill, select, pause-for-human, activate window, hotkey, delay,
+  mouse drag (aim the direction on a dial, set the distance as a 1–100% of the shorter screen edge,
+  and there is a "try it now" button in the editor), mouse wheel (scroll up / down),
   read data (txt / csv / xlsx / xls / json / folder), collect data, loop, if/else with multiple
   branches, group (collapse a run of steps into one card), free code (Python / ES6 JavaScript),
   call a function from the project's function library, note/log.
@@ -205,7 +208,7 @@ powershell -ExecutionPolicy Bypass -File packaging\build.ps1
   Timeouts stop runaway loops.
 - **Data & sessions**: variables, image library, named locators, export collected rows to Excel / CSV,
   save & reuse login state (cookies) so runs skip the login steps when already signed in.
-- **AI-friendly API**: `smart_tool/core/api.py` exposes 37 tools (list capabilities, add/update/delete
+- **AI-friendly API**: `smart_tool/core/api.py` exposes 40 tools (list capabilities, add/update/delete
   steps, validate, run, export records, …) with JSON schemas, plus a small CLI.
 - **Portable by design**: a project folder contains both the flow and its data; copy the folder to move
   a project to another machine. If a hard-coded data path is missing, the file is looked up by name

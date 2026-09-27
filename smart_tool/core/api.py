@@ -14,6 +14,12 @@
            {"action": "fill", "locator": "//input[@id='username']", "value": "{{账号}}"},
            {"action": "click", "locator": "//button[@type='submit']",
             "wait_after": "element_present", "wait_target": "//a[text()='Logout']"},
+           # 鼠标拖拽：方向是角度（0＝右、90＝下、顺时针），距离是
+           # 屏幕 / 视口较短边的百分比（网页的起点必填，桌面留空＝从当前鼠标位置拖）
+           {"action": "drag", "locator": "//div[@id='slider']", "drag_angle": 0,
+            "drag_percent": 40, "drag_duration": 0.6},
+           # 鼠标滚轮：up / down；网页按像素，桌面按格
+           {"action": "wheel", "wheel_direction": "down", "wheel_amount": 500},
        ])
        api.add_loop("我的项目", "{{列表}}", body=[{"action": "note", "text": "{{loop.item}}"}])
        api.validate_project("我的项目")
