@@ -159,10 +159,15 @@
             return new Response(text, { status: 200, headers: { 'Content-Type': 'application/json' } })
           },
           customTools: {
-            // 让模型能主动取「变量清单」里的值（读取数据 / 循环项都在里面）
+            // 兜底工具：**只在「必须看懂内容」时才用**。
+            // 平时要填值请直接写 {{名字}} —— 程序会在真正输入前替换成真值，
+            // 那样变量值不会进模型（密码、采集到的客户资料都靠这条守住）。
             get_local_variable: {
-              description: '从 RPA 变量上下文里取一个变量的值。当需要填写来自本地文件、' +
-                '上一步产出、或循环当前项的数据时用它。变量路径如 文章.标题、loop.item.内容。',
+              description: '从 RPA 变量上下文里读取一个变量的**值**（会把值发给我，' +
+                '所以只在确实需要看懂内容时才用，比如要改写它）。' +
+                '如果只是要把它填进输入框，请直接在文本里写 {{变量名}} —— ' +
+                '程序会在真正输入时替换成真值，那个值不会发给我。' +
+                '变量路径如 文章.标题、loop.item.内容。',
               inputSchema: B.z.object({
                 variablePath: B.z.string().describe('变量路径，如 文章.标题 或 loop.item.内容'),
               }),

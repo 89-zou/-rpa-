@@ -4,15 +4,19 @@
 任务节点是**一句人话**，但一句话要落地，往往得知道项目里有什么现成的东西：
 变量清单里有哪些名字、img/ 里有哪些图、有没有登录态、data/ 里采到了什么、
 函数库里有哪些函数。这些不该让用户每次手打一遍 —— 这里自动读出来，拼成一段
-「项目资料」附在任务描述后面，AI 一眼就知道有什么可用、能直接引用。
+「项目资料」附在任务描述后面，AI 一眼就知道有什么可用。
 
-规矩：
+**只给名字，不给值**（这是这一版最重要的规矩）：
+变量值、采集到的数据内容都可能敏感（密码、cookie、客户资料……），所以一律不进模型。
+AI 想用某个值就写 `{{名字}}`，程序在**真正敲进输入框之前**才替换成真值
+（见 page_agent/bridge.py 的 `_fill_vars`）。要给 AI 看内容本身，那是显式动作：
+让它调 `get_local_variable` 工具去取（那一步会把值发给模型）。
+
+其它规矩：
 · **只读**，不改任何文件；
-· 全部有上限（变量 40 个、每个值 80 字、图片 30 张……）—— 这段文字每次调模型
-  都会带上，撑爆了白花 token；
-· 运行时给的是**真实值**（循环当前项 `loop.item` 也在里面），编辑时给的是清单里的静态值。
+· 全部有上限（变量 40 个、图片 30 张、总字数 4000……）—— 这段文字每次调模型都会带上；
+· 运行时看得到**有哪些变量**（循环里的 loop.item.* 也在），编辑时看的是项目里定义的清单。
 """
-import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -21,16 +25,17 @@ from rpa_page_agent.core.project_store import ProjectStore
 
 #: 各类资料的上限（都是「显示多少个/多少字」）
 MAX_VARS = 40
-MAX_VAR_CHARS = 80
 MAX_IMAGES = 30
 MAX_DATA_FILES = 15
 MAX_FUNCS = 20
-MAX_RECORDS = 2
-MAX_RECORD_CHARS = 200
+#: 变量名连着写时的折行宽度
+NAME_WRAP = 68
 #: 这一段的总字数上限（兜底，防止某个项目特别大）
 MAX_TOTAL_CHARS = 4000
 
-HEADER = "【项目资料】（程序自动读的，下面这些可以直接用，不用再问我）"
+HEADER = ("【项目资料】（程序自动读的，下面这些可以直接用，不用再问我）\n"
+          "★ 变量只给了名字，**值不会发给你**：要填某个值就在文本里原样写 "
+          "{{名字}}（花括号别改），程序会在真正输入的那一刻替换成真值。")
 
 
 def _clip(text: Any, limit: int) -> str:
@@ -39,14 +44,21 @@ def _clip(text: Any, limit: int) -> str:
     return flat if len(flat) <= limit else flat[:limit] + "…"
 
 
-def _flat(value: Any) -> str:
-    """任意值 → 一行文本（列表/字典用 JSON，别写成一坨 Python repr）。"""
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return _clip(value, MAX_VAR_CHARS)
-    try:
-        return _clip(json.dumps(value, ensure_ascii=False), MAX_VAR_CHARS)
-    except Exception:
-        return _clip(value, MAX_VAR_CHARS)
+def _wrap_names(names: List[str], prefix: str = "· ", sep: str = "、",
+                width: int = NAME_WRAP) -> List[str]:
+    """一串名字连着写、到宽度就折行（比一行一个省地方）。"""
+    lines: List[str] = []
+    cur = prefix
+    for name in names:
+        piece = name if cur == prefix else sep + name
+        if cur != prefix and len(cur) + len(piece) > width:
+            lines.append(cur)
+            cur = prefix + name
+        else:
+            cur += piece
+    if cur != prefix:
+        lines.append(cur)
+    return lines
 
 
 def _size_kb(path: Path) -> str:
@@ -65,19 +77,21 @@ def _more(shown: int, total: int) -> str:
 # 五类资料
 # ----------------------------------------------------------------------
 def _variables(store: ProjectStore, runtime: Optional[Dict[str, Any]]) -> List[str]:
-    """变量清单：项目里定义的 + 运行时真有的（运行时值优先）。"""
+    """变量清单：**只报名字，不报值**（值可能敏感，由程序在输入时替换）。
+
+    运行时（runtime）传进来的变量一并算上：比如循环里的 loop.item.*、上一步产出的字段，
+    这样 AI 知道「现在有哪些名字可用」，但看不到内容。
+    """
     static = store.load_all_variables()
     live = dict(runtime or {})
     names = list(static.keys()) + [k for k in live if k not in static]
     if not names:
         return ["（这个项目还没有变量；用「读取数据」节点或「采集」节点能产出变量）"]
-    out = []
-    for name in names[:MAX_VARS]:
-        value = live.get(name, static.get(name, ""))
-        shown = _flat(value)
-        out.append(f"· {name} = {shown}" if shown else f"· {name}（空）")
-    out.append(f"（共 {len(names)} 个变量，写 {{名字}} 就能用{_more(MAX_VARS, len(names))}；"
-               f"也可以随时用 get_local_variable 工具按名字取）")
+    out = _wrap_names(names[:MAX_VARS])
+    out.append(f"（共 {len(names)} 个变量{_more(MAX_VARS, len(names))}。"
+               "写 {{名字}} 就能把值填进去 —— 值由程序替换，不会发给你；"
+               "只有确实需要看懂内容本身（比如要改写它）才用 get_local_variable 取，"
+               "那一步会把值发给模型，敏感信息别这么干）")
     return out
 
 
@@ -111,15 +125,17 @@ def _auth(project_dir: Path, store: ProjectStore) -> List[str]:
 
 
 def _data(project_dir: Path) -> List[str]:
-    """采集数据：采到了多少条、下载了哪些文件、data/ 里还有些什么。"""
+    """采集数据：**只说有多少、有哪些字段和文件，不给内容**（内容可能敏感）。
+
+    记录内容想进模型得走显式动作（`{{变量}}` 由程序填值，或让 AI 用取变量工具）。
+    """
     out: List[str] = []
     records_path = datastore.records_path(project_dir)
-    records: List[Dict[str, Any]] = []
     if records_path.is_file():
         try:
             total = datastore.count_records(project_dir)
-            records = datastore.read_records(project_dir, limit=MAX_RECORDS)
-            cols = datastore.columns(records) or []
+            sample = datastore.read_records(project_dir, limit=1)
+            cols = datastore.columns(sample) or []
             out.append(f"· records.jsonl：{total} 条记录"
                        + (f"，字段：{'、'.join(cols[:12])}" if cols else ""))
         except Exception:
@@ -153,12 +169,8 @@ def _data(project_dir: Path) -> List[str]:
             + _more(len(shown), len(others)))
     if not out:
         return ["（data/ 里还是空的：采集节点跑过后才会有记录和下载文件）"]
-    for rec in records:
-        try:
-            out.append("· 记录示例：" + _clip(json.dumps(rec, ensure_ascii=False),
-                                              MAX_RECORD_CHARS))
-        except Exception:
-            pass
+    out.append("（只报数量、字段名和文件名，**记录内容不给你**；要填进页面就在文本里写 "
+               "{{变量名}}，程序会替换）")
     return out
 
 

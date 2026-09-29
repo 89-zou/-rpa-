@@ -14,6 +14,7 @@
 """
 import json
 import random
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -81,6 +82,8 @@ class PageAgentBridge:
         self.injected = False
         self._llm_calls = 0
         self._session: Optional[Dict[str, Any]] = None
+        #: 运行时的变量真值（只留在本进程：AI 看到的是名字，值由这里替换）
+        self._variables: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # 注入
@@ -156,6 +159,9 @@ class PageAgentBridge:
             session["url"] = url
             session["fresh_next"] = False
         self._session = session
+        # 真值留一份在本进程（_fill_vars 要用）；给页面的是同一份，页面只用来
+        # 支撑「取变量」工具，AI 平时看不到里面有什么
+        self._variables = dict(variables or {})
         self.page.evaluate("(v) => { window.__RPA_VARS__ = v || {}; }",
                            _jsonable(variables))
         self.page.evaluate(
@@ -302,8 +308,10 @@ class PageAgentBridge:
 
     def _real_type(self, x: float, y: float, text: str):
         x, y = self._clamp(x, y)
+        # 日志打的是**替换前**的文本：真值既不进模型、也不落日志
         self.log(f"  真实键盘输入 ({x:.0f},{y:.0f})：{text[:40]}"
                  + ("…" if len(text) > 40 else ""))
+        text = self._fill_vars(text)
         self.page.mouse.move(x, y, steps=6)
         self.page.mouse.click(x, y)
         time.sleep(random.uniform(0.12, 0.25))
@@ -334,6 +342,38 @@ class PageAgentBridge:
             }"""))
         except Exception:
             return "unknown"
+
+    def _fill_vars(self, text: str) -> str:
+        """把 AI 写下的 `{{变量名}}` 换成真值 —— **值只在这一刻出现**。
+
+        为什么这么绕：变量值（密码、cookie、采集到的客户资料）不该进模型，所以
+        「项目资料」里只告诉 AI 有哪些名字。AI 要填值就原样写 `{{名字}}`（花括号别改），
+        由这里在**真正敲进输入框之前**替换。这样 AI 能干活，但看不到值。
+
+        替换只发生在本进程的内存里：日志打的是替换前的文本，页面里也没有这些值。
+        """
+        raw = str(text or "")
+        if "{{" not in raw:
+            return raw
+        filled: Dict[str, int] = {}
+        missing: Dict[str, int] = {}
+
+        def sub(m):
+            name = m.group(1).strip()
+            if name in self._variables:
+                filled[name] = 1
+                value = self._variables[name]
+                return value if isinstance(value, str) else str(value)
+            missing[name] = 1
+            return m.group(0)          # 没这个变量：原样留着，更容易看出问题
+
+        out = re.sub(r"\{\{\s*([^{}]+?)\s*\}\}", sub, raw)
+        if filled:
+            self.log(f"  程序填值：{'、'.join(filled)}（值不经过模型，也不打日志）")
+        if missing:
+            self.log(f"  提醒：这些 {{名字}} 在变量里找不到，只能原样输入："
+                     f"{'、'.join(list(missing)[:6])}")
+        return out
 
     def _clamp(self, x: float, y: float):
         """把坐标压在视口里：外面的点根本送不到元素上。"""
@@ -378,12 +418,17 @@ class PageAgentBridge:
 # 给执行器用的两个薄接口
 # ======================================================================
 def run_agent_task(executor, step) -> Dict[str, Any]:
-    """执行「任务」节点（step.action == "agent"）：把这一句话交给页面内的 Page Agent。"""
-    task = executor._resolve_value(step.agent_task or "").strip()
+    """执行「任务」节点（step.action == "agent"）：把这一句话交给页面内的 Page Agent。
+
+    **故意不把 {{变量}} 换成真值**：换掉就把密码、采集数据这些一起发给了模型。
+    描述原样发过去（AI 看到的是 {{名字}}），等它把值填进输入框时，由
+    `_fill_vars` 在本进程里替换 —— 值永远不进模型。
+    """
+    task = str(step.agent_task or "").strip()
     if not task:
         raise ValueError("「任务」还没写描述：双击节点，用一句话说清要做什么"
                          "（例：在标题框填「今天天气」，然后点发布）")
-    hints = executor._resolve_value(step.agent_hints or "").strip()
+    hints = str(step.agent_hints or "").strip()
     if hints:
         task = f"{task}\n\n额外要求：{hints}"
 

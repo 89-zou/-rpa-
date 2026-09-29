@@ -87,8 +87,9 @@ class PageAgentPanel(QWidget):
             "程序自动从本项目读出来的：变量清单 / 图片库 / 登录态 / 采集数据 / 函数库。\n"
             "跑这一步时会连同任务描述一起交给页面里的 AI，所以你可以直接说\n"
             "「用 {{标题}} 当标题」，不用再解释这些名字是什么。\n"
-            "注意：这段文字会随任务发给模型（也就是你配的 DeepSeek），"
-            "里面有采集数据、变量值 —— 不想让它看到的就别放进项目里。")
+            "这段文字会随任务发给模型（你配的 DeepSeek），但**只给名字不给值**：\n"
+            "变量值、采集到的记录内容都不进模型 —— AI 写下 {{名字}}，"
+            "程序在真正输入的那一刻才替换成真值。")
         self.context_box.setStyleSheet("color: #475569;")
         ctx_layout.addWidget(self.context_box, 1)
         btn_row = QWidget()
