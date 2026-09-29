@@ -14,9 +14,10 @@ from typing import Optional
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
     QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
-    QSpinBox, QWidget,
+    QSpinBox, QVBoxLayout, QWidget,
 )
 
+from rpa_page_agent.core import project_context
 from rpa_page_agent.core.page_agent import config as pa_config
 from rpa_page_agent.ui.ai_settings_tab import open_hub
 
@@ -75,6 +76,32 @@ class PageAgentPanel(QWidget):
         num_layout.addStretch()
         root.addRow("步数 / 时间：", num_row)
 
+        # ---- 项目资料（自动读，运行时一并交给 AI）----
+        ctx_row = QWidget()
+        ctx_layout = QHBoxLayout(ctx_row)
+        ctx_layout.setContentsMargins(0, 0, 0, 0)
+        self.context_box = QPlainTextEdit()
+        self.context_box.setReadOnly(True)
+        self.context_box.setFixedHeight(104)
+        self.context_box.setToolTip(
+            "程序自动从本项目读出来的：变量清单 / 图片库 / 登录态 / 采集数据 / 函数库。\n"
+            "跑这一步时会连同任务描述一起交给页面里的 AI，所以你可以直接说\n"
+            "「用 {{标题}} 当标题」，不用再解释这些名字是什么。\n"
+            "注意：这段文字会随任务发给模型（也就是你配的 DeepSeek），"
+            "里面有采集数据、变量值 —— 不想让它看到的就别放进项目里。")
+        self.context_box.setStyleSheet("color: #475569;")
+        ctx_layout.addWidget(self.context_box, 1)
+        btn_row = QWidget()
+        btn_col = QVBoxLayout(btn_row)
+        btn_col.setContentsMargins(0, 0, 0, 0)
+        self.btn_context = QPushButton("刷新")
+        self.btn_context.setToolTip("重新读一遍项目里的这些资料")
+        self.btn_context.clicked.connect(self._refresh_context)
+        btn_col.addWidget(self.btn_context)
+        btn_col.addStretch()
+        ctx_layout.addWidget(btn_row)
+        root.addRow("项目资料：", ctx_row)
+
         # ---- 当前用哪个 AI（只读；要改去主窗口的【AI 设置】）----
         ai_row = QWidget()
         ai_layout = QHBoxLayout(ai_row)
@@ -96,8 +123,28 @@ class PageAgentPanel(QWidget):
     def set_project_dir(self, project_dir):
         self.project_dir = Path(project_dir) if project_dir else None
 
+    def _refresh_context(self):
+        """重读项目资料（变量清单 / 图片库 / 登录态 / 采集数据 / 函数库）。
+
+        这里给的是**清单里的静态值**（编辑时看不到运行时的真实数据），
+        跑流程时执行器会拿真值重读一遍 —— 两份内容是一套代码出的，格式一致。
+        """
+        if not self.project_dir:
+            self.context_box.setPlainText("（还没打开项目）")
+            return
+        try:
+            data = project_context.collect(self.project_dir)
+            counts = "、".join(f"{k} {v}" for k, v in (data.get("counts") or {}).items()
+                               if v)
+            self.context_box.setPlainText(
+                (data.get("text") or "（这个项目里还没有可读的资料）")
+                + (f"\n\n—— 小结：{counts}" if counts else ""))
+        except Exception as e:                 # 读资料失败不该拦住编辑节点
+            self.context_box.setPlainText(f"（读不出来：{type(e).__name__}: {e}）")
+
     def reload(self):
-        """刷「当前 AI」那一行（新建节点、切项目、打开设置回来时都会调）。"""
+        """刷「项目资料」和「当前 AI」（新建节点、切项目、打开设置回来时都会调）。"""
+        self._refresh_context()
         cfg = pa_config.load(self.project_dir)
         self._def_steps = int(cfg.get("max_steps") or pa_config.DEFAULT_MAX_STEPS)
         self._def_timeout = int(cfg.get("timeout_s") or pa_config.DEFAULT_TIMEOUT_S)

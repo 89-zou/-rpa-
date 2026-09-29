@@ -387,6 +387,18 @@ def run_agent_task(executor, step) -> Dict[str, Any]:
     if hints:
         task = f"{task}\n\n额外要求：{hints}"
 
+    # 项目里现成有什么（变量清单 / 图片库 / 登录态 / 采集数据 / 函数库）自动读出来带上，
+    # 免得用户为了「用哪份数据、叫什么名字」再手打一遍
+    try:
+        from rpa_page_agent.core import project_context
+        lines = project_context.summary(executor.project_dir, executor.variables)
+        ctx = project_context.text_for(executor.project_dir, executor.variables)
+        if ctx:
+            task = f"{task}\n\n{ctx}"
+            executor.log(f"  已带上项目资料（{lines}）")
+    except Exception as e:
+        executor.log(f"  提示：项目资料没读全（{type(e).__name__}: {e}）")
+
     cfg = pa_config.load(executor.project_dir)
     bad = pa_config.problem(cfg)
     if bad:
