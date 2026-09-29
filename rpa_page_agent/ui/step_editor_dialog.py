@@ -345,9 +345,9 @@ PAGE_AGENT_HELP = (
     "真正落下的**点击和输入由本程序执行**（走浏览器的输入通道，事件 isTrusted=true，\n"
     "跟真人操作一样），所以对风控敏感的系统也稳。\n"
     "\n"
-    "【AI 设置】接口地址 / 模型 / 密钥在主窗口的【AI 设置】标签页里，\n"
-    "整个程序共用一份（把 API 密钥粘进去会自动认服务商、列模型），\n"
-    "这里只显示「当前用的是谁」，点【打开 AI 设置】就能过去改。\n"
+    "【AI 设置】只要一个 DeepSeek 的 API 密钥（模型固定 deepseek-v4-flash），\n"
+    "在主窗口【AI 设置】标签页里粘一下就行；还没有 Key 就去\n"
+    "https://platform.deepseek.com/ 注册一个。\n"
     "密钥不会进页面：页面里的 AI 要调模型时，请求会交回本程序进程去发。\n"
     "\n"
     "【话怎么写】\n"
@@ -750,7 +750,7 @@ class StepEditDialog(QDialog):
         form.addRow("任务：", self.agent_panel)
         self.agent_hint = help_row(
             "一句话说清要做什么，页面内的 AI 自己看页面、自己点；"
-            "用哪个 AI 在主窗口的【AI 设置】里配，整个程序共用一份。",
+            "DeepSeek 的 API 密钥在主窗口【AI 设置】里填，整个程序共用。",
             "任务", PAGE_AGENT_HELP)
         form.addRow("", self.agent_hint)
 
