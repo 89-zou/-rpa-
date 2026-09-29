@@ -24,6 +24,7 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 from typing import Dict, Optional, Tuple
 
 from rpa_page_agent import paths
@@ -209,39 +210,115 @@ def start_or_attach(exe_hint: str, port: int, url: str = "", headless: bool = Fa
 
 
 # ---------------------------------------------------------------- 用键盘敲网址
+#: 敲完回车等多久算「这次没生效」（没生效就补一次回车）
+ENTER_WAIT_S = 3.0
+
+
+def _href(page) -> str:
+    try:
+        return str(page.evaluate("() => location.href") or "")
+    except Exception:
+        return ""
+
+
+def _is_real_page(href: str) -> bool:
+    """这个地址算不算「打开了一个真页面」（排除空白页和浏览器错误页）。"""
+    low = (href or "").strip().lower()
+    if not low or low in ("about:blank", "about:newtab"):
+        return False
+    return not (low.startswith("chrome-error")
+                or low.startswith("edge-error")
+                or low.startswith("about:"))
+
+
+def _arrived(page, url: str, before: str) -> str:
+    """页面跳到目标地址了吗？到了返回当前地址，没到返回空串。
+
+    两种算「到了」：地址变了（站点自己 301 / 补尾斜杠也算），或者本来就在目标站点上。
+    —— 光判「不是空白页」不行：浏览器配置目录里可能自己带着一个「新标签页」，
+    那样第一轮就会误报「已经打开」，其实网址还没敲进去。
+    """
+    href = _href(page)
+    if not _is_real_page(href):
+        return ""
+    if href != before:
+        return href
+    host = urlsplit(url).netloc.lower()
+    return href if host and host in href.lower() else ""
+
+
+def _page_focused(page) -> bool:
+    """页面（＝那个浏览器窗口）现在是不是真的在前台？
+
+    `document.hasFocus()` 是网页能问到的「我是不是当前活动窗口」——用它来判断
+    「键盘敲下去会敲进浏览器」还是「会敲到别的程序里去」。
+    """
+    try:
+        return bool(page.evaluate("() => document.hasFocus()"))
+    except Exception:
+        return False
+
+
 def type_url(page, url: str, timeout_s: float = 20.0, log=print):
     """像真人一样：Ctrl+L 聚焦地址栏 → 逐字敲网址 → 回车，并确认页面真的跳过去了。
 
-    这条路的代价就是要窗口在前台：所以先 bring_to_front，敲完再等 URL 变化，
-    没跳过去就报错（比默默失败强）。
+    两个坑都在这儿堵住：
+
+    · **窗口不在前台**：键盘敲下去会敲进别的程序（用户正在用的编辑器、聊天框……），
+      浏览器这边当然「没反应」。所以敲之前先确认 `document.hasFocus()`，
+      不在前台就别敲了，直接导航 —— 免得把网址喷到别人窗口里。
+    · **中文输入法吃掉第一个回车**：它只是把候选「上屏」，不算提交地址。
+      所以敲完等 3 秒没跳就再敲一次，最多三次；再不行就直接导航兜底。
     """
     try:
         import pyautogui
     except Exception as e:
         raise BrowserError(f"「用键盘敲网址」需要 pyautogui：{e}") from e
+
+    deadline = time.monotonic() + max(5.0, timeout_s)
+
+    def direct(reason: str) -> str:
+        log(f"  {reason}，改用直接导航（更稳）")
+        left = max(3.0, deadline - time.monotonic())
+        page.goto(str(url), wait_until="domcontentloaded", timeout=left * 1000)
+        got = _href(page)
+        if got:
+            log(f"  页面已经打开：{got[:80]}")
+        return got
+
     try:
-        page.bring_to_front()
+        page.bring_to_front()             # 标签页切到前台（窗口的激活还得看系统）
     except Exception:
         pass
     time.sleep(0.6)                       # 等窗口真的到前台
+    for _ in range(5):                    # 系统切窗口偶尔慢一拍，再等等看
+        if _page_focused(page):
+            break
+        time.sleep(0.3)
+    if not _page_focused(page):
+        return direct("浏览器窗口没在前台（键盘会敲到别的程序里）")
+
+    before = _href(page)
     log(f"  用键盘输入网址：{url}")
-    pyautogui.hotkey("ctrl", "l")
+
+    pyautogui.hotkey("ctrl", "l")         # 聚焦地址栏并全选
     time.sleep(0.25)
-    pyautogui.typewrite(str(url), interval=0.02)
+    pyautogui.typewrite(str(url), interval=0.03)
     time.sleep(0.15)
     pyautogui.press("enter")
-    # 等页面真的跳过去（键盘没敲进去 / 窗口不在前台时，这里会超时）
-    deadline = time.monotonic() + max(5.0, timeout_s)
-    while time.monotonic() < deadline:
-        try:
-            current = str(page.evaluate("() => location.href") or "")
-        except Exception:
-            current = ""
-        if current and current != "about:blank" and not current.startswith("chrome-error"):
-            log(f"  页面已经打开：{current[:80]}")
-            return current
-        time.sleep(0.4)
-    raise BrowserError(
-        "用键盘敲了网址，但页面一直没跳过去。\n"
-        "    多半是浏览器窗口没在前台（被别的窗口挡住了），或者焦点不在地址栏。\n"
-        "    可以改用「启动参数带网址」（更快更稳）。")
+
+    for attempt in range(3):
+        wait = min(ENTER_WAIT_S, max(0.0, deadline - time.monotonic()))
+        end = time.monotonic() + wait
+        while time.monotonic() < end:
+            got = _arrived(page, url, before)
+            if got:
+                log(f"  页面已经打开：{got[:80]}")
+                return got
+            time.sleep(0.3)
+        if attempt < 2 and time.monotonic() < deadline:
+            log("  回车没生效，再敲一次（中文输入法有时会吃掉第一次回车）")
+            pyautogui.press("enter")
+
+    # 键盘这条路一直不通 → 别再较劲（结果是用户要的，只是少了「敲」的过程）
+    return direct("键盘敲的网址一直没生效")
