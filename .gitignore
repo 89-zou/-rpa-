@@ -16,6 +16,9 @@ __pycache__/
 .idea/
 .vscode/
 
+# ---------- 本机的 AI 密钥（DeepSeek，存在数据目录里，绝不能进库）----------
+ai_settings.json
+
 # ---------- 崩溃日志 / 普通日志 ----------
 crash.log
 *.log
