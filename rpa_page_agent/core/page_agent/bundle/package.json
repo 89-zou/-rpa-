@@ -1,0 +1,18 @@
+{
+  "name": "rpa-page-agent-bundle",
+  "version": "1.12.4",
+  "private": true,
+  "type": "module",
+  "description": "把小邹RPA 要用的 page-agent 打成一个可注入页面的 IIFE（构建产物在上一级目录：page_agent.iife.js）",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@page-agent/core": "1.12.4",
+    "@page-agent/page-controller": "1.12.4",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

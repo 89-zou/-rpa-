@@ -1,0 +1,1056 @@
+# -*- coding: utf-8 -*-
+"""浏览器自动化标签页：项目管理 + 画布编排 + 运行/停止 + 日志。"""
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+from PyQt6.QtCore import QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction
+from PyQt6.QtWidgets import (
+    QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel, QMenu, QMessageBox,
+    QPushButton, QTextEdit, QVBoxLayout, QWidget,
+)
+
+from rpa_page_agent import paths
+from rpa_page_agent.core import blocks, datastore, desktop, real_mouse
+from rpa_page_agent.core.project_store import (
+    ProjectStore, Step, list_projects, rename_field_refs,
+)
+from rpa_page_agent.core.step_executor import (
+    PauseHandle, StepExecutor, available_variables, check_variables,
+    library_written_vars,
+)
+from rpa_page_agent.ui.flow_canvas import (
+    ACTION_META, DEFAULT_PLACEHOLDER, LAYOUT_VERSION, NO_PROJECT_PLACEHOLDER,
+    FlowCanvas, step_summary,
+)
+from rpa_page_agent.ui.flow_editor_dialog import FlowEditorDialog, GroupEditDialog
+from rpa_page_agent.ui.project_manager_dialog import ProjectManagerDialog
+from rpa_page_agent.ui.project_picker_dialog import (
+    NewProjectDialog, ProjectPickerDialog,
+)
+from rpa_page_agent.ui.run_monitor import RunMonitor
+from rpa_page_agent.ui.step_editor_dialog import StepEditDialog
+
+
+# 画布上方的常驻提示（连线操作时会被临时替换成提示）
+CANVAS_HINT = "双击节点编辑｜右键增删改｜Ctrl+滚轮缩放｜框内节点：选中后点右边小箭头可连线"
+
+
+class ExecutorWorker(QThread):
+    """在后台线程执行 StepExecutor。"""
+    log_signal = pyqtSignal(str)
+    pause_signal = pyqtSignal(str, int)        # (提示, step_id)
+    pause_resolved = pyqtSignal(str)           # auto/manual/abort，用于复位按钮
+    step_signal = pyqtSignal(int)              # 开始执行某一步（步骤 id）
+    state_signal = pyqtSignal(str)             # 手动暂停：paused / running
+
+    def __init__(
+        self,
+        steps: List[Step],
+        variables: dict,
+        project_dir=None,
+        headless: bool = False,
+        real_mouse: bool = False,
+        human_mouse: bool = False,
+        mouse_speed: float = 0.3,
+        scene: str = "web",
+        auth: Optional[dict] = None,
+    ):
+        super().__init__()
+        self._pause_handle: Optional[PauseHandle] = None
+        self._executor = StepExecutor(
+            steps=steps,
+            variables=variables,
+            headless=headless,
+            project_dir=project_dir,
+            log=self.log_signal.emit,
+            on_pause=self._on_pause,
+            on_resume=self.pause_resolved.emit,
+            on_step=self.step_signal.emit,
+            on_state=self.state_signal.emit,
+            real_mouse=real_mouse,
+            human_mouse=human_mouse,
+            mouse_speed=mouse_speed,
+            scene=scene,
+            auth=auth,
+        )
+
+    def _on_pause(self, step: Step) -> PauseHandle:
+        """暂停回调：立即返回句柄，执行器自行轮询人工信号与页面信号。"""
+        self._pause_handle = PauseHandle()
+        self.pause_signal.emit(
+            step.prompt or "请人工操作（如验证码），检测到完成后会自动继续", step.id
+        )
+        return self._pause_handle
+
+    def resolve_pause(self, continue_run: bool):
+        """主线程调用：人工下发 继续/终止。"""
+        handle = self._pause_handle
+        if not handle:
+            return
+        if continue_run:
+            handle.manual_continue.set()
+        else:
+            handle.manual_abort.set()
+
+    def pause_run(self, paused: bool):
+        """主线程调用：小窗上的手动暂停 / 继续（当前步骤跑完才真的停）。"""
+        self._executor.set_user_pause(paused)
+
+    def stop(self):
+        """请求停止（含解除可能的暂停）。"""
+        self._executor.stop()
+        self.resolve_pause(False)
+
+    def run(self):
+        try:
+            self._executor.run()
+        except Exception as e:
+            self.log_signal.emit(f"执行异常: {e}")
+
+
+class WebAutomationTab(QWidget):
+    """浏览器自动化标签页。"""
+
+    def __init__(self):
+        super().__init__()
+        self._worker: Optional[ExecutorWorker] = None
+        self._current_store: Optional[ProjectStore] = None
+        self._steps: List[Step] = []
+        self._scene: str = "web"        # 当前项目的场景：web / desktop
+        self._user_paused = False       # 小窗上手动暂停中
+        self._flow_paused = False       # 流程里的「暂停等人工」节点正在等
+        self._step_labels: dict = {}    # 步骤 id → 显示编号（结构标记的结束端不占编号）
+        # 画布缩放：Ctrl+滚轮会连发一串，抖一下再落盘（跟着项目走）
+        self._pending_zoom = 0.0
+        self._zoom_timer = QTimer(self)
+        self._zoom_timer.setSingleShot(True)
+        self._zoom_timer.setInterval(500)
+        self._zoom_timer.timeout.connect(self._save_zoom_now)
+        self._init_ui()
+        # 启动就打开一个项目：优先「安装时指定的默认项目」，没有就找内置演示项目；
+        # 都没有（比如用户把演示项目删了）→ 保持空项目，自己去【新建项目…】。
+        self._clear_project()
+        if not self._open_default_project():
+            self._append_log("请点【新建项目…】创建，或【载入项目…】选择已有项目。")
+
+    def _open_default_project(self) -> bool:
+        """启动时默认载入哪个项目（失败＝保持空项目）。"""
+        try:
+            names = {p.name for p in list_projects()}
+            if not names:
+                return False
+            want = str(paths.load_config().get("default_project")
+                       or paths.DEMO_PROJECT_NAME)
+            if want not in names:
+                return False
+            if self._load_project(want):
+                self._append_log(f"已默认载入项目：{want}（不想要了在【项目管理…】里删掉，"
+                                 "下次启动就是空项目）")
+                return True
+        except Exception as e:                  # 默认项目载入失败不该拦住启动
+            self._append_log(f"默认项目没能载入：{e}")
+        return False
+
+    # ------------------------------
+    # UI 构建
+    # ------------------------------
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # 项目栏：不自动载入项目（避免启动时卡界面），由用户显式选择
+        proj_layout = QHBoxLayout()
+        self.project_label = QLabel("当前项目：（未载入）")
+        self.project_label.setStyleSheet("color: #444;")
+        proj_layout.addWidget(self.project_label, 1)
+        self.btn_new = QPushButton("新建项目…")
+        self.btn_new.setToolTip("填名称和起始网址，创建后立即载入")
+        self.btn_new.clicked.connect(self._open_new_project)
+        proj_layout.addWidget(self.btn_new)
+        self.btn_load = QPushButton("载入项目…")
+        self.btn_load.setToolTip("从项目文件夹中选择要运行的项目")
+        self.btn_load.clicked.connect(self._open_project_picker)
+        proj_layout.addWidget(self.btn_load)
+        self.btn_manage = QPushButton("项目管理…")
+        self.btn_manage.setToolTip(
+            "项目列表、变量清单、图片库、登录态、采集数据都在这里管\n"
+            "（先选一个项目，右边就是它的配置）"
+        )
+        self.btn_manage.clicked.connect(self._open_project_manager)
+        proj_layout.addWidget(self.btn_manage)
+        layout.addLayout(proj_layout)
+
+        # 编辑按钮条
+        edit_layout = QHBoxLayout()
+        self.btn_flow_edit = QPushButton("流程编辑…")
+        self.btn_flow_edit.clicked.connect(self._open_flow_editor)
+        edit_layout.addWidget(self.btn_flow_edit)
+        self.btn_layout = QPushButton("自动排版")
+        self.btn_layout.setToolTip("按横向蛇形重新排列所有节点（超出宽度自动换行）")
+        self.btn_layout.clicked.connect(self._auto_layout)
+        edit_layout.addWidget(self.btn_layout)
+        edit_layout.addStretch()
+        self.hint_label = QLabel(CANVAS_HINT)
+        self.hint_label.setStyleSheet("color: #888;")
+        edit_layout.addWidget(self.hint_label)
+        layout.addLayout(edit_layout)
+
+        # 编排画布
+        self.canvas = FlowCanvas()
+        self.canvas.selection_changed.connect(self._update_edit_buttons)
+        self.canvas.node_activated.connect(self._edit_step_by_id)
+        self.canvas.positions_changed.connect(self._persist_positions_only)
+        self.canvas.auto_layout_applied.connect(self._on_auto_layout_applied)
+        self.canvas.context_menu_requested.connect(self._show_canvas_menu)
+        self.canvas.edges_changed.connect(self._persist_canvas_edges)
+        self.canvas.zoom_changed.connect(self._persist_canvas_zoom)
+        self.canvas.connect_status.connect(self._on_connect_status)
+        layout.addWidget(self.canvas, 3)
+
+        # 运行栏
+        run_layout = QHBoxLayout()
+        self.btn_run = QPushButton("运行")
+        self.btn_run.clicked.connect(self._run)
+        run_layout.addWidget(self.btn_run)
+        self.btn_stop = QPushButton("停止")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self._stop)
+        run_layout.addWidget(self.btn_stop)
+        self.btn_continue = QPushButton("继续（人工处理完）")
+        self.btn_continue.setEnabled(False)
+        self.btn_continue.clicked.connect(self._resolve_pause_continue)
+        run_layout.addWidget(self.btn_continue)
+        self.btn_abort = QPushButton("终止（暂停中）")
+        self.btn_abort.setEnabled(False)
+        self.btn_abort.clicked.connect(self._resolve_pause_abort)
+        run_layout.addWidget(self.btn_abort)
+        run_layout.addSpacing(12)
+        self.chk_real_mouse = QCheckBox("真实鼠标")
+        self.chk_real_mouse.setToolTip(
+            "用操作系统级的真实鼠标点击（pyautogui）代替浏览器合成事件。\n"
+            "个别站点（canvas 画板、拖拽控件、盯自动化特征的站）需要它。\n\n"
+            "代价：\n"
+            "· 浏览器窗口必须可见、在最前面，全程别动鼠标键盘（会占用你的鼠标）；\n"
+            "· 第一次点击前会先花两次移动做坐标标定；\n"
+            "· 用不了（窗口被挡住 / pyautogui 没装）会自动退回普通点击，日志里会写明。\n\n"
+            "紧急情况：把鼠标猛地甩到屏幕左上角可急停。默认关闭。"
+        )
+        self.chk_real_mouse.stateChanged.connect(self._on_real_mouse_toggled)
+        run_layout.addWidget(self.chk_real_mouse)
+        # 桌面场景的「拟人化鼠标」：光标分步移动过去（缓入缓出 + 轻微抖动），
+        # 落点稍停再点，更像人手 —— 对瞬移敏感的软件更稳。默认关（瞬移最快）。
+        self.chk_human_mouse = QCheckBox("拟人化鼠标")
+        self.chk_human_mouse.setToolTip(
+            "桌面场景的鼠标行为：勾上以后光标**分步移动**过去（缓入缓出 + 轻微抖动）、\n"
+            "落点稍停再按下，更像人手；不勾就是「瞬移到位 + 立刻点」（最快）。\n\n"
+            "什么时候勾：\n"
+            "· 目标程序对「鼠标瞬间跳到控件上」不买账（游戏、有轨迹校验的软件）；\n"
+            "· 需要让人看得出鼠标是一路移过去的。\n\n"
+            "代价：每次点击多花零点几秒（速度在右边选）；跑的时候会占用你的鼠标，\n"
+            "鼠标猛地甩到屏幕左上角可以急停。"
+        )
+        self.chk_human_mouse.stateChanged.connect(self._on_human_mouse_toggled)
+        run_layout.addWidget(self.chk_human_mouse)
+        self.combo_mouse_speed = QComboBox()
+        for key, label, _sec in desktop.MOUSE_SPEED_PRESETS:
+            self.combo_mouse_speed.addItem(label, key)
+        self.combo_mouse_speed.setToolTip("拟人化移动大概花多久挪过去")
+        self.combo_mouse_speed.currentIndexChanged.connect(
+            self._on_mouse_speed_changed)
+        run_layout.addWidget(self.combo_mouse_speed)
+        run_layout.addStretch()
+        # 日志折叠开关（︿ 收起 / ﹀ 展开）：默认收起，不占画布地方
+        self._log_collapsed = True
+        self.btn_log_toggle = QPushButton("﹀ 日志")
+        self.btn_log_toggle.setToolTip("展开日志面板")
+        self.btn_log_toggle.setFixedWidth(84)
+        self.btn_log_toggle.clicked.connect(self._toggle_log)
+        run_layout.addWidget(self.btn_log_toggle)
+        layout.addLayout(run_layout)
+
+        # 日志
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumHeight(160)
+        self.log_text.setVisible(False)      # 默认收起
+        layout.addWidget(self.log_text, 1)
+
+        # 运行小窗：跑流程时主页收起来，只留屏幕右下角这一块（独立顶层窗口）
+        self.monitor = RunMonitor()
+        self.monitor.pause_clicked.connect(self._on_monitor_pause)
+        self.monitor.stop_clicked.connect(self._stop)
+        self.monitor.home_clicked.connect(self._back_to_home)
+
+    def _on_real_mouse_toggled(self, _state):
+        """「真实鼠标」开关：立即写进项目（每个项目各存各的）。"""
+        on = self.chk_real_mouse.isChecked()
+        if self._current_store:
+            self._current_store.save_real_mouse(on)
+        if not on:
+            self._append_log("真实鼠标已关闭，恢复浏览器合成点击。")
+        elif not real_mouse.available():
+            self._append_log(
+                "真实鼠标：pyautogui 没装，运行时仍会用普通点击。"
+                "装法：.venv\\Scripts\\python -m pip install pyautogui"
+            )
+        else:
+            self._append_log(
+                "真实鼠标已开启：运行时用系统级鼠标点击。"
+                "浏览器窗口要保持可见、在最前面，全程别动鼠标键盘。"
+            )
+
+    def _on_human_mouse_toggled(self, _state):
+        """「拟人化鼠标」开关（桌面场景）：立即写进项目。"""
+        on = self.chk_human_mouse.isChecked()
+        self.combo_mouse_speed.setEnabled(on and self._worker is None)
+        if self._current_store:
+            self._current_store.save_human_mouse(on, self._mouse_speed())
+        if on:
+            self._append_log(
+                f"拟人化鼠标已开启：光标分步移动过去（约 {self._mouse_speed():g} 秒）、"
+                "落点稍停再点。跑的时候别抢鼠标（甩到屏幕左上角可急停）。")
+        else:
+            self._append_log("拟人化鼠标已关闭：光标瞬移到位、立刻点击（最快）。")
+
+    def _on_mouse_speed_changed(self, _index):
+        """移动速度（快/中/慢）：立即写进项目。"""
+        if self._current_store:
+            self._current_store.save_human_mouse(
+                self.chk_human_mouse.isChecked(), self._mouse_speed())
+
+    def _mouse_speed(self) -> float:
+        """当前选的速度 → 秒。"""
+        key = self.combo_mouse_speed.currentData()
+        for k, _label, sec in desktop.MOUSE_SPEED_PRESETS:
+            if k == key:
+                return sec
+        return desktop.DEFAULT_MOUSE_SPEED
+
+    def _set_mouse_speed(self, seconds: float):
+        """按秒数选中对应的速度项（项目里存的是秒）。"""
+        for i, (k, _label, sec) in enumerate(desktop.MOUSE_SPEED_PRESETS):
+            if abs(sec - float(seconds)) < 1e-6:
+                self.combo_mouse_speed.setCurrentIndex(i)
+                return
+        self.combo_mouse_speed.setCurrentIndex(1)      # 认不出来就「中」
+
+    def _toggle_log(self):
+        """收起/展开日志面板，按钮符号在 ︿ 与 ﹀ 之间切换。"""
+        self._log_collapsed = not self._log_collapsed
+        self.log_text.setVisible(not self._log_collapsed)
+        if self._log_collapsed:
+            self.btn_log_toggle.setText("﹀ 日志")
+            self.btn_log_toggle.setToolTip("展开日志面板")
+        else:
+            self.btn_log_toggle.setText("︿ 日志")
+            self.btn_log_toggle.setToolTip("收起日志面板")
+
+    # ------------------------------
+    # 项目新建 / 载入
+    # ------------------------------
+    def _open_new_project(self):
+        """新建项目，建好后立即载入。"""
+        if self._worker is not None:
+            QMessageBox.warning(self, "提示", "执行进行中，请先停止再新建项目。")
+            return
+        dlg = NewProjectDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.created_store:
+            self._append_log(f"已创建项目【{dlg.created_store.name}】")
+            self._load_project(path=dlg.created_store.dir)
+
+    def _open_project_picker(self):
+        """从项目文件夹里选一个载入（也可浏览到别的文件夹）。"""
+        if self._worker is not None:
+            QMessageBox.warning(self, "提示", "执行进行中，请先停止再切换项目。")
+            return
+        current = self._current_store.dir if self._current_store else None
+        dlg = ProjectPickerDialog(current, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.chosen_path:
+            self._load_project(path=dlg.chosen_path)
+
+    def _load_project(self, name: Optional[str] = None, path=None) -> bool:
+        """载入项目：path 优先（任意文件夹），否则按项目名在项目文件夹里找。"""
+        store: Optional[ProjectStore] = None
+        if path is not None:
+            d = Path(path)
+            if (d / "steps.json").exists():
+                store = ProjectStore(d)
+        elif name:
+            store = next((p for p in list_projects() if p.name == name), None)
+
+        if store is None:
+            QMessageBox.warning(self, "提示", f"找不到项目：{path or name}")
+            return False
+
+        self._current_store = store
+        self._steps = store.load_steps()
+        self._scene = store.load_scene()
+        is_desktop = self._scene == "desktop"
+        # 桌面场景本身就是系统级鼠标键盘，「真实鼠标」那个开关没意义；
+        # 反过来桌面才有「拟人化鼠标」（分步移动 vs 瞬移），网页项目不显示。
+        self.chk_real_mouse.setVisible(not is_desktop)
+        self.chk_real_mouse.blockSignals(True)
+        self.chk_real_mouse.setChecked(store.load_real_mouse())
+        self.chk_real_mouse.blockSignals(False)
+        for w in (self.chk_human_mouse, self.combo_mouse_speed):
+            w.setVisible(is_desktop)
+        mouse_cfg = store.load_human_mouse()
+        self.combo_mouse_speed.blockSignals(True)
+        self._set_mouse_speed(mouse_cfg["speed"])
+        self.combo_mouse_speed.blockSignals(False)
+        self.chk_human_mouse.blockSignals(True)
+        self.chk_human_mouse.setChecked(mouse_cfg["human"])
+        self.chk_human_mouse.blockSignals(False)
+        self.combo_mouse_speed.setEnabled(mouse_cfg["human"])
+        # 旧版纵向排版、或新项目还没排过版 → 请求横向蛇形排版。
+        # 画布尚未显示时它会挂起，等拿到真实宽度再排（避免列数过窄）。
+        need_layout = (
+            store.load_layout_version() != LAYOUT_VERSION
+            or any(s.pos is None for s in self._steps)
+        )
+        self.canvas.load_steps(self._steps,
+                               auto_layout=False, keep_view=False)
+        # 画布上手动连的箭头（纯展示，随项目保存）
+        self.canvas.set_manual_edges(store.load_canvas_edges())
+        # 上次在这个项目里调好的缩放（Ctrl+滚轮那个），没存过就是 100%
+        self.canvas.set_zoom(store.load_canvas_zoom() or 1.0)
+        if need_layout:
+            self.canvas.request_layout_when_ready()
+        self.canvas.set_placeholder_text(DEFAULT_PLACEHOLDER)
+        self.project_label.setText(
+            f"当前项目：{store.name}"
+            + ("　【桌面应用】" if is_desktop else "　【网页】")
+        )
+        self._append_log(f"已载入项目【{store.name}】（{len(self._steps)} 步"
+                         + ("，桌面应用场景）" if is_desktop else "，网页场景）"))
+        self._update_edit_buttons()
+        return True
+
+    def _on_connect_status(self, message: str):
+        """画布连线操作的状态提示（已选起点 / 已连上 / 已删除…）。"""
+        self.hint_label.setText(message)
+
+    def _persist_canvas_edges(self):
+        """手动连线改了 → 落盘。纯展示数据，不影响执行。"""
+        if self._current_store:
+            self._current_store.save_canvas_edges(self.canvas.manual_edges())
+
+    def _persist_canvas_zoom(self, zoom: float):
+        """Ctrl+滚轮调了缩放 → 稍后落盘（连着滚会来一串，攒一攒再写）。"""
+        self._pending_zoom = float(zoom)
+        self._zoom_timer.start()
+
+    def _save_zoom_now(self):
+        if self._current_store and self._pending_zoom:
+            self._current_store.save_canvas_zoom(self._pending_zoom)
+
+    def _clear_project(self):
+        """卸载当前项目（未载入状态）。"""
+        self._current_store = None
+        self._steps = []
+        self._scene = "web"
+        self.chk_real_mouse.setVisible(True)
+        self.chk_real_mouse.blockSignals(True)
+        self.chk_real_mouse.setChecked(False)
+        self.chk_real_mouse.blockSignals(False)
+        for w in (self.chk_human_mouse, self.combo_mouse_speed):
+            w.setVisible(False)             # 没载入项目时不显示鼠标开关
+        self.chk_human_mouse.blockSignals(True)
+        self.chk_human_mouse.setChecked(False)
+        self.chk_human_mouse.blockSignals(False)
+        self.canvas.set_manual_edges([])
+        self.canvas.set_placeholder_text(NO_PROJECT_PLACEHOLDER)
+        self.canvas.load_steps([])
+        self.canvas.set_zoom(1.0)          # 没项目就回到原始大小
+        self.project_label.setText("当前项目：（未载入，请点【载入项目…】）")
+        self._update_edit_buttons()
+
+    def _on_auto_layout_applied(self):
+        """自动排版完成（含延迟到首次显示后的那次）：写盘并记录排版版本。"""
+        if self._current_store:
+            self._current_store.save(self._steps,
+                                     layout_version=LAYOUT_VERSION)
+
+    def _open_project_manager(self):
+        """打开【项目管理】：项目列表 + 变量清单 + 图片库 + 登录态 + 采集数据。"""
+        if self._worker is not None:
+            QMessageBox.warning(self, "提示", "执行进行中，请先停止再管理项目。")
+            return
+        current = self._current_store.name if self._current_store else ""
+        dlg = ProjectManagerDialog(current, self)
+        dlg.exec()
+        if dlg.open_project_name:
+            self._load_project(name=dlg.open_project_name)
+        elif self._current_store and not self._current_store.steps_file.exists():
+            # 当前项目刚被删掉了
+            self._append_log("当前项目已被删除，请重新载入项目。")
+            self._clear_project()
+        elif self._current_store and dlg.changed_project_name == current:
+            # 在弹窗里点【来源】改过当前项目的「读取数据」节点 → 内存里的步骤已过期
+            self._load_project(path=self._current_store.dir)
+
+    # ------------------------------
+    # 选择 / 按钮状态
+    # ------------------------------
+    def _selected_row(self) -> int:
+        sid = self.canvas.selected_step_id()
+        if sid is None:
+            return -1
+        for i, s in enumerate(self._steps):
+            if s.id == sid:
+                return i
+        return -1
+
+    def _update_edit_buttons(self):
+        """按项目/运行状态切换按钮。"""
+        editable = self._worker is None and self._current_store is not None
+        self.btn_flow_edit.setEnabled(editable)
+        self.btn_layout.setEnabled(editable)
+        self.btn_new.setEnabled(self._worker is None)
+        self.btn_load.setEnabled(self._worker is None)
+        self.btn_run.setEnabled(self._worker is None and editable)
+        self.chk_real_mouse.setEnabled(self._worker is None)
+        self.chk_human_mouse.setEnabled(self._worker is None)
+        self.combo_mouse_speed.setEnabled(
+            self._worker is None and self.chk_human_mouse.isChecked())
+
+    def _require_project(self) -> bool:
+        if not self._current_store:
+            QMessageBox.warning(self, "提示",
+                                "请先点【载入项目…】选择项目。")
+            return False
+        return True
+
+    # ------------------------------
+    # 变量来源检查
+    # ------------------------------
+    def _library_vars(self) -> List[str]:
+        """函数库里各函数写回的变量（「调用函数」节点的产出）。"""
+        return library_written_vars(
+            self._current_store.dir if self._current_store else None)
+
+    def available_variables(self) -> List[str]:
+        """当前项目可用的变量：元素定位 + 自定义变量 + 读取节点产出的 + 循环运行时。"""
+        return available_variables(
+            self._steps,
+            self._current_store.load_all_variables() if self._current_store else {},
+            self._library_vars(),
+        )
+
+    def _check_variables_before_run(self) -> bool:
+        """运行前检查变量是否有来源，避免"跑起来才发现正文是空的"。"""
+        problems = check_variables(
+            self._steps,
+            project_variables=(self._current_store.load_all_variables()
+                               if self._current_store else {}),
+            extra_names=self._library_vars(),
+            scene=self._scene,
+        )
+        if not problems:
+            return True
+        for p in problems:
+            self._append_log(f"变量检查：{p}")
+        reply = QMessageBox.warning(
+            self, "变量可能没有内容",
+            "检测到以下变量当前没有来源，运行时会被替换成空值或占位文字：\n\n"
+            + "\n".join(f"· {p}" for p in problems[:8])
+            + ("\n…" if len(problems) > 8 else "")
+            + "\n\n建议先双击相关节点补全配置（「读取数据」节点产出变量、"
+              "循环里才能用 {{loop.item.字段}}），或忽略本次提示继续运行。\n"
+              "仍要继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
+    # ------------------------------
+    # 流程编辑弹窗（增/插/改/删/排序）
+    # ------------------------------
+    def _open_flow_editor(self):
+        """打开列表式流程编辑弹窗；弹窗内每一步改动都已即时落盘，这里只刷新画布。"""
+        if not self._require_project():
+            return
+        if self._worker is not None:
+            QMessageBox.warning(self, "提示", "执行进行中，请先停止再编辑流程。")
+            return
+        dlg = FlowEditorDialog(
+            self._current_store.dir, self._steps, self,
+            project_variables=self._current_store.load_all_variables(),
+            scene=self._scene,
+        )
+        dlg.exec()
+        if dlg.changed:
+            self._steps = dlg.get_steps()
+            # 不整体重排：用户摆好的画布布局要保住，新节点只补个空位
+            self._persist()
+            self._append_log("流程已更新（改动已自动保存）。")
+
+    def _auto_layout(self):
+        """手动触发横向蛇形重排（落盘由 auto_layout_applied 信号负责）。"""
+        if not self._require_project() or self._worker is not None:
+            return
+        if not self._steps:
+            return
+        self.canvas.apply_auto_layout()
+        self._append_log("已按横向蛇形重新排版。")
+
+    def _make_step_dialog(self, step: Optional[Step] = None,
+                          rule_mode: Optional[str] = None) -> StepEditDialog:
+        """统一构造步骤编辑对话框，带上可用变量供变量下拉使用。"""
+        return StepEditDialog(
+            self._current_store.dir, step, self,
+            variable_names=self.available_variables(),
+            default_url=next((s.url for s in self._steps
+                              if s.action == "navigate" and s.url), ""),
+            scene=self._scene,
+            rule_mode=rule_mode,
+        )
+
+    # ------------------------------
+    # 步骤增删改 / 排序（画布右键菜单使用）
+    # ------------------------------
+    def _persist(self, select_row: Optional[int] = None,
+                 auto_layout: Optional[bool] = None):
+        """统一保存：id 重排 → 写盘 → 重建画布。
+
+        默认**不动画布布局**（新节点只补一个空位）：布局是用户自己摆的，
+        加/删/改一个节点就把整片打乱太难受。只有【自动排版】按钮才整体重排。
+        """
+        if not self._current_store:
+            return
+        for i, s in enumerate(self._steps, start=1):
+            s.id = i
+        self._current_store.save(self._steps)
+        select_id = None
+        if select_row is not None and 0 <= select_row < len(self._steps):
+            select_id = self._steps[select_row].id
+        self.canvas.load_steps(self._steps,
+                               select_id=select_id, auto_layout=auto_layout)
+        self._update_edit_buttons()
+
+    def _persist_positions_only(self):
+        """拖拽结束：只写盘，不重建画布。"""
+        if self._current_store:
+            self._current_store.save(self._steps)
+
+    def _add_step(self):
+        """在选中步骤之后追加（右键菜单入口）；没选中则追加到末尾。"""
+        if not self._require_project():
+            return
+        row = self._selected_row()
+        pos = row + 1 if row >= 0 else len(self._steps)
+        dlg = self._make_step_dialog(
+            None, blocks.rule_mode_at(self._steps, pos))
+        try:
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                self._insert_at(pos, dlg.get_step())
+        finally:
+            dlg.deleteLater()       # 弹窗用完就销毁，别越攒越多
+
+    def _insert_step(self):
+        """在选中步骤之前插入；未选中时追加（右键菜单入口）。"""
+        if not self._require_project():
+            return
+        row = self._selected_row()
+        pos = row if row >= 0 else len(self._steps)
+        dlg = self._make_step_dialog(
+            None, blocks.rule_mode_at(self._steps, pos))
+        try:
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                self._insert_at(pos, dlg.get_step())
+        finally:
+            dlg.deleteLater()
+
+    def _insert_at(self, pos: int, step: Step):
+        """插入步骤；新增「循环」/「条件」时自动补上配套的结构节点。"""
+        new_steps = [step]
+        if step.action == "loop_start":
+            new_steps.append(Step(id=0, action=blocks.LOOP_END))
+        elif step.action == "condition_start":
+            new_steps.append(Step(id=0, action=blocks.COND_END))
+        self._steps[pos:pos] = new_steps
+        blocks.apply_default_rule(self._steps, pos)
+        self._persist(select_row=pos)       # 新节点自己补空位，不动现有布局
+
+    def _edit_selected_step(self):
+        row = self._selected_row()
+        if row >= 0:
+            self._edit_step_by_id(self._steps[row].id)
+
+    def _edit_step_by_id(self, step_id: int):
+        """双击节点/点编辑：保留画布位置。
+
+        「循环结束」「条件结束」的设置与所属块的配置节点合并成一份，
+        点它们也是编辑那个块。
+        """
+        row = next((i for i, s in enumerate(self._steps) if s.id == step_id), -1)
+        if row < 0:
+            return
+        row = blocks.marker_owner_index(self._steps, row)
+        old = self._steps[row]
+        if old.action == blocks.GROUP_START:
+            # 画布上只有一张组合卡片，双击它直接编辑这个组合（改名 / 登录用 / 取消组合）
+            self._edit_group(row)
+            return
+        owner = blocks.rule_owner_span(self._steps, row)
+        dlg = self._make_step_dialog(
+            old, self._steps[owner.start].cond_mode or "rule"
+            if owner is not None else None)
+        try:
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            new_step = dlg.get_step()
+        finally:
+            dlg.deleteLater()       # 弹窗用完就销毁，别越攒越多
+        new_step.pos = old.pos
+        self._steps[row] = new_step
+        if old.action == "read_data" and new_step.action == "read_data":
+            # 读取节点改名（产出变量 / 字段名）→ 别处的引用一起跟着改
+            for note in rename_field_refs(self._steps, old, new_step, skip=row):
+                self._append_log(f"变量改名：{note}")
+        self._persist(select_row=row)
+
+    def _edit_group(self, row: int):
+        """画布上双击组合卡片：改名字 + 进去编辑里面的节点。
+
+        画布上这张卡片只是一层壳——合并 / 取消组合 / 删除这类结构改动
+        都留在【流程编辑…】里，免得在画布上顺手一点就把流程结构改了。
+        """
+        group = self._steps[row]
+        number = blocks.number_of(self._steps, row)
+
+        def build_items():
+            span = blocks.span_by_marker(blocks.spans(self._steps), row)
+            if span is None:
+                return []
+            numbers = blocks.step_numbers(self._steps)
+            out = []
+            for i in range(span.inner_lo, span.inner_hi):
+                s = self._steps[i]
+                if s.action in blocks.END_MARKERS:
+                    continue        # 结束端不单独列（它的设置和开始端是同一份）
+                name = ACTION_META.get(s.action, (s.action, ""))[0]
+                summary = (step_summary(s) or [""])[0]
+                out.append((f"{numbers[i]}. {s.title or name}", summary, i))
+            return out
+
+        def on_edit(index: int):
+            if 0 <= index < len(self._steps):
+                self._edit_step_by_id(self._steps[index].id)
+
+        dlg = GroupEditDialog(group, number, build_items, on_edit, self)
+        try:
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            name = dlg.group_name
+        finally:
+            dlg.deleteLater()
+        if name != group.title:
+            group.title = name
+            self._persist(select_row=row)
+            self._append_log(f"组合改名：{name}")
+
+    def _delete_selected_step(self):
+        row = self._selected_row()
+        if row < 0:
+            return
+        block = blocks.span_by_marker(blocks.spans(self._steps), row)
+        if block is not None and block.kind == "group":
+            # 组合只当一层壳：画布上不给「取消组合 / 删除」，那些是【流程编辑】里的操作
+            gname = self._steps[block.start].title or "组合"
+            QMessageBox.information(
+                self, "组合节点",
+                f"「{gname}」是一层组合，里面收了 {blocks.inner_count(block)} 个步骤。\n\n"
+                "画布上只能做两件事：改它的名字、双击进去编辑里面的节点\n"
+                "（双击这张卡片就行）。\n\n"
+                "取消组合（只拆壳、不删步骤）请到【流程编辑…】里，"
+                "右键那个组合选【取消组合（里面的步骤都留着）】。",
+            )
+            return
+        if block is not None:
+            # 只有选中块的「标记」才整块删；块里的普通步骤只删自己
+            cn = blocks.ACTION_CN.get(self._steps[row].action, "结构节点")
+            reply = QMessageBox.question(
+                self, f"删除{cn}",
+                f"「{cn}」是配套的结构节点，删除会连同里面的 "
+                f"{block.end - block.start - 1} 个步骤一起去掉。\n确定删除吗？",
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            del self._steps[block.start:block.end + 1]
+            self._persist(select_row=min(block.start, len(self._steps) - 1))
+            return
+        step = self._steps[row]
+        num = blocks.number_of(self._steps, row)
+        cn = ACTION_META.get(step.action, (step.action, ""))[0]
+        label = f"{num}. {step.title or cn}" if num else (step.title or cn)
+        reply = QMessageBox.question(
+            self, "删除步骤", f"确定删除这个步骤（{label}）？",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._steps.pop(row)
+        self._persist(select_row=min(row, len(self._steps) - 1))
+
+    def _move_bounds(self, idx: int) -> Tuple[int, int]:
+        """该步骤允许上下移动到的下标范围（不许跨出自己所在的块）。"""
+        return blocks.move_bounds(self._steps, idx)
+
+    def _move_selected(self, delta: int):
+        row = self._selected_row()
+        if row < 0:
+            return
+        block = blocks.span_by_marker(blocks.spans(self._steps), row)
+        if block is not None:
+            # 选中块的标记：整块上下移动（整块位置不动，想摆位置直接拖它的虚线框）
+            a, b = block.start, block.end
+            if delta < 0:
+                if a == 0:
+                    return
+                self._steps[a - 1:b + 1] = (
+                    self._steps[a:b + 1] + [self._steps[a - 1]]
+                )
+                target = a - 1
+            else:
+                if b >= len(self._steps) - 1:
+                    return
+                self._steps[a:b + 2] = (
+                    [self._steps[b + 1]] + self._steps[a:b + 1]
+                )
+                target = a + 1
+            self._persist(select_row=target)
+            return
+        lo, hi = self._move_bounds(row)
+        target = row + delta
+        if not (lo <= target <= hi):
+            return
+        # 换了执行顺序，把这两个节点的画布坐标也对调一下：
+        # 这样画布上的先后位置跟编号仍然一致，其它节点一个都不动
+        a, b = self._steps[row], self._steps[target]
+        a.pos, b.pos = b.pos, a.pos
+        self._steps[row], self._steps[target] = b, a
+        self._persist(select_row=target)
+
+    # ------------------------------
+    # 画布右键菜单
+    # ------------------------------
+    def _show_canvas_menu(self, step_id, global_pos):
+        if not self._require_project() or self._worker is not None:
+            return
+        menu = QMenu(self)
+        if step_id is None:
+            act_add = QAction("新增步骤", menu)
+            act_add.triggered.connect(self._add_step)
+            menu.addAction(act_add)
+        else:
+            row = next((i for i, s in enumerate(self._steps) if s.id == step_id), -1)
+            if row < 0:
+                return
+
+            def act(text, slot, enabled=True):
+                a = QAction(text, menu)
+                a.setEnabled(enabled)
+                a.triggered.connect(slot)
+                menu.addAction(a)
+                return a
+
+            act("编辑", self._edit_selected_step)
+            act("在此之前插入", self._insert_step)
+            act("删除", self._delete_selected_step)
+            menu.addSeparator()
+            block = blocks.span_by_marker(blocks.spans(self._steps), row)
+            if block is not None:
+                lo, hi = block.start, block.end   # 选中块的标记：整块上下移动
+            else:
+                lo, hi = self._move_bounds(row)
+            act("上移", lambda: self._move_selected(-1), row > lo)
+            act("下移", lambda: self._move_selected(1), row < hi)
+        try:
+            menu.exec(global_pos)
+        finally:
+            # 每次右键都会建一个菜单，用完就销毁，别让它们一直堆着
+            menu.deleteLater()
+
+    # ------------------------------
+    # 运行/停止
+    # ------------------------------
+    def _run(self):
+        if not self._current_store:
+            QMessageBox.warning(self, "提示", "请先点【载入项目…】选择项目。")
+            return
+        if not self._steps:
+            QMessageBox.warning(self, "提示", "当前项目没有步骤。")
+            return
+        # 变量来源检查：避免"到时正文没有内容"
+        if not self._check_variables_before_run():
+            self._append_log("已取消运行（变量检查未通过）。")
+            return
+        # 运行前把画布上的位置等落盘
+        self._current_store.save(self._steps)
+        variables = self._current_store.load_all_variables()
+        self.btn_run.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self._worker = ExecutorWorker(
+            self._steps, variables,
+            project_dir=self._current_store.dir,
+            headless=False,
+            real_mouse=self.chk_real_mouse.isChecked(),
+            human_mouse=(self._scene == "desktop"
+                         and self.chk_human_mouse.isChecked()),
+            mouse_speed=self._mouse_speed(),
+            scene=self._scene,
+            auth=self._current_store.load_auth(),
+        )
+        self._worker.log_signal.connect(self._append_log)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.pause_signal.connect(self._on_pause)
+        self._worker.pause_resolved.connect(self._on_pause_resolved)
+        self._worker.step_signal.connect(self._on_step)
+        self._worker.state_signal.connect(self._on_worker_state)
+        self._worker.start()
+        self.canvas.set_readonly(True)
+        self._update_edit_buttons()
+        self._start_monitor()
+
+    # ------------------------------
+    # 运行小窗
+    # ------------------------------
+    def _start_monitor(self):
+        """开跑：主页收起来，右下角摆上小窗。"""
+        self._user_paused = False
+        self._flow_paused = False
+        name = self._current_store.name if self._current_store else ""
+        # 显示编号（组合标签是「2-4」这种范围、结束标记没有编号）：小窗上的「第 N 步」
+        # 要跟画布上看到的数字一致；组合和结束标记都不会被执行到，所以只认纯数字
+        labels = blocks.step_numbers(self._steps)
+        self._step_labels = {s.id: n for s, n in zip(self._steps, labels)
+                             if n.isdigit()}
+        self.monitor.start(name, len(self._step_labels))
+        win = self.window()
+        if win is not self:
+            win.hide()
+
+    def _show_home_window(self):
+        win = self.window()
+        if win is self:
+            return
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+    def _back_to_home(self):
+        """小窗上点【显示主页】：主页回来、小窗收起（流程在后台继续跑）。"""
+        self.monitor.hide()
+        self._show_home_window()
+        if self._worker is not None:
+            self._append_log(
+                "已回到主界面（流程仍在后台运行，想停下点【停止】）。"
+            )
+
+    def _on_step(self, step_id: int):
+        """小窗上显示「跑到第几步、这一步在干什么」。"""
+        step = next((s for s in self._steps if s.id == step_id), None)
+        if step is None:
+            return
+        cn = ACTION_META.get(step.action, (step.action, ""))[0]
+        detail = " / ".join(step_summary(step)[:2])
+        if step.title:
+            detail = f"{step.title}｜{detail}" if detail else step.title
+        self.monitor.set_step(self._step_labels.get(step_id, step_id), cn, detail)
+
+    def _on_monitor_pause(self):
+        """小窗上那个按钮：随当前状态既是「暂停」也是「继续」。"""
+        if self._worker is None:
+            return
+        if self._flow_paused:                   # 流程暂停节点在等人工
+            self._resolve_pause_continue()
+            return
+        self._set_user_pause(not self._user_paused)
+
+    def _set_user_pause(self, paused: bool):
+        self._user_paused = paused
+        if self._worker:
+            self._worker.pause_run(paused)
+        self.monitor.set_state("user" if paused else "running")
+        self._append_log(
+            "已请求暂停：当前这一步跑完就停住。" if paused else "继续执行。"
+        )
+
+    def _on_worker_state(self, state: str):
+        """执行器回报：手动暂停真的停住了 / 又开始跑了。"""
+        if state == "paused":
+            self.monitor.set_state("user")
+        elif state == "running":
+            self._user_paused = False
+            self.monitor.set_state("flow" if self._flow_paused else "running")
+
+    def _stop(self):
+        if self._worker:
+            self._user_paused = False
+            self.monitor.set_state("stopping")
+            self._worker.stop()
+
+    def _on_finished(self):
+        self.btn_run.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.btn_continue.setEnabled(False)
+        self.btn_abort.setEnabled(False)
+        self._worker = None
+        self.canvas.set_readonly(False)
+        self._update_edit_buttons()
+        # 跑完：收起小窗、主页回来（这是小窗退场的两种情况之一）
+        self._user_paused = False
+        self._flow_paused = False
+        self.monitor.hide()
+        self._show_home_window()
+        if self._current_store:
+            total = datastore.count_records(self._current_store.dir)
+            if total:
+                self._append_log(
+                    f"采集到的数据：data/{datastore.RECORDS_NAME} 共 {total} 条"
+                    "（在【项目管理…】→【采集数据】里查看 / 导出 Excel）")
+
+    def _on_pause(self, prompt: str, step_id: int):
+        num = self._step_labels.get(step_id, step_id)
+        self._append_log(
+            f"暂停 [步骤 {num}] {prompt} —— 满足恢复条件会自动继续，"
+            f"也可在小窗（或这里）点【继续】"
+        )
+        self.btn_continue.setEnabled(True)
+        self.btn_abort.setEnabled(True)
+        self._flow_paused = True
+        self.monitor.set_state("flow")
+
+    def _on_pause_resolved(self, reason: str):
+        tip = {
+            "auto": "已自动恢复",
+            "manual": "人工继续",
+            "abort": "已人工终止",
+        }.get(reason, reason)
+        self._append_log(f"暂停解除：{tip}")
+        self.btn_continue.setEnabled(False)
+        self.btn_abort.setEnabled(False)
+        self._flow_paused = False
+        self.monitor.set_state("running")
+
+    def _resolve_pause_continue(self):
+        if self._worker:
+            self._worker.resolve_pause(True)
+        self.btn_continue.setEnabled(False)
+        self.btn_abort.setEnabled(False)
+
+    def _resolve_pause_abort(self):
+        if self._worker:
+            self._worker.resolve_pause(False)
+        self.btn_continue.setEnabled(False)
+        self.btn_abort.setEnabled(False)
+
+    # ------------------------------
+    # 日志
+    # ------------------------------
+    def _append_log(self, message: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log_text.append(f"[{ts}] {message}")
+        if self.monitor.isVisible():        # 小窗上也滚动显示最近几条
+            self.monitor.add_log(message)
