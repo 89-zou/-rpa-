@@ -345,10 +345,10 @@ PAGE_AGENT_HELP = (
     "真正落下的**点击和输入由本程序执行**（走浏览器的输入通道，事件 isTrusted=true，\n"
     "跟真人操作一样），所以对风控敏感的系统也稳。\n"
     "\n"
-    "【LLM 设置】接口地址 / 模型 / 密钥是**项目级**的（存在本项目的 steps.json 里），\n"
-    "同一个项目的所有任务节点共用一份；填好点【试一下】能立刻验证通不通。\n"
+    "【AI 设置】接口地址 / 模型 / 密钥在主窗口的【AI 设置】标签页里，\n"
+    "整个程序共用一份（把 API 密钥粘进去会自动认服务商、列模型），\n"
+    "这里只显示「当前用的是谁」，点【打开 AI 设置】就能过去改。\n"
     "密钥不会进页面：页面里的 AI 要调模型时，请求会交回本程序进程去发。\n"
-    "服务商选 OpenAI 兼容的都行：通义（百炼）、DeepSeek、OpenAI、本机 Ollama / LM Studio。\n"
     "\n"
     "【话怎么写】\n"
     "· 写清“做什么 + 关键文字”：如「搜索「天气预报」并点第一条结果」；\n"
@@ -744,12 +744,13 @@ class StepEditDialog(QDialog):
 
         # --- 任务（一句话一个节点；实现在 ui/page_agent_panel.py）---
         self.agent_panel = PageAgentPanel()
-        self.agent_panel.set_project_dir(self.project_dir)   # LLM 配置是项目级的
+        self.agent_panel.set_project_dir(self.project_dir)   # 项目的默认步数/超时从这儿读
         self.agent_panel.reload()                            # 新建节点时也先把配置刷上
         self.agent_panel.changed.connect(self._sync_visibility)
         form.addRow("任务：", self.agent_panel)
         self.agent_hint = help_row(
-            "一句话说清要做什么，页面内的 AI 自己看页面、自己点；LLM 设置是项目级的，所有任务节点共用。",
+            "一句话说清要做什么，页面内的 AI 自己看页面、自己点；"
+            "用哪个 AI 在主窗口的【AI 设置】里配，整个程序共用一份。",
             "任务", PAGE_AGENT_HELP)
         form.addRow("", self.agent_hint)
 
@@ -1274,8 +1275,9 @@ class StepEditDialog(QDialog):
             self._show(w, uses_image)
         for w in self._value_widgets:
             self._show(w, is_fill)
-        for w in self._wait_widgets:
-            self._show(w, show_wait)
+        # 「等待」动作没有别的字段，就靠这一行的秒数活着，别跟其它动作一起藏起来
+        self._show(self.wait_combo, show_wait)
+        self._show(self.wait_seconds, show_wait or is_delay)
         self._show(self.wait_target_row, show_wait and need_target)
         self.btn_wait_shot.setVisible(self.desktop and show_loc)
         for w in self._pause_widgets:
@@ -1339,6 +1341,14 @@ class StepEditDialog(QDialog):
         sec_label = self._form.labelForField(self.wait_seconds)
         if sec_label is not None:
             sec_label.setText("等待秒数：" if is_delay else "额外等待：")
+        # 同一个输入框，两种角色：单独用时是「等几秒」，跟着别的步骤时是「做完再等几秒」
+        self.wait_seconds.setSpecialValueText("0 秒" if is_delay else "不等")
+        self.wait_seconds.setToolTip(
+            "这个「等待」节点要等几秒（必须大于 0），等完再往下走。"
+            if is_delay else
+            "这个步骤做完后再固定等几秒（0＝不等）。\n"
+            "站点慢、点了没反应（比如点了发布但页面没动）时，\n"
+            "给这一步加 2~3 秒往往就好了。")
         if is_drag:
             self._sync_drag_summary()
         self.adjustSize()
