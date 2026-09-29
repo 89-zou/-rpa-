@@ -522,6 +522,8 @@ class ProjectStore:
             data["functions"] = list(old["functions"])   # 函数库同理（别被保存步骤弄丢）
         if old.get("page_agent"):
             data["page_agent"] = dict(old["page_agent"])  # 智能节点的 LLM 配置同理
+        if old.get("browser"):
+            data["browser"] = dict(old["browser"])        # 用哪个浏览器的配置同理
         scene_val = normalize_scene(
             scene if scene is not None else old.get("scene"))
         if scene_val == SCENE_DESKTOP:
@@ -639,6 +641,45 @@ class ProjectStore:
             "language": str(language or "zh-CN").strip() or "zh-CN",
             "max_steps": int(max_steps or 20),
             "timeout_s": int(timeout_s or 180),
+        }
+        self._write(data)
+
+    def load_browser(self) -> Dict[str, Any]:
+        """用哪个浏览器（项目级）：
+
+        - use_real_browser：True＝启动**用户自己装的 Edge/Chrome**（带调试端口 + 独立配置目录），
+          False＝用 Playwright 自带的内核（老行为，内核在「浏览器/」里）；
+        - browser_path：浏览器 exe 路径（空＝自动探测；也可以给桌面快捷方式 .lnk，会自动解析）；
+        - debug_port：调试端口，默认 9222；
+        - type_url：True＝网址用键盘敲进地址栏（像真人），False＝启动参数直接带上网址（快）；
+        - keep_open：跑完留着浏览器窗口（默认 False＝收掉我们自己启的那个进程）。
+        """
+        raw = self.load().get("browser") or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        try:
+            port = int(raw.get("debug_port") or 9222)
+        except (TypeError, ValueError):
+            port = 9222
+        return {
+            "use_real_browser": bool(raw.get("use_real_browser")),
+            "browser_path": str(raw.get("browser_path") or ""),
+            "debug_port": port if 1024 <= port <= 65535 else 9222,
+            "type_url": bool(raw.get("type_url")),
+            "keep_open": bool(raw.get("keep_open")),
+        }
+
+    def save_browser(self, use_real_browser: bool = False, browser_path: str = "",
+                     debug_port: int = 9222, type_url: bool = False,
+                     keep_open: bool = False):
+        """只更新「用哪个浏览器」的配置，其余保持不变。"""
+        data = dict(self.load())
+        data["browser"] = {
+            "use_real_browser": bool(use_real_browser),
+            "browser_path": str(browser_path or "").strip(),
+            "debug_port": int(debug_port or 9222),
+            "type_url": bool(type_url),
+            "keep_open": bool(keep_open),
         }
         self._write(data)
 

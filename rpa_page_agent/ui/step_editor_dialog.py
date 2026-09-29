@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
 
 from rpa_page_agent.core import blocks, desktop, free_code, project_store
 from rpa_page_agent.core.project_store import Locator, Step
+from rpa_page_agent.ui.browser_settings_dialog import BrowserSettingsDialog
 from rpa_page_agent.ui.captcha_panel import CaptchaPanel
 from rpa_page_agent.ui.code_editor import CodeEditor
 from rpa_page_agent.ui.collect_panel import CollectPanel
@@ -566,6 +567,20 @@ class StepEditDialog(QDialog):
             "页面是否稳定由下面的「步骤后等待」负责。"
         )
         form.addRow("打开超时：", self.nav_timeout)
+
+        # 「用哪个浏览器」是项目级的（浏览器整轮只起一次），入口就放在「打开网页」这一步上
+        self.btn_browser = QPushButton("浏览器设置…")
+        self.btn_browser.setToolTip("用程序自带的内核，还是用你自己装的 Edge / Chrome"
+                                    "（独立配置目录 + 调试端口）")
+        self.btn_browser.clicked.connect(self._open_browser_settings)
+        self.browser_hint = QLabel("")
+        self.browser_hint.setStyleSheet("color: #64748b;")
+        self.browser_row = QWidget()
+        browser_layout = QHBoxLayout(self.browser_row)
+        browser_layout.setContentsMargins(0, 0, 0, 0)
+        browser_layout.addWidget(self.btn_browser)
+        browser_layout.addWidget(self.browser_hint, 1)
+        form.addRow("浏览器：", self.browser_row)
 
         # --- read_data 组：读文件 / 文件夹，产出一个「列表变量」---
         self.output_var_edit = QLineEdit()
@@ -1126,7 +1141,7 @@ class StepEditDialog(QDialog):
         root.addWidget(buttons)
 
         # 各字段的 label buddy 不便单独拿，统一用 widget 列表控制显隐
-        self._navigate_widgets = [self.url_edit, self.nav_timeout]
+        self._navigate_widgets = [self.url_edit, self.nav_timeout, self.browser_row]
         self._read_widgets = [self.read_panel]
         self._collect_widgets = [self.collect_panel]
         self._captcha_widgets = [self.captcha_panel]
@@ -1330,7 +1345,39 @@ class StepEditDialog(QDialog):
 
     def _on_action_changed(self):
         self._on_cond_mode_changed()
+        self._refresh_browser_hint()
         self._sync_visibility()
+
+    # ------------------------------
+    # 「用哪个浏览器」（项目级设置，入口在「打开网页」这一步）
+    # ------------------------------
+    def _refresh_browser_hint(self):
+        cfg = self.project_store_cfg()
+        if not cfg.get("use_real_browser"):
+            self.browser_hint.setText("程序自带的内核")
+            return
+        from rpa_page_agent.core import browser_launcher as bl
+        try:
+            exe = bl.find_browser(cfg.get("browser_path", ""))
+            name = f"本机 {bl.browser_name(exe)}"
+        except Exception:
+            name = "本机浏览器（还没选定，点【浏览器设置…】）"
+        tip = "，网址用键盘敲" if cfg.get("type_url") else ""
+        self.browser_hint.setText(f"{name}（端口 {cfg.get('debug_port')}{tip}）")
+
+    def project_store_cfg(self) -> dict:
+        """这个项目的「用哪个浏览器」设置（读不到就用默认）。"""
+        default = {"use_real_browser": False, "browser_path": "", "debug_port": 9222,
+                   "type_url": False, "keep_open": False}
+        try:
+            return project_store.ProjectStore(self.project_dir).load_browser()
+        except Exception:
+            return default
+
+    def _open_browser_settings(self):
+        dlg = BrowserSettingsDialog(self.project_dir, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._refresh_browser_hint()
 
     def _on_locator_type_changed(self):
         """截图相关字段只在「定位方式=截图」时出现。"""

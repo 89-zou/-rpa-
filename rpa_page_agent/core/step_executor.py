@@ -791,6 +791,27 @@ class StepExecutor:
         self._auth_using = bool(use_auth)
         self._auth_checked = False
         self._auth_expired = False
+        cfg = self._browser_cfg()
+        if cfg.get("use_real_browser") and not self.desktop:
+            self._run_real_browser(nodes, cfg)
+        else:
+            self._run_builtin_browser(nodes, use_auth)
+
+    def _browser_cfg(self) -> Dict[str, Any]:
+        """项目级的「用哪个浏览器」设置（读不到就用默认：自带内核）。"""
+        default = {"use_real_browser": False, "browser_path": "", "debug_port": 9222,
+                   "type_url": False, "keep_open": False}
+        if not self.project_dir:
+            return default
+        try:
+            from rpa_page_agent.core.project_store import ProjectStore
+            return ProjectStore(self.project_dir).load_browser()
+        except Exception:
+            return default
+
+    def _run_builtin_browser(self, nodes: List[Any], use_auth: bool):
+        """老路子：用 Playwright 自带的内核（内核在数据目录的「浏览器/」里）。"""
+        self._type_url_mode = False
         # 打包版不带浏览器内核：先看一眼，别让用户看到 Playwright 那句英文报错
         if not self.desktop and not browser_setup.is_installed():
             raise RuntimeError(browser_setup.hint())
@@ -811,6 +832,65 @@ class StepExecutor:
                 self.log("执行结束，关闭浏览器。")
                 browser.close()
                 self._page = None
+
+    def _run_real_browser(self, nodes: List[Any], cfg: Dict[str, Any]):
+        """用**用户自己装的 Edge / Chrome**：启动（或复用已有实例）+ CDP 连上。
+
+        跟自带内核那套的区别（都是刻意的）：
+        · 不检查、也不需要 Playwright 的内核（这条路上不用下载 700MB）；
+        · **不用登录态文件**：浏览器配置目录自己持久化 cookie（登录一次长期有效），
+          所以 auth 的注入 / 体检 / 续期这套全跳过；
+        · 结束只**断开连接**；浏览器进程是我们启的才收掉（勾了「跑完不关」就留着）。
+        """
+        from rpa_page_agent.core import browser_launcher as bl
+        cfg = dict(cfg or {})
+        # 无头模式没有可见窗口，键盘敲进地址栏会敲到「当前前台窗口」（可能不是浏览器）
+        # —— 这种情况一律退回直接导航，安全第一
+        if cfg.get("type_url") and getattr(self, "headless", False):
+            self.log("  提示：无头模式（看不见窗口）没法用键盘敲地址栏 → 这次改成直接导航")
+            self._type_url_mode = False
+        else:
+            self._type_url_mode = bool(cfg.get("type_url"))
+        self._auth_using = False            # 登录态由浏览器自己的配置目录管
+        if self._auth_check_locator:
+            self.log("  用本机浏览器：登录状态由它自己的配置目录保存，这次不看登录态文件")
+        port = int(cfg.get("debug_port") or 9222)
+        proc, info, ours = bl.start_or_attach(
+            cfg.get("browser_path", ""), port, url="", headless=self.headless,
+            log=self.log)
+        self._browser_proc = proc if ours else None
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+                contexts = list(browser.contexts)
+                context = contexts[0] if contexts else browser.new_context()
+                self._page = self._pick_page(context)
+                self._page.on("dialog", self._on_dialog)
+                self._run_nodes(nodes)
+                self.log("执行结束，断开浏览器连接。")
+                browser.close()             # 只断连，不杀浏览器
+        finally:
+            self._page = None
+            if self._browser_proc is not None and not cfg.get("keep_open"):
+                bl.stop(self._browser_proc, log=self.log)
+            self._browser_proc = None
+
+    @staticmethod
+    def _pick_page(context) -> Any:
+        """从连上的浏览器里挑一个页面来用：优先空白页，其次最后一个，都没有就新建。"""
+        try:
+            pages = list(context.pages)
+        except Exception:
+            pages = []
+        for pg in pages:
+            try:
+                if (pg.url or "").startswith("about:blank"):
+                    return pg
+            except Exception:
+                continue
+        if pages:
+            return pages[-1]
+        return context.new_page()
 
     # ------------------------------
     # 登录态：体检 / 续期 / 登录组合跳过
@@ -2142,8 +2222,13 @@ class StepExecutor:
                    if missing else "    请双击这一步填写网址。")
             )
         try:
-            self._page.goto(url, wait_until="domcontentloaded",
-                            timeout=secs * 1000)
+            if getattr(self, "_type_url_mode", False):
+                # 用本机浏览器 + 勾了「用键盘敲网址」：像真人一样敲进地址栏
+                from rpa_page_agent.core import browser_launcher as bl
+                bl.type_url(self._page, url, timeout_s=min(30, secs), log=self.log)
+            else:
+                self._page.goto(url, wait_until="domcontentloaded",
+                                timeout=secs * 1000)
         except PlaywrightTimeout as e:
             raise TimeoutError(
                 f"打开网页超过 {secs}s 还没响应：{url}\n"
