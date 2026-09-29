@@ -177,6 +177,9 @@ class Step:
     agent_hints: str = ""                  # 可选：额外要求/线索（如「标题框是 #title」）
     agent_max_steps: int = 20              # 最多走几步（防跑飞）
     agent_timeout: int = 180               # 秒；到点停止并报错
+    # 默认**不给 AI 看变量值**（只给名字，值由程序在输入时替换，密码/采集数据不外泄）；
+    # 勾上＝这一步把真值也交给 AI（要它读懂内容、改写、判断时才需要）
+    agent_allow_values: bool = False
     # ---- captcha 专用：验证码节点（滑块 / 文字点选 / 计算题）----
     # captcha_kind：slider＝滑块拼图 / click_text＝文字点选 / math＝计算题
     # 「验证码图片」直接用主 locator 存（这样元素捕获/定位匹配那套按钮直接能用）；
@@ -314,6 +317,8 @@ class Step:
                 d["agent_hints"] = self.agent_hints
             d["agent_max_steps"] = int(self.agent_max_steps or 20)
             d["agent_timeout"] = int(self.agent_timeout or 180)
+            if self.agent_allow_values:
+                d["agent_allow_values"] = True
         if self.image_threshold:
             d["image_threshold"] = float(self.image_threshold)
         if self.pos is not None:
@@ -388,6 +393,7 @@ class Step:
             agent_hints=str(d.get("agent_hints") or ""),
             agent_max_steps=int(d.get("agent_max_steps", 20) or 20),
             agent_timeout=int(d.get("agent_timeout", 180) or 180),
+            agent_allow_values=bool(d.get("agent_allow_values")),
             captcha_kind=d.get("captcha_kind") or "slider",
             captcha_slider=locator_from_dict(d.get("captcha_slider")),
             captcha_tip=locator_from_dict(d.get("captcha_tip")),

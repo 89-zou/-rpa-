@@ -17,6 +17,7 @@ AI 想用某个值就写 `{{名字}}`，程序在**真正敲进输入框之前**
 · 全部有上限（变量 40 个、图片 30 张、总字数 4000……）—— 这段文字每次调模型都会带上；
 · 运行时看得到**有哪些变量**（循环里的 loop.item.* 也在），编辑时看的是项目里定义的清单。
 """
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -25,6 +26,7 @@ from rpa_page_agent.core.project_store import ProjectStore
 
 #: 各类资料的上限（都是「显示多少个/多少字」）
 MAX_VARS = 40
+MAX_VAR_CHARS = 80
 MAX_IMAGES = 30
 MAX_DATA_FILES = 15
 MAX_FUNCS = 20
@@ -33,15 +35,29 @@ NAME_WRAP = 68
 #: 这一段的总字数上限（兜底，防止某个项目特别大）
 MAX_TOTAL_CHARS = 4000
 
-HEADER = ("【项目资料】（程序自动读的，下面这些可以直接用，不用再问我）\n"
-          "★ 变量只给了名字，**值不会发给你**：要填某个值就在文本里原样写 "
-          "{{名字}}（花括号别改），程序会在真正输入的那一刻替换成真值。")
+HEADER = "【项目资料】（程序自动读的，下面这些可以直接用，不用再问我）"
+#: 不给值时的提醒（默认）
+NOTE_HIDE = ("★ 变量只给了名字，**值不会发给你**：要填某个值就在文本里原样写 "
+             "{{名字}}（花括号别改），程序会在真正输入的那一刻替换成真值。")
+#: 这个节点勾了「把变量值也给 AI 看」时的提醒
+NOTE_SHOW = ("★ 这一步勾了「把变量值也给 AI 看」，所以下面是真值 —— "
+             "含密码之类的敏感内容时要留神（值会随任务发给模型）。")
 
 
 def _clip(text: Any, limit: int) -> str:
     """压成一行、截断（换行会打乱 prompt 的结构）。"""
     flat = " ".join(str(text if text is not None else "").split())
     return flat if len(flat) <= limit else flat[:limit] + "…"
+
+
+def _flat(value: Any) -> str:
+    """任意值 → 一行短文本（只在「允许给 AI 看值」时才用）。"""
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return _clip(value, MAX_VAR_CHARS)
+    try:
+        return _clip(json.dumps(value, ensure_ascii=False), MAX_VAR_CHARS)
+    except Exception:
+        return _clip(value, MAX_VAR_CHARS)
 
 
 def _wrap_names(names: List[str], prefix: str = "· ", sep: str = "、",
@@ -76,22 +92,36 @@ def _more(shown: int, total: int) -> str:
 # ----------------------------------------------------------------------
 # 五类资料
 # ----------------------------------------------------------------------
-def _variables(store: ProjectStore, runtime: Optional[Dict[str, Any]]) -> List[str]:
-    """变量清单：**只报名字，不报值**（值可能敏感，由程序在输入时替换）。
+def _variables(store: ProjectStore, runtime: Optional[Dict[str, Any]],
+               with_values: bool = False) -> List[str]:
+    """变量清单。
 
-    运行时（runtime）传进来的变量一并算上：比如循环里的 loop.item.*、上一步产出的字段，
-    这样 AI 知道「现在有哪些名字可用」，但看不到内容。
+    默认**只报名字不报值**（值可能敏感，由程序在输入时替换）；节点上勾了
+    「把变量值也给 AI 看」时才带上值（`with_values=True`）。
+
+    运行时（runtime）传进来的变量一并算上：比如循环里的 loop.item.*、上一步产出的字段。
     """
     static = store.load_all_variables()
     live = dict(runtime or {})
     names = list(static.keys()) + [k for k in live if k not in static]
     if not names:
         return ["（这个项目还没有变量；用「读取数据」节点或「采集」节点能产出变量）"]
+
+    if with_values:
+        out = []
+        for name in names[:MAX_VARS]:
+            value = live.get(name, static.get(name, ""))
+            shown = _flat(value)
+            out.append(f"· {name} = {shown}" if shown else f"· {name}（空）")
+        out.append(f"（共 {len(names)} 个变量{_more(MAX_VARS, len(names))}，"
+                   "长值截断了；写 {{名字}} 也一样能用）")
+        return out
+
     out = _wrap_names(names[:MAX_VARS])
     out.append(f"（共 {len(names)} 个变量{_more(MAX_VARS, len(names))}。"
                "写 {{名字}} 就能把值填进去 —— 值由程序替换，不会发给你；"
-               "只有确实需要看懂内容本身（比如要改写它）才用 get_local_variable 取，"
-               "那一步会把值发给模型，敏感信息别这么干）")
+               "这个节点要是需要读懂内容本身（比如要改写它），"
+               "在节点上勾「把变量值也给 AI 看」）")
     return out
 
 
@@ -190,8 +220,12 @@ def _functions(store: ProjectStore) -> List[str]:
 # ----------------------------------------------------------------------
 # 对外
 # ----------------------------------------------------------------------
-def collect(project_dir, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def collect(project_dir, variables: Optional[Dict[str, Any]] = None,
+            with_values: bool = False) -> Dict[str, Any]:
     """把项目的五类资料汇总成一段文字。
+
+    with_values=True 时变量清单**带上真值**（只有节点上勾了「把变量值也给 AI 看」
+    才这样，默认不给 —— 值可能敏感）。
 
     返回 {"text": 段落, "counts": {变量/图片/登录态/数据/函数 的条数}}。
     project_dir 为空或读不到东西时，text 是空串（调用方照旧跑，不因为这里出错而停）。
@@ -205,7 +239,7 @@ def collect(project_dir, variables: Optional[Dict[str, Any]] = None) -> Dict[str
         return {"text": "", "counts": {}}
 
     readers = (
-        ("变量清单", lambda: _variables(store, variables)),
+        ("变量清单", lambda: _variables(store, variables, with_values)),
         ("图片库", lambda: _images(project)),
         ("登录态", lambda: _auth(project, store)),
         ("采集数据", lambda: _data(project)),
@@ -218,7 +252,7 @@ def collect(project_dir, variables: Optional[Dict[str, Any]] = None) -> Dict[str
         except Exception as e:            # 单类读失败不该拖死整段资料
             sections.append((title, [f"（读不出来：{type(e).__name__}）"]))
 
-    parts = [HEADER]
+    parts = [HEADER, NOTE_SHOW if with_values else NOTE_HIDE]
     for title, lines in sections:
         parts.append(f"◆ {title}：")
         parts.extend(lines)
@@ -230,14 +264,16 @@ def collect(project_dir, variables: Optional[Dict[str, Any]] = None) -> Dict[str
     return {"text": text, "counts": counts}
 
 
-def text_for(project_dir, variables: Optional[Dict[str, Any]] = None) -> str:
+def text_for(project_dir, variables: Optional[Dict[str, Any]] = None,
+             with_values: bool = False) -> str:
     """只要那段文字（给 bridge 用）。"""
-    return str(collect(project_dir, variables).get("text") or "")
+    return str(collect(project_dir, variables, with_values).get("text") or "")
 
 
-def summary(project_dir, variables: Optional[Dict[str, Any]] = None) -> str:
+def summary(project_dir, variables: Optional[Dict[str, Any]] = None,
+            with_values: bool = False) -> str:
     """一句话概括读到了多少（打进运行日志用）。"""
-    counts = collect(project_dir, variables).get("counts") or {}
+    counts = collect(project_dir, variables, with_values).get("counts") or {}
     if not counts:
         return "没有可读的项目资料"
     bits = [f"{k} {v} 条" for k, v in counts.items() if v]

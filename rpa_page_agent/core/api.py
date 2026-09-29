@@ -225,13 +225,20 @@ ACTION_SPECS: Dict[str, Dict[str, Any]] = {
                 "它记得前面做过的事；中间夹了「打开网页」就自动换一个新的。"
                 "点击与输入由本程序用**真实鼠标键盘**执行（isTrusted=true）；"
                 "LLM 调用也在本程序进程里（API Key 不进页面）。"
-                "描述里可以写 {{变量}}；agent 还能用 get_local_variable 工具现取变量清单里的值。",
+                "描述里可以写 {{变量}}：默认**只把变量名给 AI**，AI 把 {{名字}} 原样写进"
+                "要填的文本里，程序在真正输入前替换成真值（密码、采集数据不进模型）；"
+                "要让 AI 读懂内容本身，把 agent_allow_values 设为 true。"
+                "跑这一步时还会自动带上「项目资料」（变量名清单 / 图片库 / 登录态 / "
+                "采集数据概况 / 函数库）。",
         "fields": [
             f("agent_task", "str", "一句话描述，如「在标题框填「今天天气」，然后点发布」；"
-              "可含 {{变量}}", True),
+              "可含 {{变量}}（值由程序代填，不进模型）", True),
             f("agent_hints", "str", "额外要求 / 线索（可选），如「标题框是 #title」「登录按钮是蓝色那个」"),
             f("agent_max_steps", "int", "最多走几步（防跑飞）", default=20),
             f("agent_timeout", "int", "超时秒数，到点停止并报错", default=180),
+            f("agent_allow_values", "bool",
+              "是否把变量真值也给 AI（默认 false：只给名字）。要 AI 改写/判断内容时才开",
+              default=False),
         ] + WAIT_FIELDS,
     },
     "collect": {

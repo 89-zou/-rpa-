@@ -13,8 +13,8 @@ from typing import Optional
 
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
-    QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
-    QSpinBox, QVBoxLayout, QWidget,
+    QCheckBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
+    QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from rpa_page_agent.core import project_context
@@ -103,6 +103,18 @@ class PageAgentPanel(QWidget):
         ctx_layout.addWidget(btn_row)
         root.addRow("项目资料：", ctx_row)
 
+        self.allow_values_box = QCheckBox(
+            "把变量值也给 AI 看（默认不给：只给名字，值由程序在输入时替换）")
+        self.allow_values_box.setToolTip(
+            "不勾（推荐）：资料里只列变量名字，AI 要填值就写 {{名字}}，"
+            "程序在真正敲进输入框之前才替换成真值 —— 密码、采集到的资料不会发给模型。\n"
+            "勾上：这一步把真值也交给 AI（任务描述里的 {{变量}} 也会先替换）。\n"
+            "什么时候需要它：要 AI 读懂内容本身，比如「把 {{文章.内容}} 改写成 100 字」、"
+            "「按 {{订单状态}} 决定点哪个按钮」。\n"
+            "注意：勾上之后这些值会随任务发给 DeepSeek（也就是你的 API 密钥那边）。")
+        self.allow_values_box.toggled.connect(lambda _=False: self._refresh_context())
+        root.addRow("", self.allow_values_box)
+
         # ---- 当前用哪个 AI（只读；要改去主窗口的【AI 设置】）----
         ai_row = QWidget()
         ai_layout = QHBoxLayout(ai_row)
@@ -134,7 +146,9 @@ class PageAgentPanel(QWidget):
             self.context_box.setPlainText("（还没打开项目）")
             return
         try:
-            data = project_context.collect(self.project_dir)
+            # 勾了「给 AI 看值」→ 预览里也带真值，所见即 AI 所得
+            live = self.allow_values_box.isChecked()
+            data = project_context.collect(self.project_dir, with_values=live)
             counts = "、".join(f"{k} {v}" for k, v in (data.get("counts") or {}).items()
                                if v)
             self.context_box.setPlainText(
@@ -160,6 +174,7 @@ class PageAgentPanel(QWidget):
     def load(self, step):
         self.task_edit.setPlainText(str(getattr(step, "agent_task", "") or ""))
         self.hints_edit.setText(str(getattr(step, "agent_hints", "") or ""))
+        self.allow_values_box.setChecked(bool(getattr(step, "agent_allow_values", False)))
         self.steps_spin.setValue(int(getattr(step, "agent_max_steps", 0) or
                                      pa_config.DEFAULT_MAX_STEPS))
         self.timeout_spin.setValue(int(getattr(step, "agent_timeout", 0) or
@@ -171,6 +186,7 @@ class PageAgentPanel(QWidget):
         step.agent_hints = self.hints_edit.text().strip()
         step.agent_max_steps = int(self.steps_spin.value())
         step.agent_timeout = int(self.timeout_spin.value())
+        step.agent_allow_values = bool(self.allow_values_box.isChecked())
 
     def validate(self) -> Optional[str]:
         if not self.task_edit.toPlainText().strip():

@@ -420,15 +420,22 @@ class PageAgentBridge:
 def run_agent_task(executor, step) -> Dict[str, Any]:
     """执行「任务」节点（step.action == "agent"）：把这一句话交给页面内的 Page Agent。
 
-    **故意不把 {{变量}} 换成真值**：换掉就把密码、采集数据这些一起发给了模型。
+    **默认不把 {{变量}} 换成真值**：换掉就把密码、采集数据这些一起发给了模型。
     描述原样发过去（AI 看到的是 {{名字}}），等它把值填进输入框时，由
     `_fill_vars` 在本进程里替换 —— 值永远不进模型。
+    节点上勾了「把变量值也给 AI 看」才换成真值（要 AI 读懂内容、改写、判断时用）。
     """
-    task = str(step.agent_task or "").strip()
+    allow_values = bool(getattr(step, "agent_allow_values", False))
+
+    def render(text: str) -> str:
+        raw = str(text or "")
+        return executor._resolve_value(raw).strip() if allow_values else raw.strip()
+
+    task = render(step.agent_task)
     if not task:
         raise ValueError("「任务」还没写描述：双击节点，用一句话说清要做什么"
                          "（例：在标题框填「今天天气」，然后点发布）")
-    hints = str(step.agent_hints or "").strip()
+    hints = render(step.agent_hints)
     if hints:
         task = f"{task}\n\n额外要求：{hints}"
 
@@ -436,11 +443,14 @@ def run_agent_task(executor, step) -> Dict[str, Any]:
     # 免得用户为了「用哪份数据、叫什么名字」再手打一遍
     try:
         from rpa_page_agent.core import project_context
-        lines = project_context.summary(executor.project_dir, executor.variables)
-        ctx = project_context.text_for(executor.project_dir, executor.variables)
+        lines = project_context.summary(executor.project_dir, executor.variables,
+                                        allow_values)
+        ctx = project_context.text_for(executor.project_dir, executor.variables,
+                                       allow_values)
         if ctx:
             task = f"{task}\n\n{ctx}"
-            executor.log(f"  已带上项目资料（{lines}）")
+            executor.log(f"  已带上项目资料（{lines}"
+                         + ("，含变量真值）" if allow_values else "") + "）")
     except Exception as e:
         executor.log(f"  提示：项目资料没读全（{type(e).__name__}: {e}）")
 
