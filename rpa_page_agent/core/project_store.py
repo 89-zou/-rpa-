@@ -177,11 +177,6 @@ class Step:
     agent_hints: str = ""                  # 可选：额外要求/线索（如「标题框是 #title」）
     agent_max_steps: int = 20              # 最多走几步（防跑飞）
     agent_timeout: int = 180               # 秒；到点停止并报错
-    # ---- upload 专用：文件上传（网页场景，由本程序接管文件选择器）----
-    # 上传框定位复用主 locator（type=xpath，指 input[type=file]），
-    # 这样【捕获元素…】那套按钮直接能用，不用再开一个重复的字段。
-    upload_file: str = ""                  # 本地文件路径，支持 {{变量}}
-    upload_desc: str = ""                  # 没填定位时：要点的上传按钮的自然语言描述
     # ---- captcha 专用：验证码节点（滑块 / 文字点选 / 计算题）----
     # captcha_kind：slider＝滑块拼图 / click_text＝文字点选 / math＝计算题
     # 「验证码图片」直接用主 locator 存（这样元素捕获/定位匹配那套按钮直接能用）；
@@ -319,10 +314,6 @@ class Step:
                 d["agent_hints"] = self.agent_hints
             d["agent_max_steps"] = int(self.agent_max_steps or 20)
             d["agent_timeout"] = int(self.agent_timeout or 180)
-        if self.action == "upload":
-            d["upload_file"] = self.upload_file or ""
-            if self.upload_desc:
-                d["upload_desc"] = self.upload_desc
         if self.image_threshold:
             d["image_threshold"] = float(self.image_threshold)
         if self.pos is not None:
@@ -397,8 +388,6 @@ class Step:
             agent_hints=str(d.get("agent_hints") or ""),
             agent_max_steps=int(d.get("agent_max_steps", 20) or 20),
             agent_timeout=int(d.get("agent_timeout", 180) or 180),
-            upload_file=str(d.get("upload_file") or ""),
-            upload_desc=str(d.get("upload_desc") or ""),
             captcha_kind=d.get("captcha_kind") or "slider",
             captcha_slider=locator_from_dict(d.get("captcha_slider")),
             captcha_tip=locator_from_dict(d.get("captcha_tip")),

@@ -129,11 +129,12 @@
   window.__rpaAgent = {
     ready: true,
 
-    /** 起一个任务。config: {model, language, max_steps}；task: 自然语言。 */
-    start(config, task) {
+    /** 起一个任务。config: {model, language, max_steps}；task: 自然语言；
+     *  fresh=true 表示换一个新 Agent（页面已经跳走了）；false 表示接着上一个干
+     *  （同一个页面上连续的几个任务共用记忆：它记得前面点过什么、填过什么）。 */
+    start(config, task, fresh) {
       config = config || {}
-      const self = window.__rpaAgent
-      if (state.agent) {                       // 上一次没收拾干净（异常路径）
+      if (state.agent && fresh) {              // 页面换了 / 上次异常：旧的清掉
         try { state.agent.dispose() } catch (e) { /* 忽略 */ }
         state.agent = null
       }
@@ -143,48 +144,53 @@
       state.error = ''
       state.state = 'running'
 
-      const controller = new B.RpaPageController({ enableMask: false, viewportExpansion: 0 })
-      const agent = new B.PageAgentCore({
-        pageController: controller,
-        baseURL: 'https://rpa-bridge.invalid/v1',   // 只是个占位：真请求由 customFetch 接管
-        model: String(config.model || 'rpa-bridge'),
-        language: String(config.language || 'zh-CN'),
-        maxSteps: Number(config.max_steps) > 0 ? Number(config.max_steps) : 20,
-        customFetch: async function (url, init) {
-          const body = init && init.body ? init.body : ''
-          const text = await window.__rpaLLM.request(body)
-          return new Response(text, { status: 200, headers: { 'Content-Type': 'application/json' } })
-        },
-        customTools: {
-          // 让模型能主动取「变量清单」里的值（读取数据/采集数据/循环项都在里面）
-          get_local_variable: {
-            description: '从 RPA 变量上下文里取一个变量的值。当需要填写来自本地文件、' +
-              '上一步产出、或循环当前项的数据时用它。变量路径如 文章.标题、loop.item.内容。',
-            inputSchema: B.z.object({
-              variablePath: B.z.string().describe('变量路径，如 文章.标题 或 loop.item.内容'),
-            }),
-            execute: async function (args) {
-              const parts = String((args && args.variablePath) || '').split('.')
-              let v = window.__RPA_VARS__ || {}
-              for (let i = 0; i < parts.length; i++) {
-                if (v == null) break
-                v = v[parts[i]]
-              }
-              if (v == null) return ''
-              return typeof v === 'string' ? v : JSON.stringify(v)
+      let agent = state.agent
+      if (!agent) {
+        const controller = new B.RpaPageController({ enableMask: false, viewportExpansion: 0 })
+        agent = new B.PageAgentCore({
+          pageController: controller,
+          baseURL: 'https://rpa-bridge.invalid/v1',   // 只是个占位：真请求由 customFetch 接管
+          model: String(config.model || 'rpa-bridge'),
+          language: String(config.language || 'zh-CN'),
+          maxSteps: Number(config.max_steps) > 0 ? Number(config.max_steps) : 20,
+          customFetch: async function (url, init) {
+            const body = init && init.body ? init.body : ''
+            const text = await window.__rpaLLM.request(body)
+            return new Response(text, { status: 200, headers: { 'Content-Type': 'application/json' } })
+          },
+          customTools: {
+            // 让模型能主动取「变量清单」里的值（读取数据 / 循环项都在里面）
+            get_local_variable: {
+              description: '从 RPA 变量上下文里取一个变量的值。当需要填写来自本地文件、' +
+                '上一步产出、或循环当前项的数据时用它。变量路径如 文章.标题、loop.item.内容。',
+              inputSchema: B.z.object({
+                variablePath: B.z.string().describe('变量路径，如 文章.标题 或 loop.item.内容'),
+              }),
+              execute: async function (args) {
+                const parts = String((args && args.variablePath) || '').split('.')
+                let v = window.__RPA_VARS__ || {}
+                for (let i = 0; i < parts.length; i++) {
+                  if (v == null) break
+                  v = v[parts[i]]
+                }
+                if (v == null) return ''
+                return typeof v === 'string' ? v : JSON.stringify(v)
+              },
             },
           },
-        },
-      })
+        })
+        agent.addEventListener('activity', function (e) {
+          pushLog(activityText(e && e.detail))
+        })
+        agent.addEventListener('statuschange', function () {
+          try { state.state = agent.status || state.state } catch (err) { /* 忽略 */ }
+        })
+        state.agent = agent
+        pushLog('[agent] 建好了一个 Agent（这一步开始）')
+      } else {
+        pushLog('[agent] 接着上一个 Agent 干（它记得前面做过的事）')
+      }
 
-      agent.addEventListener('activity', function (e) {
-        pushLog(activityText(e && e.detail))
-      })
-      agent.addEventListener('statuschange', function () {
-        try { state.state = agent.status || state.state } catch (err) { /* 忽略 */ }
-      })
-
-      state.agent = agent
       pushLog(`[agent] 开始任务：${String(task).slice(0, 120)}`)
       agent.execute(String(task || ''))
         .then(function (res) {

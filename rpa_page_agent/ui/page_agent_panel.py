@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""「智能页面任务」「上传文件」两个节点的编辑面板。
+"""「任务」节点的编辑面板：一句话描述 + 步数/超时 + 项目级 LLM 设置。
 
 跟 CaptchaPanel / CollectPanel 一个套路：`load(step)` / `save(step)` / `validate()`，
 外面（步骤编辑器）只管把它塞进表单并按动作显隐。
 
-LLM 的三件套（接口地址 / 模型 / 密钥）是**项目级**的：所有智能节点共用一份，
+LLM 的三件套（接口地址 / 模型 / 密钥）是**项目级**的：所有任务节点共用一份，
 存在项目 steps.json 的 page_agent 键里（见 core/page_agent/config.py）。
 密钥只在本机项目文件里 —— 页面内 agent 发 LLM 请求时会交回 Python 进程，
 所以它永远不进页面。
@@ -242,74 +242,3 @@ class PageAgentPanel(QWidget):
         else:
             self.state_label.setText(f"✓ 接口就绪（{cfg['model']}）——所有智能节点共用这份设置")
             self.state_label.setStyleSheet("color: #0f766e;")
-
-
-class UploadPanel(QWidget):
-    """上传文件节点：文件路径 + （可选）input[type=file] 定位 + （可选）按钮描述。"""
-
-    changed = pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.project_dir: Optional[Path] = None
-
-        root = QFormLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-
-        file_row = QWidget()
-        file_layout = QHBoxLayout(file_row)
-        file_layout.setContentsMargins(0, 0, 0, 0)
-        self.file_edit = QLineEdit()
-        self.file_edit.setPlaceholderText("要上传的文件路径，可写 {{变量}}（循环里常写 {{loop.item.path}}）")
-        self.file_edit.textChanged.connect(self.changed)
-        self.btn_pick = QPushButton("选择文件…")
-        self.btn_pick.clicked.connect(self._pick_file)
-        file_layout.addWidget(self.file_edit, 1)
-        file_layout.addWidget(self.btn_pick)
-        root.addRow("文件：", file_row)
-
-        sel_row = QWidget()
-        sel_layout = QHBoxLayout(sel_row)
-        sel_layout.setContentsMargins(0, 0, 0, 0)
-        self.desc_edit = QLineEdit()
-        self.desc_edit.setPlaceholderText("要点的上传按钮长什么样，如「选择文件」按钮（没填上面的定位时用它）")
-        self.desc_edit.textChanged.connect(self.changed)
-        sel_layout.addWidget(self.desc_edit, 1)
-        root.addRow("按钮描述：", sel_row)
-
-        self.hint = QLabel("最稳：用上面「上传框定位」那一行的【捕获元素…】取 input[type=file] 的 XPath，"
-                           "程序会直接把文件交给它；\n"
-                           "只写「按钮描述」也行：会让 AI 找到并点那个按钮，"
-                           "再由本程序接管弹出的文件选择器。")
-        self.hint.setWordWrap(True)
-        self.hint.setStyleSheet("color: #64748b;")
-        root.addRow("", self.hint)
-
-    def set_project_dir(self, project_dir):
-        self.project_dir = Path(project_dir) if project_dir else None
-
-    def load(self, step):
-        self.file_edit.setText(str(getattr(step, "upload_file", "") or ""))
-        self.desc_edit.setText(str(getattr(step, "upload_desc", "") or ""))
-
-    def save(self, step):
-        step.upload_file = self.file_edit.text().strip()
-        step.upload_desc = self.desc_edit.text().strip()
-
-    def validate(self) -> Optional[str]:
-        if not self.file_edit.text().strip():
-            return ("「上传文件」要填文件路径（可写 {{变量}}；"
-                    "循环里常写 {{loop.item.path}}）")
-        return None
-
-    def _pick_file(self):
-        start = ""
-        text = self.file_edit.text().strip()
-        if text and "{{" not in text:
-            start = text
-        elif self.project_dir:
-            start = str(self.project_dir)
-        picked, _ = QFileDialog.getOpenFileName(self, "选要上传的文件", start,
-                                                "所有文件 (*.*)")
-        if picked:
-            self.file_edit.setText(picked)

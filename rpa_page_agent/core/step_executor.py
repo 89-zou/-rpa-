@@ -541,16 +541,8 @@ def check_variables(steps: List[Step],
             add(s.id, "「鼠标滚轮」的滚动量是 0，滚不动"
                       "（双击这一步填个正数：网页＝像素，桌面＝格数）")
         if s.action == "agent" and not (s.agent_task or "").strip():
-            add(s.id, "「智能页面任务」还没写任务（双击节点，一句话说清要做什么，"
+            add(s.id, "「任务」还没写描述（双击节点，一句话说清要做什么，"
                       "如：在标题框填「今天天气」，然后点发布）")
-        if s.action == "upload":
-            if not (s.upload_file or "").strip():
-                add(s.id, "「上传文件」还没填文件路径（双击节点；可以写 {{变量}}）")
-            elif not ((s.locator.value if s.locator else "")
-                      or (s.upload_desc or "")).strip():
-                add(s.id, "「上传文件」没填「上传框定位」也没写按钮描述"
-                          "——两条至少要有一条，否则不知道该点哪里"
-                          "（最稳的是用【捕获元素…】取 input[type=file] 的 XPath）")
         rule = cond_children.get(idx)
         if rule and rule[3] != "expr":
             _cond, order, total, _mode = rule
@@ -1319,11 +1311,8 @@ class StepExecutor:
                     self._require_web(step, "鼠标滚轮")
                     self._web_wheel(step)
             elif step.action == "agent":
-                self._require_web(step, "智能页面任务")
+                self._require_web(step, "任务")
                 self._agent_task(step)
-            elif step.action == "upload":
-                self._require_web(step, "上传文件")
-                self._upload_file(step)
             elif step.action == "pause_for_human":
                 self._pause_for_human(step)
             elif step.action == "script":
@@ -2255,21 +2244,16 @@ class StepExecutor:
         self._page.mouse.wheel(0, -amount if up else amount)
         self.log(f"  页面{'上' if up else '下'}滚 {amount} 像素")
 
-    # ---- 智能页面任务 / 上传文件（实现都在 core/page_agent/ 里，跟老动作隔开）----
+    # ---- 任务（智能页面操作；实现都在 core/page_agent/ 里，跟老动作隔开）----
     def _agent_task(self, step: Step):
-        """一句话交代要干什么：页面里的 page-agent 自己多步完成。
+        """把这一步的一句话交给页面内的 Page Agent 执行。
 
-        点击/输入由**本进程**用真实鼠标键盘执行（CDP 输入，isTrusted=true）；
-        LLM 调用也在本进程（密钥不进页面）。变量既能写进任务文本（{{变量}}），
-        也能被 agent 用 get_local_variable 工具现取。
+        连续的「任务」节点共用同一个 Agent（它会记住前面做过的事）；
+        中间夹了「打开网页」就自动换一个新的（页面都换了，旧记忆没用）。
+        点击/输入由**本进程**用真实鼠标键盘执行；LLM 调用也在本进程（密钥不进页面）。
         """
         from rpa_page_agent.core.page_agent import run_agent_task
         run_agent_task(self, step)
-
-    def _upload_file(self, step: Step):
-        """上传文件：填了 input[type=file] 就直喂，没填就让 agent 点按钮 + 接管选择器。"""
-        from rpa_page_agent.core.page_agent import run_upload
-        run_upload(self, step)
 
     # ------------------------------
     # 验证码（滑块 / 文字点选 / 计算题）

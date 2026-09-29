@@ -39,28 +39,30 @@ from rpa_page_agent.ui.element_capture import (
 )
 from rpa_page_agent.ui.help_tip import HelpButton, help_row
 from rpa_page_agent.ui import mouse_test
-from rpa_page_agent.ui.page_agent_panel import PageAgentPanel, UploadPanel
+from rpa_page_agent.ui.page_agent_panel import PageAgentPanel
 from rpa_page_agent.ui.picker_controller import (
     capture_element, release_stuck_modal, trace_later, trace_windows,
 )
 from rpa_page_agent.ui.read_data_panel import ReadDataPanel
 from rpa_page_agent.ui.window_match_dialog import WindowMatchDialog
 
-# 网页场景能用的动作
+# 网页场景能用的动作。
+#
+# 这个包（rpa_page_agent）是**极简版**：画布上就是「一句话一个节点」，所以下拉里
+# 只给这几种；其余动作（点击/填入/拖拽/滚轮/验证码/采集/自由代码/组合…）留给
+# 老包 smart_tool。老项目里已经存在的那些节点**照样能打开、能跑**（见
+# _load_from_step 里「动作不在清单里就临时补进下拉」的那段），只是没得新建。
 WEB_ACTIONS = [
-    "navigate", "read_data", "collect", "captcha", "click", "drag", "wheel",
-    "agent", "upload",
-    "fill", "select",
-    "note", "pause_for_human", "loop_start", "loop_end", "condition_start",
-    "condition_end", "script", "call",
+    "agent",                 # 任务：一句话，交给页面内的 AI
+    "navigate",              # 打开网页：给流程一个起点
+    "delay",                 # 等待几秒
+    "read_data",             # 读取数据：给循环准备数据
+    "loop_start", "loop_end",           # 循环（结构节点，系统配对）
+    "condition_start", "condition_end",  # 条件（结构节点，系统配对）
 ]
-# 桌面场景能用的动作（没有浏览器，也就没有 XPath / 下拉选择）
-DESKTOP_ACTIONS = [
-    "win_activate", "captcha", "click", "drag", "wheel", "fill", "hotkey",
-    "delay", "read_data",
-    "note", "pause_for_human", "loop_start", "loop_end", "condition_start",
-    "condition_end", "script", "call",
-]
+# 桌面场景：这个包只做网页，桌面动作一个都不给（老包里有）
+DESKTOP_ACTIONS = ["read_data", "delay", "loop_start", "loop_end",
+                   "condition_start", "condition_end"]
 # 新建步骤时不出现在菜单里的动作：这些标记由系统配对生成
 NEW_STEP_HIDDEN = {"loop_end", "condition_end"}
 ACTION_LABELS = {
@@ -72,8 +74,9 @@ ACTION_LABELS = {
     "click": "点击 click",
     "drag": "鼠标拖拽 drag（从起点按住，朝圆盘方向拖过去再松开）",
     "wheel": "鼠标滚轮 wheel（向上 / 向下滚动）",
-    "agent": "智能页面任务 agent（一句话交代要做什么，页面内的 AI 自己多步完成；点击/输入用真实鼠标键盘）",
-    "upload": "上传文件 upload（把本地文件交给网页的上传框；文件由本程序接管）",
+    "agent": "任务（一句话说清要做什么，页面内的 AI 自己完成；点击/输入用真实鼠标键盘）",
+    # 下面这些动作这个包里不再新建（下拉里不出现），但老项目里的节点要能正常显示名字
+    "upload": "上传文件（已不在新版里）",
     "fill": "填入 fill",
     "select": "下拉选择 select",
     "pause_for_human": "暂停等人工 pause_for_human",
@@ -327,33 +330,33 @@ DRAG_HELP = (
 )
 
 PAGE_AGENT_HELP = (
-    "「智能页面任务」＝ 用一个节点交代一整件事，页面里的 AI 自己多步完成。\n"
+    "「任务」＝ 一句话说清要做什么，页面里的 AI 自己完成。\n"
     "\n"
-    "【跟「点击 / 填入」的区别】\n"
-    "· 点击 / 填入：你得先知道元素在哪（XPath），一步一个动作；\n"
-    "· 智能任务：你只说「在标题框填「今天天气」，然后点发布」，\n"
-    "  AI 自己看页面、自己找元素、自己决定下一步 —— 页面改版了也不容易崩。\n"
+    "【整个流程就是一句句这样的话】\n"
+    "打开网页 → 任务（登录）→ 任务（进后台）→ 任务（填标题正文并发布）…\n"
+    "每个任务节点就是画布上一张卡片，写着你这句人话。\n"
+    "**同一个页面上连着写的几个任务，会交给同一个 AI** —— 它记得前面做过什么；\n"
+    "中间夹了「打开网页」，就自动换一个新的（页面都换了，旧记忆没用）。\n"
     "\n"
     "【它是怎么干活的】\n"
     "页面里会注入一个 AI（官方 page-agent，离线产物随程序走）：它把页面变成\n"
     "一段带编号的文本 → 交给大模型想下一步 → 决定点哪个编号。\n"
-    "真正落下的**点击和输入由本程序用真实鼠标键盘执行**（走浏览器的输入通道，\n"
-    "事件 isTrusted=true，跟真人操作一样），所以对风控敏感的系统也稳。\n"
+    "真正落下的**点击和输入由本程序执行**（走浏览器的输入通道，事件 isTrusted=true，\n"
+    "跟真人操作一样），所以对风控敏感的系统也稳。\n"
     "\n"
     "【LLM 设置】接口地址 / 模型 / 密钥是**项目级**的（存在本项目的 steps.json 里），\n"
-    "同一个项目的所有智能节点共用一份；填好点【试一下】能立刻验证通不通。\n"
+    "同一个项目的所有任务节点共用一份；填好点【试一下】能立刻验证通不通。\n"
     "密钥不会进页面：页面里的 AI 要调模型时，请求会交回本程序进程去发。\n"
     "服务商选 OpenAI 兼容的都行：通义（百炼）、DeepSeek、OpenAI、本机 Ollama / LM Studio。\n"
     "\n"
-    "【任务怎么写】\n"
+    "【话怎么写】\n"
     "· 写清“做什么 + 关键文字”：如「搜索「天气预报」并点第一条结果」；\n"
     "· 要填的数据可以写 {{变量}}（跟别的节点一样），循环里能写 {{loop.item.内容}}；\n"
     "· 拿不准的元素写在「额外提示」里（如「标题框是 #title」），AI 会优先参考。\n"
     "\n"
     "【步数 / 超时】最多走几步、最多跑多久：跑飞了会自己停下并报错，不会卡住流程。\n"
     "\n"
-    "【什么时候别用它】要精确到毫秒的重复操作（用点击/填入更省更稳）、\n"
-    "页面里完全看不出区别的元素（AI 也认不出来）。"
+    "【什么时候少用它】要精确到毫秒的重复操作、页面里完全看不出区别的元素（AI 也认不出来）。"
 )
 
 WHEEL_HELP = (
@@ -724,21 +727,16 @@ class StepEditDialog(QDialog):
             "鼠标滚轮", WHEEL_HELP)
         form.addRow("", self.wheel_hint)
 
-        # --- 智能页面任务 / 上传文件（实现见 ui/page_agent_panel.py）---
+        # --- 任务（一句话一个节点；实现在 ui/page_agent_panel.py）---
         self.agent_panel = PageAgentPanel()
         self.agent_panel.set_project_dir(self.project_dir)   # LLM 配置是项目级的
         self.agent_panel.reload()                            # 新建节点时也先把配置刷上
         self.agent_panel.changed.connect(self._sync_visibility)
-        form.addRow("智能任务：", self.agent_panel)
+        form.addRow("任务：", self.agent_panel)
         self.agent_hint = help_row(
-            "一句话说清要做什么，页面内的 AI 自己看页面、自己点；LLM 设置是项目级的，所有智能节点共用。",
-            "智能页面任务", PAGE_AGENT_HELP)
+            "一句话说清要做什么，页面内的 AI 自己看页面、自己点；LLM 设置是项目级的，所有任务节点共用。",
+            "任务", PAGE_AGENT_HELP)
         form.addRow("", self.agent_hint)
-
-        self.upload_panel = UploadPanel()
-        self.upload_panel.set_project_dir(self.project_dir)
-        self.upload_panel.changed.connect(self._sync_visibility)
-        form.addRow("上传文件：", self.upload_panel)
 
         # --- 定位组（click/fill/select）---
         self.locator_type = QComboBox()
@@ -1140,7 +1138,6 @@ class StepEditDialog(QDialog):
         self._drag_widgets = [self.drag_box, self.drag_hint, self.drag_status]
         self._wheel_widgets = [self.wheel_row, self.wheel_hint]
         self._agent_widgets = [self.agent_panel, self.agent_hint]
-        self._upload_widgets = [self.upload_panel]
         self._pause_widgets = [self.prompt_edit, self.resume_combo,
                                self.resume_timeout]
         self._loop_widgets = [
@@ -1186,14 +1183,12 @@ class StepEditDialog(QDialog):
         is_drag = action == "drag"
         is_wheel = action == "wheel"
         is_agent = action == "agent"
-        is_upload = action == "upload"
         # 主定位那一行（「定位路径」/「图片模板」）对验证码节点也是必填的 ——
         # 对验证码来说它填的是「验证码图在哪」，所以用 show_loc 统一控制。
         # 拖拽的起点也走这一行；滚轮只有桌面场景需要（光标先挪到哪张图上）
-        show_loc = (is_locate or is_captcha or is_drag or is_upload
+        show_loc = (is_locate or is_captcha or is_drag
                     or (is_wheel and self.desktop))
-        # 「步骤后等待」拖拽 / 滚轮 / 智能任务 / 上传也都留着：
-        # 滚完等懒加载、任务跑完等页面刷新、上传完等缩略图，都很常见
+        # 「步骤后等待」拖拽 / 滚轮 / 任务 也都留着：滚完等懒加载、任务跑完等页面刷新，都很常见
         show_wait = show_loc or is_wheel or is_agent
         is_fill = action in ("fill", "select")
         # 桌面场景只有「图片模板」一种定位方式：定位方式那个下拉在这儿没有意义
@@ -1244,8 +1239,6 @@ class StepEditDialog(QDialog):
             self.wheel_amount_spin.setSuffix(" 格" if self.desktop else " 像素")
         for w in self._agent_widgets:
             self._show(w, is_agent)
-        for w in self._upload_widgets:
-            self._show(w, is_upload)
         self.btn_pick_image.setVisible(is_image)
         self.btn_capture.setVisible(
             show_loc and (self.desktop or loc_kind == "xpath"))
@@ -1326,8 +1319,6 @@ class StepEditDialog(QDialog):
                 label.setText("起点：")
             elif is_wheel:
                 label.setText("滚动位置：")
-            elif is_upload:
-                label.setText("上传框定位：")
             else:
                 label.setText("图片模板：" if self.desktop else "定位路径：")
         sec_label = self._form.labelForField(self.wait_seconds)
@@ -1922,6 +1913,12 @@ class StepEditDialog(QDialog):
     # ------------------------------
     def _load_from_step(self, s: Step):
         idx = self.action_combo.findData(s.action)
+        if idx < 0:
+            # 这个动作不在本包的「极简清单」里（多半是老项目里的老节点）：
+            # 临时补进下拉，保证能正常打开、看得懂、改得动，别把动作悄悄换成别的
+            label = ACTION_LABELS.get(s.action, s.action)
+            self.action_combo.addItem(f"{label}（老节点）", s.action)
+            idx = self.action_combo.count() - 1
         self.action_combo.setCurrentIndex(max(0, idx))
 
         self.url_edit.setText(s.url)
@@ -2019,10 +2016,7 @@ class StepEditDialog(QDialog):
         self.wheel_amount_spin.setValue(int(s.wheel_amount or 0) or
                                         (3 if self.desktop else 500))
 
-        self.agent_panel.set_project_dir(self.project_dir)
-        self.upload_panel.set_project_dir(self.project_dir)
         self.agent_panel.load(s)
-        self.upload_panel.load(s)
 
         mode_idx = self.cond_mode_combo.findData(s.cond_mode or "rule")
         self.cond_mode_combo.setCurrentIndex(max(0, mode_idx))
@@ -2109,20 +2103,6 @@ class StepEditDialog(QDialog):
             problem = self.agent_panel.validate()
             if problem:
                 errors.append(problem)
-        elif action == "upload":
-            problem = self.upload_panel.validate()
-            if problem:
-                errors.append(problem)
-            elif not (self.locator_value.text().strip()
-                      or self.upload_panel.desc_edit.text().strip()):
-                errors.append(
-                    "「上传文件」要说明文件交给谁：最稳是用【捕获元素…】取 "
-                    "input[type=file] 的 XPath 填在「上传框定位」里；"
-                    "也可以写「按钮描述」，让 AI 去点那个上传按钮。")
-            elif (self.locator_type.currentData() == "xpath"
-                    and self.locator_value.text().strip()
-                    and not _looks_like_xpath(self.locator_value.text().strip())):
-                errors.append("「上传框定位」只能填 XPath（说明文字请写到【备注】里）")
         elif action == "hotkey":
             if not self.keys_edit.text().strip():
                 errors.append("「按键」要填按什么键，如 enter、ctrl+s、alt+f4")
@@ -2334,17 +2314,6 @@ class StepEditDialog(QDialog):
             step.win_title = self.win_title_edit.text().strip()
         elif action == "agent":
             self.agent_panel.save(step)
-            step.wait_after = self.wait_combo.currentData()
-            step.wait_target = self.wait_target.text().strip()
-            step.wait_seconds = float(self.wait_seconds.value())
-        elif action == "upload":
-            self.upload_panel.save(step)
-            value = self.locator_value.text().strip()
-            if value:                       # 上传框定位：复用标准定位那一行（捕获元素直接能用）
-                step.locator = Locator(
-                    type="xpath" if not self.desktop else "image",
-                    value=value,
-                )
             step.wait_after = self.wait_combo.currentData()
             step.wait_target = self.wait_target.text().strip()
             step.wait_seconds = float(self.wait_seconds.value())

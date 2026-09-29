@@ -87,8 +87,7 @@ ACTION_META = {
     "click": ("点击", "#e8890c"),
     "drag": ("鼠标拖拽", "#c2410c"),
     "wheel": ("鼠标滚轮", "#0e7490"),
-    "agent": ("智能页面任务", "#4f46e5"),
-    "upload": ("上传文件", "#0e7490"),
+    "agent": ("任务", "#4f46e5"),
     "fill": ("填入", "#1a9d6b"),
     "select": ("下拉选择", "#1192a8"),
     "pause_for_human": ("暂停等人工", "#d1495b"),
@@ -235,13 +234,7 @@ def _step_summary_body(s: Step) -> List[str]:
         return [f"{'向上' if up else '向下'}滚 {int(s.wheel_amount or 0)}"]
     if s.action == "agent":
         text = (s.agent_task or "").strip()
-        return wrap_for_card(text or "（没写任务：双击节点写一句话）")
-    if s.action == "upload":
-        from pathlib import Path as _Path
-        name = _Path(str(s.upload_file or "").strip()).name
-        where = ((s.locator.value if s.locator else "")
-                 or s.upload_desc or "（没说点哪儿）")
-        return [f"文件：{name or '（没选）'}", f"位置：{str(where)[:50]}"]
+        return wrap_for_card(text or "（双击这里写一句话：要做什么）")
     if s.action == "hotkey":
         return [f"按键：{s.keys}" if s.keys else "（未填按键）"]
     if s.action == "delay":

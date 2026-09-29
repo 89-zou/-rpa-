@@ -80,6 +80,7 @@ class PageAgentBridge:
         self.config = config or {}
         self.injected = False
         self._llm_calls = 0
+        self._session: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # 注入
@@ -138,17 +139,30 @@ class PageAgentBridge:
     # 主循环
     # ------------------------------------------------------------------
     def run_task(self, task: str, variables: Optional[Dict[str, Any]] = None,
-                 max_steps: int = 20, timeout_s: int = 180) -> Dict[str, Any]:
-        """跑一个任务，返回 {"success", "data", "steps"}；失败/超时/被停都抛异常。"""
+                 max_steps: int = 20, timeout_s: int = 180,
+                 session: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """跑一个任务，返回 {"success", "data", "steps"}；失败/超时/被停都抛异常。
+
+        session：同一次流程里各「任务」节点共用的小本子（挂在执行器上）。
+        同一个页面上连续的几个任务会**复用同一个 Agent**（它记得前面做过的事）；
+        页面换过（前面有「打开网页」）或上一次异常退出时，自动换一个新的。
+        """
         self.ensure_injected()
         cfg = self.config
+        url = self._url()
+        fresh = True
+        if session is not None:
+            fresh = bool(session.get("fresh_next")) or session.get("url") != url
+            session["url"] = url
+            session["fresh_next"] = False
+        self._session = session
         self.page.evaluate("(v) => { window.__RPA_VARS__ = v || {}; }",
                            _jsonable(variables))
         self.page.evaluate(
-            "([c, t]) => window.__rpaAgent.start(c, t)",
+            "([c, t, f]) => window.__rpaAgent.start(c, t, f)",
             [{"model": str(cfg.get("model") or ""),
               "language": str(cfg.get("language") or "zh-CN"),
-              "max_steps": int(max_steps or 20)}, str(task or "")])
+              "max_steps": int(max_steps or 20)}, str(task or ""), bool(fresh)])
 
         started = time.monotonic()
         last_step = 0
@@ -179,10 +193,13 @@ class PageAgentBridge:
             self._sleep(POLL_S)
 
         self._drain_logs()
-        try:
-            self.page.evaluate("() => window.__rpaAgent.dispose()")
-        except Exception:
-            pass
+        if session is None:
+            # 独立使用（没走流程）才顺手把页面里的 agent 收掉；
+            # 走流程时留着，下一个任务节点接着用它的记忆
+            try:
+                self.page.evaluate("() => window.__rpaAgent.dispose()")
+            except Exception:
+                pass
         success = state.get("success")
         data = str(state.get("data") or "")
         if not success:
@@ -200,6 +217,13 @@ class PageAgentBridge:
             return self.page.evaluate("() => window.__rpaAgent.status()") or {}
         except Exception as e:
             raise PageAgentError(f"页面没了或 Agent 状态读不到：{_first_line(e)}") from e
+
+    def _url(self) -> str:
+        """当前页面地址（用来判断「页面是不是换过了」→ 换不换新 Agent）。"""
+        try:
+            return str(self.page.evaluate("() => location.href") or "")
+        except Exception:
+            return ""
 
     def _drain_logs(self):
         try:
@@ -321,7 +345,10 @@ class PageAgentBridge:
         return min(max(x, 1.0), vw - 2.0), min(max(y, 1.0), vh - 2.0)
 
     def _abort(self, why: str):
-        self.log(f"  停止智能任务（{why}）")
+        self.log(f"  停止任务（{why}）")
+        if self._session is not None:
+            # 这次是异常收场，页面里的 agent 别留给下一个任务用
+            self._session["fresh_next"] = True
         try:
             self.page.evaluate("() => window.__rpaAgent.stop()")
         except Exception:
@@ -351,10 +378,10 @@ class PageAgentBridge:
 # 给执行器用的两个薄接口
 # ======================================================================
 def run_agent_task(executor, step) -> Dict[str, Any]:
-    """执行「智能页面任务」节点（step.action == "agent"）。"""
+    """执行「任务」节点（step.action == "agent"）：把这一句话交给页面内的 Page Agent。"""
     task = executor._resolve_value(step.agent_task or "").strip()
     if not task:
-        raise ValueError("「智能页面任务」还没写任务：双击节点，用一句话说清要做什么"
+        raise ValueError("「任务」还没写描述：双击节点，用一句话说清要做什么"
                          "（例：在标题框填「今天天气」，然后点发布）")
     hints = executor._resolve_value(step.agent_hints or "").strip()
     if hints:
@@ -370,75 +397,19 @@ def run_agent_task(executor, step) -> Dict[str, Any]:
     max_steps = int(step.agent_max_steps or cfg.get("max_steps") or 20)
     timeout_s = int(step.agent_timeout or cfg.get("timeout_s") or 180)
     first = task.splitlines()[0][:60]
-    executor.log(f"  智能任务：{first}（最多 {max_steps} 步，超时 {timeout_s} 秒）")
+    executor.log(f"  任务：{first}（最多 {max_steps} 步，超时 {timeout_s} 秒）")
     bridge = PageAgentBridge(executor._page, executor.log,
                              should_stop=lambda: bool(getattr(executor, "_stop", False)),
                              config=cfg)
+    # 同一次流程里各「任务」节点共用一个小本子：同一个页面上就复用同一个 Agent
+    session = executor.__dict__.setdefault("_pa_session", {})
     result = bridge.run_task(task, variables=executor.variables,
-                             max_steps=max_steps, timeout_s=timeout_s)
+                             max_steps=max_steps, timeout_s=timeout_s,
+                             session=session)
     said = str(result.get("data") or "").strip().replace("\n", " ")
-    executor.log(f"  智能任务完成（{result.get('steps')} 步"
+    executor.log(f"  任务完成（{result.get('steps')} 步"
                  f"，LLM 调用 {result.get('llm_calls')} 次）：{said[:200]}")
     return result
-
-
-def run_upload(executor, step) -> Dict[str, Any]:
-    """执行「上传文件」节点（step.action == "upload"）：文件由本进程接管。
-
-    两条路，从稳到活：
-    1. 填了 input[type=file] 的 XPath → 直接 set_input_files（不依赖按钮/弹窗）；
-    2. 没填 → 让智能 Agent 找到并点「上传按钮」，本进程用 expect_file_chooser 接下文件。
-    """
-    raw = executor._resolve_value(step.upload_file or "").strip()
-    if not raw:
-        raise ValueError("「上传文件」还没填文件路径：双击节点填（可以写 {{变量}}，"
-                         "比如循环里写 {{loop.item.path}}）")
-    path = Path(raw)
-    if not path.is_absolute() and executor.project_dir:
-        path = Path(executor.project_dir) / path
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"要上传的文件不存在：{path}\n"
-            "    路径可以写 {{变量}}；相对路径是相对项目目录。")
-
-    page = executor._page
-    selector = (step.locator.value if step.locator else "").strip()
-    if selector:
-        try:
-            page.set_input_files(f"xpath={selector}", str(path))
-            executor.log(f"  已把文件交给上传框：{path.name}")
-            return {"how": "input[type=file]", "file": str(path)}
-        except Exception as e:
-            executor.log(f"  直接交给上传框没成（{_first_line(e)}）→ 改用「点按钮 + 文件选择器」")
-
-    desc = executor._resolve_value(step.upload_desc or "").strip() or "上传文件的按钮"
-    cfg = pa_config.load(executor.project_dir)
-    bad = pa_config.problem(cfg)
-    if bad:
-        raise ValueError(bad + "（点按钮这条路要用智能 Agent 定位，需要先配好 LLM）")
-    if not bundle_ready():
-        raise PageAgentError(missing_hint())
-    executor.log(f"  让智能 Agent 去点「{desc}」，文件由本程序接管")
-    try:
-        with page.expect_file_chooser(timeout=120000) as fc:
-            bridge = PageAgentBridge(page, executor.log,
-                                     should_stop=lambda: bool(getattr(executor, "_stop", False)),
-                                     config=cfg)
-            bridge.run_task(f"点击这个按钮：{desc}", variables=executor.variables,
-                            max_steps=6, timeout_s=120)
-    except PageAgentStopped:
-        raise
-    except Exception as e:
-        if "Timeout" in type(e).__name__ or "timeout" in str(e).lower():
-            raise TimeoutError(
-                "点了按钮，但一直没等到文件选择器（也可能是这个按钮本来就不弹窗）。\n"
-                "    最稳的办法：用【捕获元素…】把页面上 input[type=file] 的 XPath 填进"
-                "「上传框定位」，那样直接喂文件。") from e
-        raise
-    chooser = fc.value
-    chooser.set_files(str(path))
-    executor.log(f"  已通过文件选择器上传：{path.name}")
-    return {"how": "file-chooser", "file": str(path)}
 
 
 def _segments(text: str):

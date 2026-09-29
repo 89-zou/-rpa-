@@ -139,6 +139,14 @@ DATA_SOURCE_TYPES = [
 ]
 
 
+#: 本包（极简版）对外暴露的动作：画布上就是「一句话一个节点」。
+#: 其余动作（点击 / 填入 / 拖拽 / 滚轮 / 验证码 / 采集 / 自由代码 / 组合…）的代码
+#: 都还在 —— 老项目里的那些节点必须照样能跑 —— 但 list_actions 不再列出来，
+#: 所以 AI 和新手都不会拿它们去建新节点。
+VISIBLE_ACTIONS = ("navigate", "agent", "delay", "read_data",
+                   "loop_start", "condition_start")
+
+
 def _actions_for(scene: str) -> List[str]:
     want = SCENE_DESKTOP if scene == SCENE_DESKTOP else SCENE_WEB
     return [a for a, spec in ACTION_SPECS.items() if want in spec["scenes"]]
@@ -210,35 +218,21 @@ ACTION_SPECS: Dict[str, Dict[str, Any]] = {
                   + WAIT_FIELDS,
     },
     "agent": {
-        "label": "智能页面任务", "scenes": [SCENE_WEB],
-        "desc": "用一句自然语言交代要做什么，页面内的 AI Agent（官方 page-agent）自己"
-                "多步完成：读页面 → 想下一步 → 决定点哪个元素 / 填什么。"
-                "点击与输入由本程序用**真实鼠标键盘**执行（CDP 输入，事件 isTrusted=true）；"
+        "label": "任务", "scenes": [SCENE_WEB],
+        "desc": "用一句自然语言交代要做什么，页面内的 AI（官方 page-agent）自己多步完成："
+                "读页面 → 想下一步 → 决定点哪个元素 / 填什么。"
+                "**整个流程就是一句句这样的话**：连续的任务节点会交给同一个 Agent，"
+                "它记得前面做过的事；中间夹了「打开网页」就自动换一个新的。"
+                "点击与输入由本程序用**真实鼠标键盘**执行（isTrusted=true）；"
                 "LLM 调用也在本程序进程里（API Key 不进页面）。"
-                "任务里可以写 {{变量}}；agent 还能用 get_local_variable 工具现取变量清单里的值。"
-                "要先用「打开网页」把页面打开，再放这个节点。",
+                "描述里可以写 {{变量}}；agent 还能用 get_local_variable 工具现取变量清单里的值。",
         "fields": [
-            f("agent_task", "str", "自然语言任务，如「在标题框填「今天天气」，然后点发布」；"
+            f("agent_task", "str", "一句话描述，如「在标题框填「今天天气」，然后点发布」；"
               "可含 {{变量}}", True),
             f("agent_hints", "str", "额外要求 / 线索（可选），如「标题框是 #title」「登录按钮是蓝色那个」"),
             f("agent_max_steps", "int", "最多走几步（防跑飞）", default=20),
             f("agent_timeout", "int", "超时秒数，到点停止并报错", default=180),
         ] + WAIT_FIELDS,
-    },
-    "upload": {
-        "label": "上传文件", "scenes": [SCENE_WEB],
-        "desc": "上传本地文件：填了 input[type=file] 的 XPath 就直接把文件交给它（最稳）；"
-                "没填就让 AI Agent 找到并点「上传按钮」，文件由本程序接管文件选择器。"
-                "注意：不要指望前端 JS 去设置 input 的值，那条路在多数站点上是断的。",
-        "fields": [dict(LOCATOR_FIELD, required=False,
-                        desc="选填：**最稳的一条路** —— 用【捕获元素…】取 "
-                             "input[type=file] 的 XPath 填这儿，程序直接把文件交给它。"
-                             "不填就走下面的 upload_desc，让 AI 去找按钮"),
-                   f("upload_file", "str",
-                     "本地文件路径，可含 {{变量}}（循环里常写 {{loop.item.path}}）", True),
-                   f("upload_desc", "str",
-                     "没填 locator 时：要点的上传按钮的自然语言描述，如「选择文件」按钮"),
-                   ] + WAIT_FIELDS,
     },
     "collect": {
         "label": "采集数据", "scenes": [SCENE_WEB],
@@ -401,8 +395,8 @@ ACTION_SPECS: Dict[str, Dict[str, Any]] = {
         "fields": [f("keys", "str", "要按的键", True)],
     },
     "delay": {
-        "label": "等待", "scenes": [SCENE_DESKTOP],
-        "desc": "纯等几秒（桌面场景用；网页里请用步骤后等待）。",
+        "label": "等待", "scenes": [SCENE_WEB, SCENE_DESKTOP],
+        "desc": "纯等几秒（页面在慢吞吞加载、或者要等个动画的时候用）。",
         "fields": [f("wait_seconds", "float", "等几秒", True)],
     },
 }
@@ -437,13 +431,16 @@ def _all_fields(action: str, spec: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def list_actions(scene: str = "") -> List[Dict[str, Any]]:
-    """列出所有能用的动作（可按场景过滤）。
+    """列出**这个包对外**能用的动作（极简集；可按场景过滤）。
 
-    scene 留空＝全部；"web"＝网页自动化；"desktop"＝桌面应用。
-    每个动作给出：动作名、中文名、适用场景、说明、字段清单。
+    只列 VISIBLE_ACTIONS：全流程就是「打开网页 → 一句话任务 → 一句话任务 …」，
+    （需要时加「等待 / 读取数据 / 循环 / 条件」）。老动作还在代码里、老项目照样能跑，
+    只是不再作为可选项暴露出来。
     """
     out = []
     for name, spec in ACTION_SPECS.items():
+        if name not in VISIBLE_ACTIONS:
+            continue
         if scene and (SCENE_DESKTOP if scene == SCENE_DESKTOP else SCENE_WEB) \
                 not in spec["scenes"]:
             continue
@@ -461,7 +458,8 @@ def describe_action(action: str) -> Dict[str, Any]:
     """看某个动作要填哪些字段（写步骤前先看一眼，省得来回试）。"""
     spec = ACTION_SPECS.get(str(action).strip())
     if spec is None:
-        raise ApiError(f"不认识的 action：{action}。可用动作：{'、'.join(ACTION_SPECS)}")
+        raise ApiError(f"不认识的 action：{action}。这个包能用的动作："
+                       f"{'、'.join(VISIBLE_ACTIONS)}")
     return {"action": action, "label": spec["label"], "scenes": spec["scenes"],
             "desc": spec["desc"], "fields": _all_fields(action, spec)}
 
@@ -798,12 +796,7 @@ def _summary(step: Step) -> str:
         return f"滚轮：{'向上' if up else '向下'}滚 {int(step.wheel_amount or 0)}"
     if a == "agent":
         first = (step.agent_task or "").strip().splitlines()[0] if step.agent_task else ""
-        return "智能任务：" + (first[:40] or "（没写任务）")
-    if a == "upload":
-        name = Path(str(step.upload_file or "").strip()).name
-        where = ((step.locator.value if step.locator else "")
-                 or step.upload_desc or "（没说点哪儿）")
-        return f"上传：{name or '（没选文件）'} ← {str(where)[:40]}"
+        return "任务：" + (first[:40] or "（还没写描述）")
     if a == "hotkey":
         return f"按键 {step.keys}"
     if a == "delay":
@@ -899,7 +892,9 @@ def _step_from_dict(d: Dict[str, Any]) -> Step:
                 f"「{action}」是结构标记，不用自己写："
                 "循环用 add_loop()、条件用 add_condition()、组合用 add_group()，"
                 "系统会自动补齐配对标记。")
-        raise ApiError(f"不认识的 action：{action}。可用动作：{'、'.join(ACTION_SPECS)}")
+        raise ApiError(f"不认识的 action：{action}。这个包能用的动作："
+                       f"{'、'.join(VISIBLE_ACTIONS)}"
+                       "（click/fill 这类老动作只在打开老项目时还能编辑，不能拿来建新节点）")
 
     # 任何动作只要被放进「条件」里，就是那个条件的一个动作节点，可以带自己的判断规则；
     # image_threshold 是「这一步的图片匹配要像到什么程度」；
@@ -1254,13 +1249,7 @@ def _connect_roundtrip(steps: List[Step], scene: str = "") -> List[str]:
         if a == "wheel" and int(s.wheel_amount or 0) <= 0:
             out.append(f"第 {i} 步（鼠标滚轮）没填滚动量")
         if a == "agent" and not (s.agent_task or "").strip():
-            out.append(f"第 {i} 步（智能页面任务）没填任务描述")
-        if a == "upload":
-            if not (s.upload_file or "").strip():
-                out.append(f"第 {i} 步（上传文件）没填文件路径")
-            elif not ((s.locator.value if s.locator else "")
-                      or (s.upload_desc or "")).strip():
-                out.append(f"第 {i} 步（上传文件）既没填上传框定位、也没写按钮描述")
+            out.append(f"第 {i} 步（任务）没写描述")
         if a == "collect":
             if not (s.output_var or "").strip():
                 out.append(f"第 {i} 步（采集数据）没填产出变量名")
